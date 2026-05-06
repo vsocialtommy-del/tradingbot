@@ -1,0 +1,39 @@
+# XAUUSD trading bot — runtime dependencies
+# Python 3.11+ required (see .python-version).
+
+# ---- Broker / market data ----
+# Note: MetaTrader5 is officially Windows-only. On the Hetzner Linux VPS
+# (Phase G) we'll run MT5 + Python under Wine. Local dev should be on
+# Windows, or macOS/Linux with MT5 + Python in a Windows VM.
+MetaTrader5>=5.0.45
+
+# ---- Data handling ----
+pandas>=2.2,<3.0
+# numpy<2 for compatibility with pandas-ta and MetaTrader5 (numpy 2.x
+# has breaking ABI changes some libs haven't caught up with).
+numpy>=1.26,<2.0
+pandas-ta>=0.3.14b0
+
+# ---- Database ----
+supabase>=2.3
+
+# ---- Config / env ----
+python-dotenv>=1.0
+pydantic>=2.5
+pydantic-settings>=2.1
+
+# ---- HTTP (Telegram alerts, ad-hoc; bot itself doesn't call Finnhub) ----
+requests>=2.31
+
+# ---- Logging ----
+loguru>=0.7
+
+# ---- Dev / test ----
+pytest>=7.4
+pytest-mock>=3.12
+ruff>=0.1
+black>=23.12
+
+# Deferred — added in their respective phases:
+#   vectorbt / backtrader        Phase D (backtest)
+#   python-telegram-bot          Phase E (dashboard / alerts)
