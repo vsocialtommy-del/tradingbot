@@ -33,30 +33,85 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-import MetaTrader5 as mt5
 import pandas as pd
 from loguru import logger
+
+
+# --------------------------------------------------------------------------- #
+# Lazy MetaTrader5 import
+#
+# The ``MetaTrader5`` package is **Windows-only** (or Wine on Linux for the
+# Hetzner VPS). Importing this module on Linux/macOS — e.g. for the
+# backtest framework, which only needs the ``MT5Connector`` class for
+# type annotations — must not fail.
+#
+# The :class:`_LazyMT5` proxy intercepts attribute access and triggers the
+# real ``import MetaTrader5`` only when something actually uses it. The
+# error message points users at the backtest framework if they hit this
+# path on a Linux host.
+# --------------------------------------------------------------------------- #
+
+
+class _LazyMT5:
+    """Lazy proxy for ``MetaTrader5``. ``mt5.foo()`` triggers real import."""
+
+    _module: Any = None
+
+    def __getattr__(self, name: str) -> Any:
+        if _LazyMT5._module is None:
+            try:
+                import MetaTrader5 as _real_mt5  # noqa: PLC0415
+            except ImportError as e:
+                raise ImportError(
+                    "MetaTrader5 is required for live MT5 connections but "
+                    "is not installed. The library is Windows-only "
+                    "(use a Windows VPS, or Linux+Wine for production). "
+                    "If you only need the backtest framework, use "
+                    "``bot.backtest`` — it does not depend on MetaTrader5."
+                ) from e
+            _LazyMT5._module = _real_mt5
+        return getattr(_LazyMT5._module, name)
+
+
+mt5: Any = _LazyMT5()
 
 Direction = Literal["BUY", "SELL"]
 Timeframe = Literal["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
 
-_TIMEFRAME_MAP: dict[str, int] = {
-    "M1": mt5.TIMEFRAME_M1,
-    "M5": mt5.TIMEFRAME_M5,
-    "M15": mt5.TIMEFRAME_M15,
-    "M30": mt5.TIMEFRAME_M30,
-    "H1": mt5.TIMEFRAME_H1,
-    "H4": mt5.TIMEFRAME_H4,
-    "D1": mt5.TIMEFRAME_D1,
-}
 
-# Retcodes that are worth retrying — price moved between our quote read
-# and broker fill. We refresh the price and try again.
-_RETRYABLE_RETCODES = {
-    mt5.TRADE_RETCODE_REQUOTE,
-    mt5.TRADE_RETCODE_PRICE_OFF,
-    mt5.TRADE_RETCODE_PRICE_CHANGED,
-}
+# These dicts dereference ``mt5.TIMEFRAME_*`` / ``mt5.TRADE_RETCODE_*``
+# constants. Building them at module import time would force the lazy
+# proxy to load MetaTrader5 — which is exactly what we're trying to
+# avoid. Defer to first-use via the getter functions below.
+
+_TIMEFRAME_MAP: dict[str, int] | None = None
+_RETRYABLE_RETCODES: set[int] | None = None
+
+
+def _get_timeframe_map() -> dict[str, int]:
+    global _TIMEFRAME_MAP
+    if _TIMEFRAME_MAP is None:
+        _TIMEFRAME_MAP = {
+            "M1": mt5.TIMEFRAME_M1,
+            "M5": mt5.TIMEFRAME_M5,
+            "M15": mt5.TIMEFRAME_M15,
+            "M30": mt5.TIMEFRAME_M30,
+            "H1": mt5.TIMEFRAME_H1,
+            "H4": mt5.TIMEFRAME_H4,
+            "D1": mt5.TIMEFRAME_D1,
+        }
+    return _TIMEFRAME_MAP
+
+
+def _get_retryable_retcodes() -> set[int]:
+    global _RETRYABLE_RETCODES
+    if _RETRYABLE_RETCODES is None:
+        _RETRYABLE_RETCODES = {
+            mt5.TRADE_RETCODE_REQUOTE,
+            mt5.TRADE_RETCODE_PRICE_OFF,
+            mt5.TRADE_RETCODE_PRICE_CHANGED,
+        }
+    return _RETRYABLE_RETCODES
 
 DEFAULT_DEVIATION_POINTS = 20  # max acceptable slippage on market orders
 DEFAULT_MAGIC = 234567         # bot's order tag — distinguishes from manual trades
@@ -210,13 +265,14 @@ class MT5Connector:
         MT5's ``tick_volume`` — number of ticks during the bar; CFDs
         rarely have real exchange volume).
         """
-        if timeframe not in _TIMEFRAME_MAP:
+        if timeframe not in _get_timeframe_map():
             raise MT5Error(
-                f"unknown timeframe {timeframe!r}; supported: {sorted(_TIMEFRAME_MAP)}"
+                f"unknown timeframe {timeframe!r}; supported: "
+                f"{sorted(_get_timeframe_map())}"
             )
         self._ensure_symbol(symbol)
         rates = mt5.copy_rates_from_pos(
-            symbol, _TIMEFRAME_MAP[timeframe], 0, count
+            symbol, _get_timeframe_map()[timeframe], 0, count
         )
         if rates is None or len(rates) == 0:
             raise MT5Error(
@@ -450,7 +506,7 @@ class MT5Connector:
                     f"vol={result.volume} price={result.price}"
                 )
                 return result
-            elif result.retcode in _RETRYABLE_RETCODES:
+            elif result.retcode in _get_retryable_retcodes():
                 logger.warning(
                     f"order requote (attempt {attempt + 1}/{max_attempts}): "
                     f"retcode={result.retcode} — refreshing price"
