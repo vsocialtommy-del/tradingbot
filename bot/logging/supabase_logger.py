@@ -197,6 +197,30 @@ class Trade(_ReadModelBase):
     updated_at: datetime
 
 
+class NewsEvent(_ReadModelBase):
+    """A row from the ``news_events`` table.
+
+    Populated by a Vercel cron from Finnhub (spec Section 8). The bot
+    only reads this table; it never writes to it. ``forecast`` and
+    ``actual`` are deliberately ``str`` rather than numeric — Finnhub
+    embeds units (``%``, ``$``, ``M``) and qualitative values
+    (``Hawkish``, ``Dovish``) that don't round-trip through ``float``.
+    The trading decision in :mod:`bot.filters.news_filter` only needs
+    ``event_time`` + ``impact_level`` + ``currency``; the value strings
+    are informational for the dashboard.
+    """
+
+    id: UUID
+    event_time: datetime
+    currency: str
+    title: str
+    impact_level: ImpactLevel
+    forecast: str | None = None
+    actual: str | None = None
+    fetched_at: datetime
+    created_at: datetime
+
+
 # ---------------------------------------------------------------------------
 # Wrapper
 # ---------------------------------------------------------------------------
@@ -335,6 +359,42 @@ class SupabaseLogger:
             .execute()
         )
         return [Trade.model_validate(row) for row in (result.data or [])]
+
+    # ---- news_events (read-only — Vercel cron writes) ----
+
+    def get_news_events_in_window(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        currencies: list[str] | None = None,
+        min_impact: ImpactLevel = "HIGH",
+    ) -> list[NewsEvent]:
+        """Return events in ``[start, end]`` matching the impact / currency filter.
+
+        ``min_impact`` follows the standard severity ordering
+        ``HIGH > MEDIUM > LOW``; the query selects every level at or
+        above the threshold. ``currencies`` is None ⇒ no currency
+        filter (return everything in window). Boundary inclusive on
+        both ends so the caller's blackout window logic is exact.
+        """
+        # Severity ordering used to expand min_impact to a set.
+        order: list[ImpactLevel] = ["LOW", "MEDIUM", "HIGH"]
+        if min_impact not in order:
+            raise ValueError(f"unknown min_impact: {min_impact!r}")
+        levels = order[order.index(min_impact):]
+
+        q = (
+            self._client.table("news_events")
+            .select("*")
+            .gte("event_time", start.isoformat())
+            .lte("event_time", end.isoformat())
+            .in_("impact_level", levels)
+        )
+        if currencies:
+            q = q.in_("currency", currencies)
+        result = q.order("event_time").execute()
+        return [NewsEvent.model_validate(row) for row in (result.data or [])]
 
     # ---- update methods ----
 
