@@ -1,66 +1,62 @@
-"""Order manager — places the three layered orders for a setup.
+"""Order manager — places Layer 1 (market) + writes WAITING rows for L2/L3.
 
-Per spec Section 4:
+**Strategy change (May 2026):** Layers 2 and 3 are no longer placed at
+the broker as pending limit orders. They're tracked in Supabase as
+``WAITING`` trade rows; the :mod:`bot.execution.entry_trigger` module
+fires them as market orders when the live tick reaches each layer's
+trigger price.
 
-* **Layer 1**: market order at the entry tick (fires immediately when
-  this function is called — the *orchestrator* is responsible for
-  watching ticks and only calling us when entry conditions are met).
-* **Layer 2**: pending limit at zone midpoint.
-* **Layer 3**: pending limit at the far zone edge (zone.bottom for BUY,
-  zone.top for SELL).
+Why bot-managed instead of broker-pending:
 
-All three share one SL. After this module returns, ``tp1_manager`` and
-``sl_manager`` take over for the rest of the lifecycle.
+* Real-time control of each entry decision — easier to skip if the
+  setup invalidates between layers.
+* Cleaner backtest path (same trigger logic on historical data as on
+  live ticks).
+* The bot can apply gating rules (news filter, exposure cap) right
+  before each layer fires, not just at setup creation.
 
 Pipeline order
 --------------
 ::
 
-    1. Pre-checks (input validation, zone tradeable, SL sane)
-    2. Compute layer prices + TP1
+    1. Compute layer prices + TP1 (always doable, no I/O)
+    2. Pre-checks (input validation, zone tradeable, SL sane)
     3. log_setup → Supabase (status=PENDING) ............ side effect #1
     4. place_market_order → MT5 (Layer 1) ............... side effect #2
-    5. Look up filled price; gap-through check
-    6. place_limit_order × 2 → MT5 (Layers 2/3) ......... side effects #3, #4
-    7. log_trade × {1..3} → Supabase ..................... side effects #5..
+    5. Resolve filled price; gap-through check
+    6. log_trade for Layer 1 (FILLED) ................... side effect #3
+    7. log_trade for Layers 2 + 3 (WAITING, no ticket)... side effects #4, #5
 
-Failures at any step degrade the result status:
+Failures degrade ``OrderPlacementResult.status``:
 
-    PLACED   all 3 layers placed
-    PARTIAL  Layer 1 placed, but at least one of 2/3 failed
-    FAILED   pre-checks failed, OR Layer 1 itself failed
+    PLACED   Layer 1 placed + all 3 trade rows written
     SKIPPED  Layer 1 placed but gap-through detected; Layer 1 closed
+    FAILED   pre-checks failed OR Layer 1 itself failed
 
-Design decisions called out in PR #13
+The earlier ``PARTIAL`` status is retired — it only applied to L2/L3
+broker failures, which can no longer happen.
+
+Design decisions called out in PR #15
 -------------------------------------
 
-1. **Supabase before MT5.** Even if MT5 placement fails, the setup is
-   tracked in the database for reconciliation. The setup_id is also
-   needed to tag MT5 orders via the comment field.
+1. **Supabase before MT5.** Setup tracked even on MT5 failure;
+   ``setup_id`` available to tag MT5 orders via ``comment``.
 
-2. **No TP on the MT5 orders.** Spec Section 6.1 requires a 50% close at
-   TP1 plus break-even SL move on the runner. MT5's built-in TP closes
-   100%, which would defeat the partial-take design. TP1 is therefore
-   a bot-managed event monitored by ``tp1_manager``. Only SL is set on
-   the broker side as a catastrophic backstop.
+2. **No TP on the MT5 order.** Spec Section 6.1 needs a 50% close at
+   TP1, which MT5's TP closes 100%. TP1 is bot-managed by
+   ``tp1_manager``. Only SL on the broker side as a backstop.
 
-3. **Idempotency is the caller's responsibility.** The orchestrator
-   tracks which zones have been traded; we don't query Supabase to
-   check. This keeps the function fast and pure-call. (A defensive
-   check could be added later if buggy callers become a real risk.)
+3. **L2/L3 trade rows have ``mt5_ticket=None`` and ``entry_price=None``.**
+   They get populated when ``entry_trigger`` fires the layers.
 
-4. **Order comment format**: ``bot:L{1,2,3}:s={first 8 chars of setup_id}``
-   — fits MT5's 31-char comment limit and gives operator-side
-   traceability when looking at the broker's trade history.
+4. **Idempotency = caller's responsibility.** Documented.
 
-5. **Partial fills are accepted (Section 4.5).** If Layer 2 or Layer 3
-   fails to place, we log the failure and continue with the layers we
-   got. Layer 1 must succeed (it's the entry).
+5. **Comment format**: ``bot:L1:s={first 8 chars of setup_id}`` — fits
+   MT5's 31-char limit. Only Layer 1 gets a broker comment;
+   ``entry_trigger`` writes its own comments when it fires L2/L3.
 
-6. **Setup record stays at PENDING in v1** if anything goes sideways
-   downstream. The supabase_logger doesn't yet have an
-   ``update_setup_status`` method; we log to ``bot_logs`` for
-   reconciliation. Adding update_setup is a follow-up.
+6. **Setup record stays at PENDING in v1** if downstream fails.
+   Reconciliation via ``position_tracker.reconcile_with_mt5()``.
 """
 
 from __future__ import annotations
@@ -80,7 +76,7 @@ from bot.logging.supabase_logger import (
 )
 from bot.strategy.imbalance import ImbalanceZone
 
-PlacementStatus = Literal["PLACED", "PARTIAL", "FAILED", "SKIPPED"]
+PlacementStatus = Literal["PLACED", "FAILED", "SKIPPED"]
 
 
 @dataclass(frozen=True)
@@ -96,9 +92,9 @@ class OrderManagerConfig:
 @dataclass(frozen=True)
 class OrderPlacementResult:
     setup_id: UUID | None
-    layer_1_ticket: int | None
-    layer_2_ticket: int | None
-    layer_3_ticket: int | None
+    layer_1_ticket: int | None  # broker ticket for Layer 1
+    layer_2_trade_id: UUID | None  # Supabase row UUID for the WAITING L2 row
+    layer_3_trade_id: UUID | None  # Supabase row UUID for the WAITING L3 row
     layer_1_filled_price: float | None
     sl_price: float
     tp1_price: float
@@ -121,44 +117,27 @@ def place_layered_orders(
     supabase: SupabaseLogger,
     config: OrderManagerConfig | None = None,
 ) -> OrderPlacementResult:
-    """Place Layer 1 (market) + Layers 2-3 (limits) for a tradeable zone.
+    """Place Layer 1 + write Supabase rows for Layers 2/3 (status=WAITING).
 
-    Parameters
-    ----------
-    zone
-        :class:`ImbalanceZone` from the Phase B pipeline. Must be
-        ``is_tradeable=True`` and either ``is_strong_point=True`` or
-        ``is_imbalance=True``.
-    zone_id
-        UUID of the already-persisted zone row in Supabase.
-    lot_size
-        From :func:`bot.risk.position_sizing.calculate_lot_size`.
-    sl_price
-        Stop-loss price for *all three* layers. Must be on the correct
-        side of the zone (below zone.top for BUY; above zone.bottom for
-        SELL).
-    mt5
-        :class:`MT5Connector` instance.
-    supabase
-        :class:`SupabaseLogger` instance.
-    config
-        Optional :class:`OrderManagerConfig` overrides.
+    Layers 2 and 3 are NOT sent to the broker. ``entry_trigger`` fires
+    them as market orders when the live tick reaches their trigger price.
     """
     cfg = config or OrderManagerConfig()
     errors: list[str] = []
 
-    # 1. Compute layer prices + TP1 (always doable; no I/O).
-    layer_prices = _compute_layer_prices(zone, cfg)
-    layer_1_price, layer_2_price, layer_3_price, tp1_price = layer_prices
+    # 1. Compute layer prices + TP1.
+    layer_1_price, layer_2_price, layer_3_price, tp1_price = (
+        _compute_layer_prices(zone, cfg)
+    )
 
-    # 2. Pre-checks. Fail fast before any side effects.
+    # 2. Pre-checks.
     pre_check_error = _validate_inputs(zone, lot_size, sl_price)
     if pre_check_error is not None:
         errors.append(pre_check_error)
         logger.warning(f"order_manager pre-check failed: {pre_check_error}")
         return _failed_result(sl_price, tp1_price, errors)
 
-    # 3. Create setup record in Supabase. If this fails, no MT5 calls.
+    # 3. Create setup record.
     entry_mode = (
         "IMBALANCE_FIRST_TOUCH" if zone.is_imbalance
         else "STRONG_POINT_FIRST_TOUCH"
@@ -190,7 +169,7 @@ def place_layered_orders(
             direction=zone.direction,
             lot_size=lot_size,
             sl=sl_price,
-            tp=None,  # TP1 is bot-managed; see module docstring.
+            tp=None,  # bot-managed; see module docstring.
             comment=f"bot:L1:s={setup_id_short}",
         )
     except Exception as e:
@@ -204,17 +183,20 @@ def place_layered_orders(
         )
         return _failed_result(sl_price, tp1_price, errors, setup_id=setup_id)
 
-    # 5. Look up filled price and check for gap-through.
-    layer_1_filled_price = _resolve_filled_price(mt5, cfg.symbol, layer_1_ticket)
+    # 5. Resolve filled price + gap-through check.
+    layer_1_filled_price = _resolve_filled_price(
+        mt5, cfg.symbol, layer_1_ticket
+    )
     if layer_1_filled_price is not None:
-        gap = _detect_gap_through(zone, layer_1_filled_price, cfg.gap_tolerance_dollars)
+        gap = _detect_gap_through(
+            zone, layer_1_filled_price, cfg.gap_tolerance_dollars
+        )
         if gap is not None:
-            # Close Layer 1 — we shouldn't be in this trade.
             try:
                 mt5.close_position(layer_1_ticket)
             except Exception as e:
-                errors.append(f"failed to close Layer 1 after gap detected: {e}")
-                logger.exception("order_manager: failed to close Layer 1 on gap")
+                errors.append(f"failed to close Layer 1 after gap: {e}")
+                logger.exception("order_manager: close-on-gap failed")
             errors.append(gap)
             _try_log_event(
                 supabase, "WARN", "Setup skipped: gap through zone",
@@ -229,8 +211,8 @@ def place_layered_orders(
             return OrderPlacementResult(
                 setup_id=setup_id,
                 layer_1_ticket=layer_1_ticket,
-                layer_2_ticket=None,
-                layer_3_ticket=None,
+                layer_2_trade_id=None,
+                layer_3_trade_id=None,
                 layer_1_filled_price=layer_1_filled_price,
                 sl_price=sl_price,
                 tp1_price=tp1_price,
@@ -238,52 +220,27 @@ def place_layered_orders(
                 error_messages=errors,
             )
 
-    # 6. Place Layers 2 & 3 (pending limits). Failures here are
-    # accepted as partial fills (spec Section 4.5).
-    layer_2_ticket = _try_place_limit(
-        mt5, cfg.symbol, zone.direction, lot_size, layer_2_price,
-        sl_price, f"bot:L2:s={setup_id_short}", errors, layer=2,
-    )
-    layer_3_ticket = _try_place_limit(
-        mt5, cfg.symbol, zone.direction, lot_size, layer_3_price,
-        sl_price, f"bot:L3:s={setup_id_short}", errors, layer=3,
-    )
-
-    # 7. Determine final status.
-    placed = sum(
-        1 for t in (layer_1_ticket, layer_2_ticket, layer_3_ticket)
-        if t is not None
-    )
-    status: PlacementStatus = "PLACED" if placed == 3 else "PARTIAL"
-
-    # 8. Write trade records (best-effort — Layer 1 is already on the
-    # broker, so a Supabase failure here is a bookkeeping problem, not
-    # a trading problem).
-    _try_log_trades(
+    # 6. Write trade records: Layer 1 FILLED, Layers 2/3 WAITING.
+    layer_2_trade_id, layer_3_trade_id = _write_trade_rows(
         supabase=supabase,
         setup_id=setup_id,
         zone=zone,
         lot_size=lot_size,
         sl_price=sl_price,
-        tp1_price=tp1_price,
         layer_1_ticket=layer_1_ticket,
         layer_1_filled_price=layer_1_filled_price,
-        layer_2_ticket=layer_2_ticket,
-        layer_2_price=layer_2_price,
-        layer_3_ticket=layer_3_ticket,
-        layer_3_price=layer_3_price,
         errors=errors,
     )
 
     return OrderPlacementResult(
         setup_id=setup_id,
         layer_1_ticket=layer_1_ticket,
-        layer_2_ticket=layer_2_ticket,
-        layer_3_ticket=layer_3_ticket,
+        layer_2_trade_id=layer_2_trade_id,
+        layer_3_trade_id=layer_3_trade_id,
         layer_1_filled_price=layer_1_filled_price,
         sl_price=sl_price,
         tp1_price=tp1_price,
-        status=status,
+        status="PLACED",
         error_messages=errors,
     )
 
@@ -300,14 +257,12 @@ def _compute_layer_prices(
     midpoint = (zone.top + zone.bottom) / 2.0
     if zone.direction == "BUY":
         return zone.top, midpoint, zone.bottom, zone.top + cfg.tp1_distance_dollars
-    # SELL
     return zone.bottom, midpoint, zone.top, zone.bottom - cfg.tp1_distance_dollars
 
 
 def _validate_inputs(
     zone: ImbalanceZone, lot_size: float, sl_price: float
 ) -> str | None:
-    """Return an error message if pre-checks fail, else None."""
     if not zone.is_tradeable:
         return f"zone not tradeable: {zone.rejection_reason}"
     if not (zone.is_strong_point or zone.is_imbalance):
@@ -328,7 +283,6 @@ def _validate_inputs(
 def _resolve_filled_price(
     mt5: MT5Connector, symbol: str, ticket: int
 ) -> float | None:
-    """Look up the open position's fill price by ticket. None if not found."""
     try:
         positions = mt5.get_open_positions(symbol=symbol)
     except Exception:
@@ -345,11 +299,7 @@ def _resolve_filled_price(
 def _detect_gap_through(
     zone: ImbalanceZone, filled_price: float, tolerance: float
 ) -> str | None:
-    """Return an error message if the fill is past the far edge by > tolerance.
-
-    For BUY: filled_price < zone.bottom - tolerance is a gap-through.
-    For SELL: filled_price > zone.top + tolerance is a gap-through.
-    """
+    """Error message if fill is past the far zone edge by > tolerance."""
     if zone.direction == "BUY":
         threshold = zone.bottom - tolerance
         if filled_price < threshold:
@@ -367,100 +317,78 @@ def _detect_gap_through(
     return None
 
 
-def _try_place_limit(
-    mt5: MT5Connector,
-    symbol: str,
-    direction: str,
-    lot_size: float,
-    price: float,
-    sl_price: float,
-    comment: str,
-    errors: list[str],
-    *,
-    layer: int,
-) -> int | None:
-    try:
-        return mt5.place_limit_order(
-            symbol=symbol,
-            direction=direction,  # type: ignore[arg-type]
-            lot_size=lot_size,
-            price=price,
-            sl=sl_price,
-            tp=None,
-            comment=comment,
-        )
-    except Exception as e:
-        errors.append(f"Layer {layer} pending limit failed: {e}")
-        logger.exception(f"order_manager: Layer {layer} placement failed")
-        return None
-
-
-def _try_log_trades(
+def _write_trade_rows(
     *,
     supabase: SupabaseLogger,
     setup_id: UUID,
     zone: ImbalanceZone,
     lot_size: float,
     sl_price: float,
-    tp1_price: float,
-    layer_1_ticket: int | None,
+    layer_1_ticket: int,
     layer_1_filled_price: float | None,
-    layer_2_ticket: int | None,
-    layer_2_price: float,
-    layer_3_ticket: int | None,
-    layer_3_price: float,
     errors: list[str],
-) -> None:
-    """Best-effort trade-row writes. Failures don't change the result status."""
+) -> tuple[UUID | None, UUID | None]:
+    """Write all three trade rows. Best-effort.
+
+    Returns (layer_2_trade_id, layer_3_trade_id). Either may be None
+    if its insert failed — Layer 1 errors are logged but don't fail
+    the whole call (Layer 1 is already on the broker; its row is
+    repairable).
+    """
+    layer_2_trade_id: UUID | None = None
+    layer_3_trade_id: UUID | None = None
+
+    # Layer 1: FILLED with broker ticket and entry price.
     try:
-        if layer_1_ticket is not None:
-            supabase.log_trade(TradeInput(
+        supabase.log_trade(TradeInput(
+            setup_id=setup_id,
+            layer_number=1,
+            direction=zone.direction,
+            order_type="MARKET",
+            mt5_ticket=layer_1_ticket,
+            entry_price=(
+                Decimal(str(layer_1_filled_price))
+                if layer_1_filled_price is not None else None
+            ),
+            lot_size=Decimal(str(lot_size)),
+            sl_price=Decimal(str(sl_price)),
+            tp_price=None,
+            status="FILLED",
+        ))
+    except Exception as e:
+        errors.append(f"Layer 1 trade row write failed: {e}")
+        logger.exception(
+            "order_manager: Layer 1 trade row write failed — "
+            "broker has the order but Supabase doesn't; reconciliation needed"
+        )
+
+    # Layer 2: WAITING — entry_trigger will fire it.
+    for layer_num in (2, 3):
+        try:
+            row = supabase.log_trade(TradeInput(
                 setup_id=setup_id,
-                layer_number=1,
+                layer_number=layer_num,
                 direction=zone.direction,
-                order_type="MARKET",
-                mt5_ticket=layer_1_ticket,
-                entry_price=(
-                    Decimal(str(layer_1_filled_price))
-                    if layer_1_filled_price is not None else None
-                ),
-                lot_size=Decimal(str(lot_size)),
-                sl_price=Decimal(str(sl_price)),
-                tp_price=None,  # bot-managed, not on broker order
-                status="FILLED",
-            ))
-        if layer_2_ticket is not None:
-            supabase.log_trade(TradeInput(
-                setup_id=setup_id,
-                layer_number=2,
-                direction=zone.direction,
-                order_type="LIMIT",
-                mt5_ticket=layer_2_ticket,
-                entry_price=None,  # not yet filled
-                lot_size=Decimal(str(lot_size)),
-                sl_price=Decimal(str(sl_price)),
-                tp_price=None,
-                status="PENDING",
-            ))
-        if layer_3_ticket is not None:
-            supabase.log_trade(TradeInput(
-                setup_id=setup_id,
-                layer_number=3,
-                direction=zone.direction,
-                order_type="LIMIT",
-                mt5_ticket=layer_3_ticket,
+                order_type="MARKET",  # all bot-fired layers are market orders
+                mt5_ticket=None,
                 entry_price=None,
                 lot_size=Decimal(str(lot_size)),
                 sl_price=Decimal(str(sl_price)),
                 tp_price=None,
-                status="PENDING",
+                status="WAITING",
             ))
-    except Exception as e:
-        errors.append(f"trade record write failed: {e}")
-        logger.exception(
-            "order_manager: trade-record writes failed — orders are "
-            "placed on broker but unrecorded; will need reconciliation"
-        )
+            trade_id = UUID(str(row["id"]))
+            if layer_num == 2:
+                layer_2_trade_id = trade_id
+            else:
+                layer_3_trade_id = trade_id
+        except Exception as e:
+            errors.append(f"Layer {layer_num} WAITING trade row failed: {e}")
+            logger.exception(
+                f"order_manager: Layer {layer_num} WAITING row write failed"
+            )
+
+    return layer_2_trade_id, layer_3_trade_id
 
 
 def _try_log_event(
@@ -493,8 +421,8 @@ def _failed_result(
     return OrderPlacementResult(
         setup_id=setup_id,
         layer_1_ticket=None,
-        layer_2_ticket=None,
-        layer_3_ticket=None,
+        layer_2_trade_id=None,
+        layer_3_trade_id=None,
         layer_1_filled_price=None,
         sl_price=sl_price,
         tp1_price=tp1_price,

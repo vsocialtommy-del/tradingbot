@@ -44,7 +44,7 @@ SetupStatus = Literal[
     "PENDING", "ACTIVE", "TP1_HIT", "CLOSED", "SKIPPED", "STOPPED_OUT"
 ]
 TradeStatus = Literal[
-    "PENDING", "FILLED", "PARTIALLY_CLOSED", "CLOSED", "CANCELLED"
+    "WAITING", "FILLED", "PARTIALLY_CLOSED", "CLOSED", "CANCELLED"
 ]
 OrderType = Literal["MARKET", "LIMIT"]
 CloseReason = Literal["TP1", "SL_HIT", "BE_HIT", "MANUAL_CLOSE", "NEWS_CLOSE"]
