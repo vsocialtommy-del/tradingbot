@@ -1,7 +1,7 @@
 """OHLC bar fetcher with TTL caching.
 
 Wraps ``MT5Connector.get_ohlc`` with a small in-memory cache so the
-strategy modules can ask "give me the last 200 1H bars" repeatedly
+strategy modules can ask "give me the last 200 M5 bars" repeatedly
 without a network round-trip every time.
 
 Cache strategy

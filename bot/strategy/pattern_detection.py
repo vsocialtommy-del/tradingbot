@@ -1,4 +1,4 @@
-"""W and M pattern detection on close prices (1H line chart).
+"""W and M pattern detection on close prices.
 
 Builds on :mod:`bot.strategy.structure` for swing detection. Pure-Python
 logic on pandas DataFrames — no MT5, no Supabase, no I/O.
@@ -97,7 +97,7 @@ class PatternConfig:
     # for Gold; tunable in backtest.
     peak_threshold_pct: float = 0.2
     # Both pivots must lie within the most recent N bars of the
-    # DataFrame. 50 1H bars ≈ two trading days.
+    # DataFrame. On M5 (the v1 strategy timeframe) 50 bars ≈ 4 hours.
     lookback_bars: int = 50
 
 

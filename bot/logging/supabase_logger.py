@@ -141,6 +141,63 @@ class LogEvent(_ModelBase):
 
 
 # ---------------------------------------------------------------------------
+# Pydantic READ models — typed views of rows pulled back from Supabase.
+# Used by position_tracker for type-safe state-machine logic.
+# ---------------------------------------------------------------------------
+
+
+class _ReadModelBase(BaseModel):
+    """Read models are lenient: extra fields ignored (forward-compat)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class Setup(_ReadModelBase):
+    """A row from the ``setups`` table."""
+
+    id: UUID
+    zone_id: UUID
+    direction: Direction
+    entry_mode: EntryMode
+    planned_layer1_price: Decimal
+    planned_layer2_price: Decimal
+    planned_layer3_price: Decimal
+    planned_sl_price: Decimal
+    planned_tp1_price: Decimal
+    status: SetupStatus
+    skip_reason: str | None = None
+    activated_at: datetime | None = None
+    closed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class Trade(_ReadModelBase):
+    """A row from the ``trades`` table."""
+
+    id: UUID
+    setup_id: UUID
+    layer_number: int
+    direction: Direction
+    order_type: OrderType
+    mt5_ticket: int | None = None
+    entry_price: Decimal | None = None
+    exit_price: Decimal | None = None
+    lot_size: Decimal
+    sl_price: Decimal
+    tp_price: Decimal | None = None
+    status: TradeStatus
+    pnl: Decimal | None = None
+    commission: Decimal = Decimal("0")
+    swap: Decimal = Decimal("0")
+    close_reason: CloseReason | None = None
+    filled_at: datetime | None = None
+    closed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+# ---------------------------------------------------------------------------
 # Wrapper
 # ---------------------------------------------------------------------------
 
@@ -228,3 +285,118 @@ class SupabaseLogger:
         payload = event.model_dump(mode="json", exclude_none=True)
         result = self._client.table("bot_logs").insert(payload).execute()
         return result.data[0]
+
+    # ---- read methods (used by position_tracker) ----
+
+    def get_setups_by_status(
+        self, statuses: list[str]
+    ) -> list[Setup]:
+        """Return all setup rows whose status is in ``statuses``."""
+        result = (
+            self._client.table("setups")
+            .select("*")
+            .in_("status", list(statuses))
+            .execute()
+        )
+        return [Setup.model_validate(row) for row in (result.data or [])]
+
+    def get_setup_by_id(self, setup_id: UUID | str) -> Setup | None:
+        """Return one setup by id, or None if not found."""
+        result = (
+            self._client.table("setups")
+            .select("*")
+            .eq("id", str(setup_id))
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return None
+        return Setup.model_validate(rows[0])
+
+    def get_trade_by_id(self, trade_id: UUID | str) -> Trade | None:
+        result = (
+            self._client.table("trades")
+            .select("*")
+            .eq("id", str(trade_id))
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return None
+        return Trade.model_validate(rows[0])
+
+    def get_trades_for_setup(self, setup_id: UUID | str) -> list[Trade]:
+        """Return all trade (layer) rows for a setup, ordered by layer."""
+        result = (
+            self._client.table("trades")
+            .select("*")
+            .eq("setup_id", str(setup_id))
+            .order("layer_number")
+            .execute()
+        )
+        return [Trade.model_validate(row) for row in (result.data or [])]
+
+    # ---- update methods ----
+
+    def update_setup(
+        self, setup_id: UUID | str, **fields: Any
+    ) -> Setup:
+        """Patch fields on a setup row. Returns the updated row.
+
+        ``None`` values are stripped so partial updates can't blank
+        existing columns. Pass an explicit empty string or sentinel if
+        you really need to clear something.
+        """
+        payload = _serialize_update_payload(fields)
+        if not payload:
+            raise ValueError("update_setup called with no fields to update")
+        result = (
+            self._client.table("setups")
+            .update(payload)
+            .eq("id", str(setup_id))
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            raise ValueError(f"setup {setup_id} not found for update")
+        return Setup.model_validate(rows[0])
+
+    def update_trade(
+        self, trade_id: UUID | str, **fields: Any
+    ) -> Trade:
+        """Patch fields on a trade row. Returns the updated row."""
+        payload = _serialize_update_payload(fields)
+        if not payload:
+            raise ValueError("update_trade called with no fields to update")
+        result = (
+            self._client.table("trades")
+            .update(payload)
+            .eq("id", str(trade_id))
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            raise ValueError(f"trade {trade_id} not found for update")
+        return Trade.model_validate(rows[0])
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _serialize_update_payload(fields: dict[str, Any]) -> dict[str, Any]:
+    """Drop None values; convert Decimals/UUIDs/datetimes to JSON-friendly forms."""
+    out: dict[str, Any] = {}
+    for k, v in fields.items():
+        if v is None:
+            continue
+        if isinstance(v, Decimal):
+            out[k] = str(v)
+        elif isinstance(v, UUID):
+            out[k] = str(v)
+        elif isinstance(v, datetime):
+            out[k] = v.isoformat()
+        else:
+            out[k] = v
+    return out
