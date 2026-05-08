@@ -28,6 +28,16 @@ from bot.backtest.metrics import (
     TradeMetrics,
     compute_metrics,
 )
+from bot.backtest.reporter import (
+    ReporterConfig,
+    generate_drawdown_chart,
+    generate_equity_curve,
+    generate_hourly_heatmap,
+    generate_html_report,
+    generate_r_multiple_histogram,
+    generate_skip_reasons_pie,
+    generate_trade_scatter,
+)
 from bot.backtest.simulator import (
     BacktestBroker,
     BrokerConfig,
@@ -54,6 +64,15 @@ __all__ = [
     "SetupMetrics",
     "TradeMetrics",
     "compute_metrics",
+    # reporter
+    "ReporterConfig",
+    "generate_drawdown_chart",
+    "generate_equity_curve",
+    "generate_hourly_heatmap",
+    "generate_html_report",
+    "generate_r_multiple_histogram",
+    "generate_skip_reasons_pie",
+    "generate_trade_scatter",
     # simulator
     "BacktestBroker",
     "BrokerConfig",
