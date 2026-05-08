@@ -171,15 +171,40 @@ Stage 3: Runner phase        → Tommy manually manages or SL stays at BE until 
 
 ### 6.1 TP1 (automated)
 
-**Trigger:** Price moves $4-5 beyond the zone edge in trade direction
-- For BUY: zone top + $4-5
-- For SELL: zone bottom - $4-5
+**Trigger (default — `tp1_method = BOS_LEVEL`):**
+TP1 = the BoS level — the swing high (BUY) or swing low (SELL) from
+**before** the zone formed that the impulse broke through. This is the
+prior structural level that traders watch for retracement, and price
+typically reacts there. The level is captured automatically by the
+Strong Point validator (`bos_event.broken_level`) and snapshotted onto
+the setup as `planned_tp1_price`.
 
-Default value: $4 (configurable parameter, will be tuned in backtest)
+Confirmed via real trade screenshot analysis (May 2026): zone at
+~4,704–4,710, TP at 4,717.478 — the swing high broken by the impulse
+that formed the zone.
 
-**Action at TP1:**
-- Close 50% of total position (half of each filled layer)
-- Move SL on remaining 50% to break-even (= average entry price of filled layers)
+**No filter on TP distance.** A BoS level 1–2 points beyond the zone
+gives a tiny TP, a BoS level 50+ points away gives a wide TP — both are
+acceptable. Tommy's directive: take all valid Strong Points.
+
+**Trigger (legacy — `tp1_method = FIXED_DISTANCE`):**
+TP1 = `zone_edge ± tp1_distance_dollars` (default $4, configurable in
+the $2–10 range, optimised in backtest).
+- For BUY: zone top + $4
+- For SELL: zone bottom - $4
+
+The fixed-distance path is retained as a backtest-revert escape hatch.
+Switch by setting `bot_config.tp1_method = "FIXED_DISTANCE"`.
+
+**Action at TP1 (both methods):**
+- Close 50% of total position (half of each filled layer, rounded down
+  to broker lot step; in v1 with 0.01 lots the rounded amount is below
+  the step, so the partial close is skipped and the runner is preserved
+  intact — see `tp1_manager` for details).
+- Move SL on remaining 50% to break-even (= lot-weighted average of
+  filled entry prices).
+- Cascade-cancel any still-WAITING Layer 2/3 trades (no new entries
+  after profit is locked).
 
 ### 6.2 TP2 / Runner (manual)
 
@@ -477,7 +502,8 @@ gold-bot/
 ### 11.3 Parameters to optimize
 
 - Zone size filter ranges (currently 5-80, optimize)
-- TP1 distance (currently $4, optimize $2-10 range)
+- TP1 method: `BOS_LEVEL` (default, May 2026 refinement) vs `FIXED_DISTANCE` (legacy). A/B both on the test window — the BoS-level retracement target is the strategy default but the fixed-distance path is preserved for rollback.
+- TP1 distance — only when `tp1_method=FIXED_DISTANCE` (currently $4, optimize $2-10 range)
 - SL buffer (currently 15-20 points, optimize 10-30 range)
 - "Recent low" lookback (currently 20 candles, optimize 10-50)
 - Pattern tolerance (currently 0.1%, optimize 0.05-0.2%)
@@ -520,7 +546,7 @@ These can be defaulted in v1 and refined later:
 - [x] Setup types decided (Strong Point + Imbalance only)
 - [x] Entry rules locked (first touch, 3 layers)
 - [x] SL rules locked (real SL → BE after TP1)
-- [x] TP1 rule locked ($4-5 beyond zone)
+- [x] TP1 rule locked (default: BoS level; legacy $4-5 distance behind `tp1_method` config flag)
 - [x] Runner management decided (manual)
 - [x] Risk parameters locked (0.33% per layer)
 - [x] Tech stack decided
