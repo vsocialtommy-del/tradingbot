@@ -32,7 +32,7 @@ from bot.execution.order_manager import (
 from bot.logging.supabase_logger import SupabaseLogger
 from bot.strategy.imbalance import ImbalanceZone
 from bot.strategy.pattern_detection import MPattern, WPattern
-from bot.strategy.structure import Swing
+from bot.strategy.structure import BosEvent, Swing
 from bot.strategy.strong_point import ValidatedZone
 from bot.strategy.zone_marking import Zone
 from bot.strategy.zone_refinement import RefinedZone
@@ -52,7 +52,17 @@ def make_imbalance_zone(
     is_imbalance: bool = True,
     is_tradeable: bool = True,
     rejection_reason: str | None = None,
+    bos_broken_level: float | None = None,
 ) -> ImbalanceZone:
+    """Build an ImbalanceZone for tests.
+
+    ``bos_broken_level`` controls whether the zone carries a ``BosEvent``.
+    A real ``BosEvent`` is the v1 default for any Strong Point; tests
+    that exercise the BOS_LEVEL TP1 path should pass an explicit value
+    (e.g. ``top + 10`` for a BUY zone, ``bottom - 10`` for a SELL).
+    Default behaviour uses ``top + 5`` (BUY) or ``bottom - 5`` (SELL) so
+    BOS_LEVEL pre-checks pass; TP1-method-specific tests override.
+    """
     ts = pd.Timestamp("2026-05-08T12:00:00Z")
     if direction == "BUY":
         pattern: Any = WPattern(
@@ -68,6 +78,19 @@ def make_imbalance_zone(
             trough_index=6, trough_time=ts, trough_price=bottom - 10,
             formed_at=ts, completed=True,
         )
+
+    if bos_broken_level is None:
+        # Default to a sensible BoS level that survives pre-checks.
+        bos_broken_level = top + 5.0 if direction == "BUY" else bottom - 5.0
+    bos_event = BosEvent(
+        bar_index=12,
+        time=ts,
+        direction="UP" if direction == "BUY" else "DOWN",
+        broken_swing_index=4,
+        broken_level=bos_broken_level,
+        break_close=bos_broken_level + 0.5 if direction == "BUY"
+                    else bos_broken_level - 0.5,
+    )
 
     initial = Zone(
         direction=direction,  # type: ignore[arg-type]
@@ -86,7 +109,8 @@ def make_imbalance_zone(
         is_tradeable=is_tradeable,
         rejection_reason=rejection_reason,  # type: ignore[arg-type]
         original_zone=initial, refined_zone=refined,
-        is_strong_point=is_strong_point, validation_failures=[], bos_event=None,
+        is_strong_point=is_strong_point, validation_failures=[],
+        bos_event=bos_event,
     )
     return ImbalanceZone(
         direction=direction,  # type: ignore[arg-type]
@@ -94,11 +118,44 @@ def make_imbalance_zone(
         is_tradeable=is_tradeable,
         rejection_reason=rejection_reason,  # type: ignore[arg-type]
         original_zone=initial, refined_zone=refined,
-        is_strong_point=is_strong_point, validation_failures=[], bos_event=None,
+        is_strong_point=is_strong_point, validation_failures=[],
+        bos_event=bos_event,
         validated_zone=validated,
         approach_count=2 if is_imbalance else 0, is_imbalance=is_imbalance,
         approach_events=[], qualified_at=ts if is_imbalance else None,
         is_tapped=False, tapped_at=None,
+    )
+
+
+def make_imbalance_zone_no_bos(**kwargs: Any) -> ImbalanceZone:
+    """Build an ImbalanceZone with ``bos_event=None``.
+
+    Used only for the defensive test that the BOS_LEVEL pre-check fails
+    cleanly when validation has been bypassed. (In production every zone
+    reaching ``order_manager`` has a ``bos_event`` because ``strong_point``
+    guarantees it; this exists purely to verify the guard.)
+    """
+    z = make_imbalance_zone(**kwargs)
+    # Rebuild with bos_event=None on both layers.
+    no_bos_validated = ValidatedZone(
+        direction=z.direction, top=z.top, bottom=z.bottom,
+        formed_at=z.formed_at, source_pattern=z.source_pattern,
+        is_tradeable=z.is_tradeable, rejection_reason=z.rejection_reason,
+        original_zone=z.original_zone, refined_zone=z.refined_zone,
+        is_strong_point=z.is_strong_point,
+        validation_failures=z.validation_failures, bos_event=None,
+    )
+    return ImbalanceZone(
+        direction=z.direction, top=z.top, bottom=z.bottom,
+        formed_at=z.formed_at, source_pattern=z.source_pattern,
+        is_tradeable=z.is_tradeable, rejection_reason=z.rejection_reason,
+        original_zone=z.original_zone, refined_zone=z.refined_zone,
+        is_strong_point=z.is_strong_point,
+        validation_failures=z.validation_failures, bos_event=None,
+        validated_zone=no_bos_validated,
+        approach_count=z.approach_count, is_imbalance=z.is_imbalance,
+        approach_events=z.approach_events, qualified_at=z.qualified_at,
+        is_tapped=z.is_tapped, tapped_at=z.tapped_at,
     )
 
 
@@ -180,7 +237,10 @@ class TestHappyPath:
         layer_2_trade_id: UUID,
         layer_3_trade_id: UUID,
     ) -> None:
-        zone = make_imbalance_zone(direction="BUY", top=1900, bottom=1895)
+        zone = make_imbalance_zone(
+            direction="BUY", top=1900, bottom=1895,
+            bos_broken_level=1907.0,  # the swing high broken by the impulse
+        )
         result = place_layered_orders(
             zone, zone_id, lot_size=0.01, sl_price=1880.0,
             mt5=mock_mt5, supabase=mock_supabase,
@@ -193,13 +253,17 @@ class TestHappyPath:
         assert result.layer_3_trade_id == layer_3_trade_id
         assert result.layer_1_filled_price == 1900.00
         assert result.error_messages == []
-        assert result.tp1_price == 1904.0  # top + 4
+        # BOS_LEVEL (default): TP1 = bos_event.broken_level.
+        assert result.tp1_price == 1907.0
 
     def test_sell_layer_1_places_and_l2_l3_are_waiting_rows(
         self, mock_mt5, mock_supabase, zone_id, setup_id,
         layer_2_trade_id, layer_3_trade_id,
     ) -> None:
-        zone = make_imbalance_zone(direction="SELL", top=1905, bottom=1900)
+        zone = make_imbalance_zone(
+            direction="SELL", top=1905, bottom=1900,
+            bos_broken_level=1893.0,  # the swing low broken by the impulse
+        )
         result = place_layered_orders(
             zone, zone_id, lot_size=0.01, sl_price=1925.0,
             mt5=mock_mt5, supabase=mock_supabase,
@@ -208,7 +272,8 @@ class TestHappyPath:
         assert result.layer_1_ticket == 11111
         assert result.layer_2_trade_id == layer_2_trade_id
         assert result.layer_3_trade_id == layer_3_trade_id
-        assert result.tp1_price == 1896.0  # bottom - 4
+        # BOS_LEVEL (default): TP1 = bos_event.broken_level.
+        assert result.tp1_price == 1893.0
 
 
 class TestLayerOrderToBroker:
@@ -513,7 +578,10 @@ class TestSetupRecord:
     def test_setup_record_planned_prices_match_zone_geometry(
         self, mock_mt5, mock_supabase, zone_id,
     ) -> None:
-        zone = make_imbalance_zone(direction="BUY", top=1900, bottom=1895)
+        zone = make_imbalance_zone(
+            direction="BUY", top=1900, bottom=1895,
+            bos_broken_level=1908.0,
+        )
         place_layered_orders(
             zone, zone_id, 0.01, 1880.0,
             mt5=mock_mt5, supabase=mock_supabase,
@@ -523,7 +591,8 @@ class TestSetupRecord:
         assert float(s.planned_layer2_price) == 1897.5  # midpoint
         assert float(s.planned_layer3_price) == 1895.0  # zone bottom
         assert float(s.planned_sl_price) == 1880.0
-        assert float(s.planned_tp1_price) == 1904.0  # top + 4
+        # BOS_LEVEL (default): TP1 = bos_event.broken_level.
+        assert float(s.planned_tp1_price) == 1908.0
         assert s.status == "PENDING"
 
 
@@ -533,13 +602,189 @@ class TestSetupRecord:
 
 
 class TestConfig:
-    def test_custom_tp1_distance(
+    def test_default_method_is_bos_level(self) -> None:
+        # Sanity: default constructor selects BOS_LEVEL, the strategy default.
+        cfg = OrderManagerConfig()
+        assert cfg.tp1_method == "BOS_LEVEL"
+
+    def test_fixed_distance_uses_legacy_calculation(
         self, mock_mt5, mock_supabase, zone_id,
     ) -> None:
-        zone = make_imbalance_zone(direction="BUY", top=1900, bottom=1895)
+        # FIXED_DISTANCE remains usable for backtests. It ignores
+        # bos_event entirely — even with a BoS at 1907, the legacy path
+        # uses zone_top + tp1_distance_dollars.
+        zone = make_imbalance_zone(
+            direction="BUY", top=1900, bottom=1895,
+            bos_broken_level=1907.0,
+        )
         result = place_layered_orders(
             zone, zone_id, 0.01, 1880.0,
             mt5=mock_mt5, supabase=mock_supabase,
-            config=OrderManagerConfig(tp1_distance_dollars=10.0),
+            config=OrderManagerConfig(
+                tp1_method="FIXED_DISTANCE", tp1_distance_dollars=10.0,
+            ),
         )
-        assert result.tp1_price == 1910.0  # top + 10
+        # 1900 (top) + 10 = 1910 — the BoS at 1907 is intentionally ignored.
+        assert result.tp1_price == 1910.0
+
+    def test_fixed_distance_buy_default_4(
+        self, mock_mt5, mock_supabase, zone_id,
+    ) -> None:
+        zone = make_imbalance_zone(
+            direction="BUY", top=1900, bottom=1895,
+            bos_broken_level=1907.0,
+        )
+        result = place_layered_orders(
+            zone, zone_id, 0.01, 1880.0,
+            mt5=mock_mt5, supabase=mock_supabase,
+            config=OrderManagerConfig(tp1_method="FIXED_DISTANCE"),
+        )
+        assert result.tp1_price == 1904.0  # top + 4 default
+
+    def test_fixed_distance_sell_default_4(
+        self, mock_mt5, mock_supabase, zone_id,
+    ) -> None:
+        zone = make_imbalance_zone(
+            direction="SELL", top=1905, bottom=1900,
+            bos_broken_level=1893.0,
+        )
+        result = place_layered_orders(
+            zone, zone_id, 0.01, 1925.0,
+            mt5=mock_mt5, supabase=mock_supabase,
+            config=OrderManagerConfig(tp1_method="FIXED_DISTANCE"),
+        )
+        assert result.tp1_price == 1896.0  # bottom - 4 default
+
+
+# --------------------------------------------------------------------------- #
+# TP1 method = BOS_LEVEL — strategy default
+# --------------------------------------------------------------------------- #
+
+
+class TestTP1MethodBosLevel:
+    """May 2026 strategy refinement: TP1 = the swing high/low broken by
+    the impulse before the zone formed (spec Section 6.1)."""
+
+    def test_buy_uses_bos_event_broken_level(
+        self, mock_mt5, mock_supabase, zone_id,
+    ) -> None:
+        # Mirrors Tommy's screenshot example shape (zone ~6 pts wide,
+        # BoS ~7 pts above zone top) with mock-fixture-compatible prices.
+        # The actual numbers in the screenshot were 4704/4710/4717.478.
+        zone = make_imbalance_zone(
+            direction="BUY", top=1900.0, bottom=1894.0,
+            bos_broken_level=1907.478,
+        )
+        result = place_layered_orders(
+            zone, zone_id, 0.01, sl_price=1880.0,
+            mt5=mock_mt5, supabase=mock_supabase,
+        )
+        assert result.status == "PLACED"
+        assert result.tp1_price == pytest.approx(1907.478)
+
+    def test_sell_uses_bos_event_broken_level(
+        self, mock_mt5, mock_supabase, zone_id,
+    ) -> None:
+        # SELL mirror. Zone 1900-1906; BoS at 1885 (broken swing low
+        # below the zone, the natural retracement target downward).
+        # Mock fixture's price_open=1900.00 lands exactly at zone bottom
+        # (zone.top=1906, zone.bottom=1900 for SELL → entry at top means
+        # fill ≤ top + tolerance), so we override it.
+        mock_mt5.get_open_positions.return_value = [
+            {"ticket": 11111, "price_open": 1906.00},
+        ]
+        zone = make_imbalance_zone(
+            direction="SELL", top=1906.0, bottom=1900.0,
+            bos_broken_level=1885.0,
+        )
+        result = place_layered_orders(
+            zone, zone_id, 0.01, sl_price=1920.0,
+            mt5=mock_mt5, supabase=mock_supabase,
+        )
+        assert result.status == "PLACED"
+        assert result.tp1_price == pytest.approx(1885.0)
+
+    def test_bos_close_to_zone_still_used(
+        self, mock_mt5, mock_supabase, zone_id,
+    ) -> None:
+        # Edge case: BoS just 1.5 pts above zone top — tiny TP, but spec
+        # is "no filter, take all valid Strong Points".
+        zone = make_imbalance_zone(
+            direction="BUY", top=1900.0, bottom=1895.0,
+            bos_broken_level=1901.5,
+        )
+        result = place_layered_orders(
+            zone, zone_id, 0.01, 1880.0,
+            mt5=mock_mt5, supabase=mock_supabase,
+        )
+        assert result.status == "PLACED"
+        assert result.tp1_price == pytest.approx(1901.5)
+
+    def test_bos_far_from_zone_still_used(
+        self, mock_mt5, mock_supabase, zone_id,
+    ) -> None:
+        # Edge case: BoS 60+ pts above zone — wide TP. Same rule.
+        zone = make_imbalance_zone(
+            direction="BUY", top=1900.0, bottom=1895.0,
+            bos_broken_level=1962.0,
+        )
+        result = place_layered_orders(
+            zone, zone_id, 0.01, 1880.0,
+            mt5=mock_mt5, supabase=mock_supabase,
+        )
+        assert result.status == "PLACED"
+        assert result.tp1_price == pytest.approx(1962.0)
+
+    def test_planned_tp1_price_in_setup_row_matches_bos_level(
+        self, mock_mt5, mock_supabase, zone_id,
+    ) -> None:
+        # Verify the value persists into the Supabase setup row, not
+        # just the OrderPlacementResult.
+        zone = make_imbalance_zone(
+            direction="BUY", top=1900.0, bottom=1895.0,
+            bos_broken_level=1912.5,
+        )
+        place_layered_orders(
+            zone, zone_id, 0.01, 1880.0,
+            mt5=mock_mt5, supabase=mock_supabase,
+        )
+        s = mock_supabase.log_setup.call_args.args[0]
+        assert float(s.planned_tp1_price) == pytest.approx(1912.5)
+
+    def test_missing_bos_event_fails_pre_check_no_setup_written(
+        self, mock_mt5, mock_supabase, zone_id,
+    ) -> None:
+        # Defensive: a zone reaching order_manager without a bos_event
+        # means validation was bypassed somewhere upstream. Hard-fail
+        # with a clear error rather than crashing on None-deref.
+        zone = make_imbalance_zone_no_bos(
+            direction="BUY", top=1900.0, bottom=1895.0,
+        )
+        result = place_layered_orders(
+            zone, zone_id, 0.01, 1880.0,
+            mt5=mock_mt5, supabase=mock_supabase,
+        )
+        assert result.status == "FAILED"
+        assert result.setup_id is None
+        # Pre-check fails before any side effects.
+        mock_supabase.log_setup.assert_not_called()
+        mock_mt5.place_market_order.assert_not_called()
+        # Error message is actionable.
+        assert any("bos_event" in m for m in result.error_messages)
+        assert any("BOS_LEVEL" in m for m in result.error_messages)
+
+    def test_missing_bos_event_fixed_distance_still_works(
+        self, mock_mt5, mock_supabase, zone_id,
+    ) -> None:
+        # Inverse of the previous test: with FIXED_DISTANCE, no bos_event
+        # required — the legacy path is the rollback escape hatch.
+        zone = make_imbalance_zone_no_bos(
+            direction="BUY", top=1900.0, bottom=1895.0,
+        )
+        result = place_layered_orders(
+            zone, zone_id, 0.01, 1880.0,
+            mt5=mock_mt5, supabase=mock_supabase,
+            config=OrderManagerConfig(tp1_method="FIXED_DISTANCE"),
+        )
+        assert result.status == "PLACED"
+        assert result.tp1_price == 1904.0  # top + 4 (default)
