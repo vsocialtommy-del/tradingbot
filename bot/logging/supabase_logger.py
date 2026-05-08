@@ -25,11 +25,39 @@ from __future__ import annotations
 import os
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
-from supabase import Client, create_client
+
+# ``supabase-py`` is a runtime dep of the live bot but is NOT needed by
+# the backtest framework (which writes nothing to Supabase). Guarding
+# the import keeps ``bot.backtest`` usable on Linux/Colab/CI hosts that
+# don't have it installed. ``Client`` is annotation-only thanks to the
+# ``from __future__ import annotations`` above; ``create_client`` is
+# called lazily by :meth:`SupabaseLogger.__init__` only when the live
+# bot actually instantiates a logger.
+if TYPE_CHECKING:
+    from supabase import Client
+
+
+def _get_create_client() -> Any:
+    """Lazy ``from supabase import create_client``.
+
+    Same pattern as :class:`bot.execution.mt5_connector._LazyMT5`: any
+    transitive importer (sl_manager, tp1_manager, news_filter, …) can
+    pull this module in without supabase-py installed; only
+    constructing a real :class:`SupabaseLogger` triggers the import.
+    """
+    try:
+        from supabase import create_client  # noqa: PLC0415
+    except ImportError as e:
+        raise ImportError(
+            "supabase-py is required for SupabaseLogger but is not "
+            "installed. If you only need the backtest framework, use "
+            "``bot.backtest`` — it does not depend on supabase-py."
+        ) from e
+    return create_client
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +258,7 @@ class SupabaseLogger:
     """Thin typed wrapper over the supabase-py client for the bot's tables."""
 
     def __init__(self, url: str, service_role_key: str) -> None:
-        self._client: Client = create_client(url, service_role_key)
+        self._client: Client = _get_create_client()(url, service_role_key)
 
     @classmethod
     def from_env(cls) -> SupabaseLogger:
