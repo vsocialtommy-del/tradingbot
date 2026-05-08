@@ -28,6 +28,11 @@ requests>=2.31
 # ---- Logging ----
 loguru>=0.7
 
+# ---- Backtest visualisation (Phase D) ----
+# Plotly is the only chart dep — works in Colab, browser, and exports
+# to standalone HTML with no JS deps when embedded.
+plotly>=5.20
+
 # ---- Dev / test ----
 pytest>=7.4
 pytest-mock>=3.12
@@ -35,5 +40,4 @@ ruff>=0.1
 black>=23.12
 
 # Deferred — added in their respective phases:
-#   vectorbt / backtrader        Phase D (backtest)
 #   python-telegram-bot          Phase E (dashboard / alerts)
