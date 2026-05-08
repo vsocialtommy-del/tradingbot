@@ -38,6 +38,9 @@ pytest>=7.4
 pytest-mock>=3.12
 ruff>=0.1
 black>=23.12
+# nbformat: validates the Colab demo notebook structure in tests
+# (test_backtest_demo_notebook.py). Not needed at bot runtime.
+nbformat>=5.10
 
 # Deferred — added in their respective phases:
 #   python-telegram-bot          Phase E (dashboard / alerts)
