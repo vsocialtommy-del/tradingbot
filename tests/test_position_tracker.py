@@ -73,9 +73,9 @@ def make_trade(
     id: UUID | None = None,
     setup_id: UUID | None = None,
     layer_number: int = 1,
-    status: str = "PENDING",
+    status: str = "WAITING",
     mt5_ticket: int | None = 11111,
-    order_type: str = "LIMIT",
+    order_type: str = "MARKET",
     entry_price: Decimal | None = None,
 ) -> Trade:
     return Trade(
@@ -170,8 +170,8 @@ class TestStateMachineValidation:
     @pytest.mark.parametrize(
         "current,new",
         [
-            ("PENDING", "FILLED"),
-            ("PENDING", "CANCELLED"),
+            ("WAITING", "FILLED"),
+            ("WAITING", "CANCELLED"),
             ("FILLED", "PARTIALLY_CLOSED"),
             ("FILLED", "CLOSED"),
             ("PARTIALLY_CLOSED", "CLOSED"),
@@ -183,9 +183,9 @@ class TestStateMachineValidation:
     @pytest.mark.parametrize(
         "current,new",
         [
-            ("FILLED", "PENDING"),       # backwards
-            ("CLOSED", "FILLED"),         # from terminal
-            ("CANCELLED", "PENDING"),     # from terminal
+            ("FILLED", "WAITING"),         # backwards
+            ("CLOSED", "FILLED"),          # from terminal
+            ("CANCELLED", "WAITING"),      # from terminal
             ("PARTIALLY_CLOSED", "FILLED"),  # backwards
         ],
     )
@@ -360,15 +360,148 @@ class TestUpdateSetupStatus:
 
 
 # --------------------------------------------------------------------------- #
+# Cascade-cancel WAITING trades on terminal setup transitions
+# --------------------------------------------------------------------------- #
+
+
+class TestCascadeCancel:
+    def _setup_with_waiting_layers(
+        self, mock_supabase: MagicMock,
+        *,
+        setup_status: str = "ACTIVE",
+        layer_2_status: str = "WAITING",
+        layer_3_status: str = "WAITING",
+    ) -> tuple[Setup, list[Trade]]:
+        setup = make_setup(status=setup_status)
+        trades = [
+            make_trade(
+                setup_id=setup.id, layer_number=1,
+                status="FILLED", mt5_ticket=11111,
+            ),
+            make_trade(
+                setup_id=setup.id, layer_number=2,
+                status=layer_2_status, mt5_ticket=None,
+            ),
+            make_trade(
+                setup_id=setup.id, layer_number=3,
+                status=layer_3_status, mt5_ticket=None,
+            ),
+        ]
+        # The cascade fetches trades on every cancel call, so make
+        # get_trades_for_setup return them. update_trade_status fetches
+        # each trade by id; configure that too.
+        mock_supabase.get_trades_for_setup.return_value = trades
+        # get_trade_by_id is called inside update_trade_status. Return
+        # the matching trade based on the requested id.
+        def by_id(tid):
+            for t in trades:
+                if str(t.id) == str(tid):
+                    return t
+            return None
+        mock_supabase.get_trade_by_id.side_effect = by_id
+        # update_trade returns the (now-CANCELLED) trade.
+        mock_supabase.update_trade.side_effect = lambda *args, **kwargs: trades[0]
+        mock_supabase.get_setup_by_id.return_value = setup
+        mock_supabase.update_setup.return_value = setup
+        return setup, trades
+
+    def test_setup_to_stopped_out_cancels_waiting_trades(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        setup, trades = self._setup_with_waiting_layers(mock_supabase)
+
+        tracker.update_setup_status(setup.id, "STOPPED_OUT")
+
+        # 2 WAITING trades should be cancelled (layers 2 and 3).
+        # update_trade is called 1× for setup status + 2× for cascade.
+        cascade_calls = [
+            c for c in mock_supabase.update_trade.call_args_list
+            if c.kwargs.get("status") == "CANCELLED"
+        ]
+        assert len(cascade_calls) == 2
+
+    def test_setup_to_closed_cancels_waiting_trades(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        setup, _ = self._setup_with_waiting_layers(mock_supabase)
+        tracker.update_setup_status(setup.id, "CLOSED")
+        cascade_calls = [
+            c for c in mock_supabase.update_trade.call_args_list
+            if c.kwargs.get("status") == "CANCELLED"
+        ]
+        assert len(cascade_calls) == 2
+
+    def test_setup_pending_to_skipped_no_waiting_trades(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        # PENDING setups have no trade rows yet (order_manager hasn't
+        # written them). Cascade is a no-op.
+        setup = make_setup(status="PENDING")
+        mock_supabase.get_setup_by_id.return_value = setup
+        mock_supabase.update_setup.return_value = setup
+        mock_supabase.get_trades_for_setup.return_value = []
+
+        tracker.update_setup_status(setup.id, "SKIPPED")
+
+        # No update_trade calls for cascade.
+        cascade_calls = [
+            c for c in mock_supabase.update_trade.call_args_list
+            if c.kwargs.get("status") == "CANCELLED"
+        ]
+        assert len(cascade_calls) == 0
+
+    def test_filled_trades_not_cascaded(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        # All three layers FILLED (Layer 1 from order_manager + Layers
+        # 2/3 fired by entry_trigger). No WAITING → no cascade.
+        setup = make_setup(status="ACTIVE")
+        trades = [
+            make_trade(setup_id=setup.id, layer_number=i, status="FILLED")
+            for i in (1, 2, 3)
+        ]
+        mock_supabase.get_setup_by_id.return_value = setup
+        mock_supabase.update_setup.return_value = setup
+        mock_supabase.get_trades_for_setup.return_value = trades
+
+        tracker.update_setup_status(setup.id, "STOPPED_OUT")
+
+        cascade_calls = [
+            c for c in mock_supabase.update_trade.call_args_list
+            if c.kwargs.get("status") == "CANCELLED"
+        ]
+        assert len(cascade_calls) == 0
+
+    def test_only_waiting_trades_cancelled_not_filled(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        # Layer 1 FILLED, Layer 2 WAITING, Layer 3 already CANCELLED
+        # (some prior reason). Only Layer 2 should get cancelled by
+        # this cascade.
+        setup, trades = self._setup_with_waiting_layers(
+            mock_supabase, layer_3_status="CANCELLED"
+        )
+
+        tracker.update_setup_status(setup.id, "STOPPED_OUT")
+
+        cascade_calls = [
+            c for c in mock_supabase.update_trade.call_args_list
+            if c.kwargs.get("status") == "CANCELLED"
+        ]
+        # Only Layer 2 cancelled this time.
+        assert len(cascade_calls) == 1
+
+
+# --------------------------------------------------------------------------- #
 # update_trade_status
 # --------------------------------------------------------------------------- #
 
 
 class TestUpdateTradeStatus:
-    def test_pending_to_filled_sets_filled_at(
+    def test_waiting_to_filled_sets_filled_at(
         self, tracker: PositionTracker, mock_supabase: MagicMock
     ) -> None:
-        current = make_trade(status="PENDING")
+        current = make_trade(status="WAITING")
         mock_supabase.get_trade_by_id.return_value = current
         mock_supabase.update_trade.return_value = current
 
@@ -405,104 +538,35 @@ class TestUpdateTradeStatus:
 
         mock_supabase.update_trade.assert_not_called()
 
-
-# --------------------------------------------------------------------------- #
-# detect_filled_layers
-# --------------------------------------------------------------------------- #
-
-
-class TestDetectFilledLayers:
-    def test_pending_setup_with_no_fills_returns_empty(
-        self, tracker: PositionTracker, mock_supabase: MagicMock,
-        mock_mt5: MagicMock,
-    ) -> None:
-        setup = make_setup(status="PENDING")
-        trades = [
-            make_trade(layer_number=1, mt5_ticket=11111, status="PENDING"),
-            make_trade(layer_number=2, mt5_ticket=22222, status="PENDING"),
-            make_trade(layer_number=3, mt5_ticket=33333, status="PENDING"),
-        ]
-        mock_supabase.get_trades_for_setup.return_value = trades
-        mock_mt5.get_open_positions.return_value = []  # no fills yet
-
-        result = tracker.detect_filled_layers(setup)
-        assert result == []
-        mock_supabase.update_trade.assert_not_called()
-        mock_supabase.update_setup.assert_not_called()
-
-    def test_one_layer_filled_transitions_setup_to_active(
-        self, tracker: PositionTracker, mock_supabase: MagicMock,
-        mock_mt5: MagicMock,
-    ) -> None:
-        setup = make_setup(status="PENDING")
-        trades = [
-            make_trade(layer_number=1, mt5_ticket=11111, status="PENDING"),
-            make_trade(layer_number=2, mt5_ticket=22222, status="PENDING"),
-            make_trade(layer_number=3, mt5_ticket=33333, status="PENDING"),
-        ]
-        mock_supabase.get_trades_for_setup.return_value = trades
-        mock_mt5.get_open_positions.return_value = [
-            {"ticket": 22222, "price_open": 1897.50},
-        ]
-        mock_supabase.get_setup_by_id.return_value = setup
-        mock_supabase.update_setup.return_value = setup
-
-        result = tracker.detect_filled_layers(setup)
-
-        assert result == [2]
-        # update_trade called once for layer 2.
-        assert mock_supabase.update_trade.call_count == 1
-        update_kwargs = mock_supabase.update_trade.call_args.kwargs
-        assert update_kwargs["status"] == "FILLED"
-        assert update_kwargs["entry_price"] == 1897.50
-        # Setup transitioned PENDING → ACTIVE.
-        mock_supabase.update_setup.assert_called_once()
-
-    def test_all_three_filled(
-        self, tracker: PositionTracker, mock_supabase: MagicMock,
-        mock_mt5: MagicMock,
-    ) -> None:
-        setup = make_setup(status="PENDING")
-        trades = [
-            make_trade(layer_number=1, mt5_ticket=11111, status="PENDING"),
-            make_trade(layer_number=2, mt5_ticket=22222, status="PENDING"),
-            make_trade(layer_number=3, mt5_ticket=33333, status="PENDING"),
-        ]
-        mock_supabase.get_trades_for_setup.return_value = trades
-        mock_mt5.get_open_positions.return_value = [
-            {"ticket": 11111, "price_open": 1900.00},
-            {"ticket": 22222, "price_open": 1897.50},
-            {"ticket": 33333, "price_open": 1895.00},
-        ]
-        mock_supabase.get_setup_by_id.return_value = setup
-        mock_supabase.update_setup.return_value = setup
-
-        result = tracker.detect_filled_layers(setup)
-        assert result == [1, 2, 3]
-        assert mock_supabase.update_trade.call_count == 3
-
-    def test_only_for_pending_setups(
+    def test_waiting_to_filled_with_entry_price_and_ticket(
         self, tracker: PositionTracker, mock_supabase: MagicMock
     ) -> None:
-        # ACTIVE setup — should NOT detect fills (already active).
-        setup = make_setup(status="ACTIVE")
-        result = tracker.detect_filled_layers(setup)
-        assert result == []
-        mock_supabase.get_trades_for_setup.assert_not_called()
+        # Used by entry_trigger when it fires Layer 2/3.
+        current = make_trade(status="WAITING", mt5_ticket=None)
+        mock_supabase.get_trade_by_id.return_value = current
+        mock_supabase.update_trade.return_value = current
 
-    def test_mt5_failure_returns_empty(
-        self, tracker: PositionTracker, mock_supabase: MagicMock,
-        mock_mt5: MagicMock,
+        tracker.update_trade_status(
+            current.id, "FILLED", entry_price=1897.5, mt5_ticket=44444,
+        )
+        kwargs = mock_supabase.update_trade.call_args.kwargs
+        assert kwargs["status"] == "FILLED"
+        assert kwargs["entry_price"] == 1897.5
+        assert kwargs["mt5_ticket"] == 44444
+        assert "filled_at" in kwargs
+
+    def test_waiting_to_cancelled_sets_closed_at(
+        self, tracker: PositionTracker, mock_supabase: MagicMock
     ) -> None:
-        setup = make_setup(status="PENDING")
-        mock_supabase.get_trades_for_setup.return_value = [
-            make_trade(layer_number=1, mt5_ticket=11111, status="PENDING"),
-        ]
-        mock_mt5.get_open_positions.side_effect = RuntimeError("network blip")
+        # CANCELLED is also a terminal state — should stamp closed_at.
+        current = make_trade(status="WAITING")
+        mock_supabase.get_trade_by_id.return_value = current
+        mock_supabase.update_trade.return_value = current
 
-        result = tracker.detect_filled_layers(setup)
-        assert result == []
-        mock_supabase.update_trade.assert_not_called()
+        tracker.update_trade_status(current.id, "CANCELLED")
+        kwargs = mock_supabase.update_trade.call_args.kwargs
+        assert kwargs["status"] == "CANCELLED"
+        assert "closed_at" in kwargs
 
 
 # --------------------------------------------------------------------------- #
@@ -562,16 +626,18 @@ class TestDetectClosedPositions:
         result = tracker.detect_closed_positions(setup)
         assert result == []
 
-    def test_pending_trades_in_active_setup_ignored(
+    def test_waiting_trades_in_active_setup_ignored(
         self, tracker: PositionTracker, mock_supabase: MagicMock,
         mock_mt5: MagicMock,
     ) -> None:
-        # Layer 1 FILLED, Layers 2/3 PENDING. Only FILLED should be checked.
+        # Layer 1 FILLED, Layers 2/3 WAITING. Only FILLED should be checked.
+        # WAITING trades have no broker position to be "closed externally" —
+        # they're bot-tracked, awaiting trigger.
         setup = make_setup(status="ACTIVE")
         trades = [
             make_trade(layer_number=1, mt5_ticket=11111, status="FILLED"),
-            make_trade(layer_number=2, mt5_ticket=22222, status="PENDING"),
-            make_trade(layer_number=3, mt5_ticket=33333, status="PENDING"),
+            make_trade(layer_number=2, mt5_ticket=None, status="WAITING"),
+            make_trade(layer_number=3, mt5_ticket=None, status="WAITING"),
         ]
         mock_supabase.get_trades_for_setup.return_value = trades
         mock_mt5.get_open_positions.return_value = []  # all gone
@@ -579,8 +645,6 @@ class TestDetectClosedPositions:
         mock_supabase.update_trade.return_value = trades[0]
 
         result = tracker.detect_closed_positions(setup)
-        # Only Layer 1 (FILLED) gets closed; Layers 2/3 are pending limits
-        # that just haven't been filled yet — not "closed externally".
         assert len(result) == 1
         assert result[0].trade_id == trades[0].id
 

@@ -99,7 +99,7 @@ VALID_SETUP_TRANSITIONS: dict[str, frozenset[str]] = {
 }
 
 VALID_TRADE_TRANSITIONS: dict[str, frozenset[str]] = {
-    "PENDING": frozenset({"FILLED", "CANCELLED"}),
+    "WAITING": frozenset({"FILLED", "CANCELLED"}),
     "FILLED": frozenset({"PARTIALLY_CLOSED", "CLOSED"}),
     "PARTIALLY_CLOSED": frozenset({"CLOSED"}),
     "CLOSED": frozenset(),     # terminal
@@ -108,6 +108,11 @@ VALID_TRADE_TRANSITIONS: dict[str, frozenset[str]] = {
 
 ACTIVE_SETUP_STATUSES: frozenset[str] = frozenset({"PENDING", "ACTIVE", "TP1_HIT"})
 """Statuses where the setup is consuming exposure capacity."""
+
+TERMINAL_SETUP_STATUSES: frozenset[str] = frozenset(
+    {"CLOSED", "SKIPPED", "STOPPED_OUT"}
+)
+"""Statuses where the setup's lifecycle is finished."""
 
 OPEN_TRADE_STATUSES: frozenset[str] = frozenset({"FILLED", "PARTIALLY_CLOSED"})
 """Statuses where the trade has a live position on the broker."""
@@ -196,10 +201,35 @@ class PositionTracker:
             fields["closed_at"] = now_iso
 
         updated = self._supabase.update_setup(setup_id, **fields)
+
+        # Cascade: terminating a setup cancels any WAITING layer trades.
+        # An ACTIVE setup that hits SL ⇒ STOPPED_OUT shouldn't leave its
+        # un-fired Layer 2/3 trades hanging — they'd never be triggered
+        # but would still show as live in queries.
+        if new_status in TERMINAL_SETUP_STATUSES:
+            self._cascade_cancel_waiting(setup_id)
+
         logger.info(
             f"setup {setup_id} transitioned: {current.status} → {new_status}"
         )
         return updated
+
+    def _cascade_cancel_waiting(self, setup_id: UUID | str) -> None:
+        """Cancel all WAITING trades belonging to a now-terminal setup."""
+        trades = self._supabase.get_trades_for_setup(setup_id)
+        for trade in trades:
+            if trade.status != "WAITING":
+                continue
+            try:
+                self.update_trade_status(trade.id, "CANCELLED")
+                logger.info(
+                    f"cascade-cancel: trade {trade.id} (layer "
+                    f"{trade.layer_number}) WAITING → CANCELLED"
+                )
+            except (StateTransitionError, ValueError):
+                logger.exception(
+                    f"cascade-cancel failed for trade {trade.id}"
+                )
 
     def update_trade_status(
         self,
@@ -208,9 +238,17 @@ class PositionTracker:
         *,
         close_reason: str | None = None,
         exit_price: float | None = None,
+        entry_price: float | None = None,
+        mt5_ticket: int | None = None,
         pnl: float | None = None,
     ) -> Trade:
-        """Transition a trade row, validating the transition."""
+        """Transition a trade row, validating the transition.
+
+        Optional fields:
+          ``close_reason`` / ``exit_price`` / ``pnl``: set on close.
+          ``entry_price`` / ``mt5_ticket``: set when an entry-trigger
+            fires a WAITING layer (WAITING → FILLED).
+        """
         current = self._supabase.get_trade_by_id(trade_id)
         if current is None:
             raise ValueError(f"trade {trade_id} not found")
@@ -222,11 +260,20 @@ class PositionTracker:
             fields["close_reason"] = close_reason
         if exit_price is not None:
             fields["exit_price"] = exit_price
+        if entry_price is not None:
+            fields["entry_price"] = entry_price
+        if mt5_ticket is not None:
+            fields["mt5_ticket"] = mt5_ticket
         if pnl is not None:
             fields["pnl"] = pnl
 
         now_iso = datetime.now(tz=timezone.utc).isoformat()
-        if new_status in ("CLOSED",) and current.closed_at is None:
+        # Both CLOSED and CANCELLED are terminal — stamp closed_at on
+        # either transition for consistent analytics.
+        if (
+            new_status in ("CLOSED", "CANCELLED")
+            and current.closed_at is None
+        ):
             fields["closed_at"] = now_iso
         if new_status == "FILLED" and current.filled_at is None:
             fields["filled_at"] = now_iso
@@ -239,45 +286,11 @@ class PositionTracker:
 
     # ---- detection (Supabase ←→ MT5 sync) ----------------------------------
 
-    def detect_filled_layers(self, setup: Setup) -> list[int]:
-        """For PENDING setups, check if any pending limit orders have filled.
-
-        Updates each freshly-filled trade to ``FILLED`` and (if at least
-        one filled) transitions the setup to ``ACTIVE``. Returns the
-        list of layer numbers that were just newly filled.
-        """
-        if setup.status != "PENDING":
-            return []
-
-        trades = self._supabase.get_trades_for_setup(setup.id)
-        positions = self._safe_get_open_positions()
-        if positions is None:
-            return []
-        positions_by_ticket = {p["ticket"]: p for p in positions}
-
-        newly_filled: list[int] = []
-        for trade in trades:
-            if trade.status != "PENDING":
-                continue
-            if trade.mt5_ticket is None:
-                continue
-            position = positions_by_ticket.get(trade.mt5_ticket)
-            if position is None:
-                continue
-            # MT5 reports an open position with this ticket → fill happened.
-            now_iso = datetime.now(tz=timezone.utc).isoformat()
-            self._supabase.update_trade(
-                trade.id,
-                status="FILLED",
-                entry_price=float(position.get("price_open", 0)),
-                filled_at=now_iso,
-            )
-            newly_filled.append(trade.layer_number)
-
-        if newly_filled and setup.status == "PENDING":
-            self.update_setup_status(setup.id, "ACTIVE")
-
-        return sorted(newly_filled)
+    # Note: ``detect_filled_layers`` from the original design has been
+    # removed. It existed to monitor broker-pending limit orders for
+    # Layers 2/3, but those are no longer placed at the broker (PR #15
+    # strategy change). ``entry_trigger`` now directly transitions
+    # WAITING → FILLED when it fires a market order.
 
     def detect_closed_positions(self, setup: Setup) -> list[ClosedPosition]:
         """For ACTIVE/TP1_HIT setups, find trades whose MT5 position is gone.
