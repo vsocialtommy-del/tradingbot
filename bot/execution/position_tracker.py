@@ -114,6 +114,16 @@ TERMINAL_SETUP_STATUSES: frozenset[str] = frozenset(
 )
 """Statuses where the setup's lifecycle is finished."""
 
+CASCADE_CANCEL_SETUP_STATUSES: frozenset[str] = (
+    TERMINAL_SETUP_STATUSES | frozenset({"TP1_HIT"})
+)
+"""Statuses whose entry into triggers cancellation of WAITING layer trades.
+
+Terminal states obviously cancel pending layers (the setup is done). TP1_HIT
+also cancels them: once profit is locked at TP1, scaling deeper into the
+zone would just add risk in territory we've already booked. (Spec 6.1.)
+"""
+
 OPEN_TRADE_STATUSES: frozenset[str] = frozenset({"FILLED", "PARTIALLY_CLOSED"})
 """Statuses where the trade has a live position on the broker."""
 
@@ -202,11 +212,12 @@ class PositionTracker:
 
         updated = self._supabase.update_setup(setup_id, **fields)
 
-        # Cascade: terminating a setup cancels any WAITING layer trades.
-        # An ACTIVE setup that hits SL ⇒ STOPPED_OUT shouldn't leave its
-        # un-fired Layer 2/3 trades hanging — they'd never be triggered
-        # but would still show as live in queries.
-        if new_status in TERMINAL_SETUP_STATUSES:
+        # Cascade: terminating a setup or hitting TP1 cancels WAITING layers.
+        # Terminal: ACTIVE → STOPPED_OUT shouldn't leave un-fired Layer 2/3
+        #   trades hanging — they'd never trigger but would show as live.
+        # TP1_HIT: profit locked, scaling deeper just adds risk in
+        #   already-booked territory (spec 6.1).
+        if new_status in CASCADE_CANCEL_SETUP_STATUSES:
             self._cascade_cancel_waiting(setup_id)
 
         logger.info(

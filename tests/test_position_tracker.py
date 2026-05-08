@@ -20,7 +20,9 @@ from pytest_mock import MockerFixture
 from bot.execution.mt5_connector import MT5Connector
 from bot.execution.position_tracker import (
     ACTIVE_SETUP_STATUSES,
+    CASCADE_CANCEL_SETUP_STATUSES,
     OPEN_TRADE_STATUSES,
+    TERMINAL_SETUP_STATUSES,
     VALID_SETUP_TRANSITIONS,
     VALID_TRADE_TRANSITIONS,
     ClosedPosition,
@@ -490,6 +492,29 @@ class TestCascadeCancel:
         ]
         # Only Layer 2 cancelled this time.
         assert len(cascade_calls) == 1
+
+    def test_tp1_hit_cancels_waiting_trades(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        # ACTIVE → TP1_HIT also triggers cascade. Once profit is locked
+        # at TP1, scaling deeper just adds risk in already-booked
+        # territory (spec 6.1).
+        setup, trades = self._setup_with_waiting_layers(mock_supabase)
+
+        tracker.update_setup_status(setup.id, "TP1_HIT")
+
+        cascade_calls = [
+            c for c in mock_supabase.update_trade.call_args_list
+            if c.kwargs.get("status") == "CANCELLED"
+        ]
+        # Layers 2 and 3 cancelled (Layer 1 stays FILLED for the runner).
+        assert len(cascade_calls) == 2
+
+    def test_cascade_set_includes_tp1_hit_and_terminal_statuses(self) -> None:
+        # Sanity: the canonical set used by update_setup_status is the
+        # union of terminal statuses and TP1_HIT.
+        assert "TP1_HIT" in CASCADE_CANCEL_SETUP_STATUSES
+        assert TERMINAL_SETUP_STATUSES.issubset(CASCADE_CANCEL_SETUP_STATUSES)
 
 
 # --------------------------------------------------------------------------- #
