@@ -145,9 +145,12 @@ def analyze_structure(
     last_low = next((s for s in reversed(classified) if s.kind == "LOW"), None)
     last_bos = bos_events[-1] if bos_events else None
 
+    # Lazy format — loguru skips str-build when DEBUG is filtered.
+    # This call fires once per bar in backtest (1000s of times); eager
+    # f-string formatting was measurable overhead in profiling.
     logger.debug(
-        f"structure: bars={len(df)} swings={len(swings)} "
-        f"bos={len(bos_events)} state={state.value}"
+        "structure: bars={} swings={} bos={} state={}",
+        len(df), len(swings), len(bos_events), state.value,
     )
     return StructureSnapshot(
         swings=classified,

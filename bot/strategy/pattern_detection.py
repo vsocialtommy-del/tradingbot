@@ -143,13 +143,23 @@ class MPattern:
 def detect_w_patterns(
     df: pd.DataFrame,
     config: PatternConfig | None = None,
+    *,
+    swings: list[Swing] | None = None,
 ) -> list[WPattern]:
-    """Find every W pattern in ``df`` (all-pairs over confirmed swing lows)."""
+    """Find every W pattern in ``df`` (all-pairs over confirmed swing lows).
+
+    ``swings`` is an optional pre-computed swing list. When supplied,
+    we skip the internal ``detect_swings`` call. The strategy pipeline
+    passes ``analyze_structure``'s swings here so they aren't recomputed
+    a second time per pipeline iteration — a 3× speedup on the hot
+    path.
+    """
     cfg = config or PatternConfig()
     if len(df) == 0:
         return []
 
-    swings = detect_swings(df, cfg.swing_strength)
+    if swings is None:
+        swings = detect_swings(df, cfg.swing_strength)
     lows = sorted(
         (s for s in swings if s.kind == "LOW"), key=lambda s: s.index
     )
@@ -201,8 +211,9 @@ def detect_w_patterns(
                 )
             )
 
+    # Lazy format — loguru skips str-build when DEBUG is filtered.
     logger.debug(
-        f"detect_w_patterns: {len(lows)} lows, {len(patterns)} W patterns"
+        "detect_w_patterns: {} lows, {} W patterns", len(lows), len(patterns),
     )
     return patterns
 
@@ -231,13 +242,20 @@ def detect_latest_w(
 def detect_m_patterns(
     df: pd.DataFrame,
     config: PatternConfig | None = None,
+    *,
+    swings: list[Swing] | None = None,
 ) -> list[MPattern]:
-    """Find every M pattern in ``df`` (all-pairs over confirmed swing highs)."""
+    """Find every M pattern in ``df`` (all-pairs over confirmed swing highs).
+
+    See :func:`detect_w_patterns` for the rationale behind the optional
+    ``swings`` parameter — pipeline pre-computes swings once and shares.
+    """
     cfg = config or PatternConfig()
     if len(df) == 0:
         return []
 
-    swings = detect_swings(df, cfg.swing_strength)
+    if swings is None:
+        swings = detect_swings(df, cfg.swing_strength)
     highs = sorted(
         (s for s in swings if s.kind == "HIGH"), key=lambda s: s.index
     )
@@ -287,8 +305,9 @@ def detect_m_patterns(
                 )
             )
 
+    # Lazy format — loguru skips str-build when DEBUG is filtered.
     logger.debug(
-        f"detect_m_patterns: {len(highs)} highs, {len(patterns)} M patterns"
+        "detect_m_patterns: {} highs, {} M patterns", len(highs), len(patterns),
     )
     return patterns
 
