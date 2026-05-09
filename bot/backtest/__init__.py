@@ -16,6 +16,10 @@ from bot.backtest.data_loader import (
     load_dukascopy_csv,
     validate_ohlc,
 )
+from bot.backtest.diagnose import (
+    FunnelCounts,
+    diagnose,
+)
 from bot.backtest.engine import (
     BacktestConfig,
     BacktestEngine,
@@ -54,6 +58,9 @@ __all__ = [
     # data_loader
     "load_dukascopy_csv",
     "validate_ohlc",
+    # diagnose
+    "FunnelCounts",
+    "diagnose",
     # engine
     "BacktestConfig",
     "BacktestEngine",

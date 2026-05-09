@@ -151,6 +151,18 @@ class BacktestConfig:
     """Skip the first N bars before running the pipeline. Pipeline
     needs swing detection + lookback windows to be populated."""
 
+    pipeline_window_bars: int = 250
+    """How many recent bars the strategy pipeline sees per call. The
+    pipeline's pattern detectors already filter to ``lookback_bars=50``
+    internally; passing the entire history-so-far made every pipeline
+    call O(n) → total backtest O(n²), which became prohibitive on
+    real Dukascopy data (a year of M5 was projected at hours).
+
+    Default 250 = comfortable buffer over the 50-bar pattern lookback
+    plus enough headroom for swing-detection shoulders. Bump if you
+    raise ``StrategyPipelineConfig.pattern_lookback_bars`` above 200.
+    """
+
     progress_log_every_bars: int = 1000
 
 
@@ -256,7 +268,13 @@ class BacktestEngine:
                 self._step_tick(tick)
 
             # On bar close: maybe detect new setups.
-            self._maybe_run_strategy(df.iloc[: i + 1], bar_time, ticks[-1])
+            # Pass only the most recent ``pipeline_window_bars`` so the
+            # strategy pipeline runs in O(window) per call instead of
+            # O(n). See BacktestConfig.pipeline_window_bars docstring.
+            window_start = max(0, i + 1 - self.config.pipeline_window_bars)
+            self._maybe_run_strategy(
+                df.iloc[window_start : i + 1], bar_time, ticks[-1],
+            )
 
             if (
                 self.config.progress_log_every_bars > 0
