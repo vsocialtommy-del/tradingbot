@@ -414,20 +414,21 @@ class TestZeroRangeBars:
 
     def test_zero_range_base_bar_passes_compactness(self) -> None:
         # Base bar idx 2 is a doji at exactly 1900 (no wick at all).
-        # Bar 9 (the other base) might still have some range from CLEAN_W_DATA.
+        # Bar 9 (the other base) is also flattened to 1900.
+        # Refinement now spans the full bar range [low1.idx, low2.idx], so
+        # the bars BETWEEN must also be flattened to 1900 to keep the
+        # refined zone width-zero (otherwise the peak's body inflates).
         d = {k: list(v) for k, v in CLEAN_W_DATA.items()}
-        d["opens"][2] = 1900
-        d["closes"][2] = 1900
-        d["highs"][2] = 1900
-        d["lows"][2] = 1900
-        d["opens"][9] = 1900
-        d["highs"][9] = 1900
-        d["lows"][9] = 1900
+        for i in range(2, 10):
+            d["opens"][i] = 1900
+            d["closes"][i] = 1900
+            d["highs"][i] = 1900
+            d["lows"][i] = 1900
         df = make_ohlc(**d)
         zone = make_w_refined_zone(df)
-        # NOTE: with both base bars at zero open/close=1900, refined zone
-        # becomes 1900-1900 (width 0) → fails size filter. validate_strong_point
-        # short-circuits to NOT_TRADEABLE.
+        # All bars flat at 1900 → refined zone 1900-1900 (width 0) →
+        # fails size filter. validate_strong_point short-circuits to
+        # NOT_TRADEABLE.
         assert zone.is_tradeable is False
         bos = make_bos(11, "UP", df, broken_level=1910.0)
         v = validate_strong_point(zone, df, [bos])
@@ -495,8 +496,12 @@ class TestMultipleFailures:
 class TestNotTradeable:
     def test_zone_failing_size_filter_skips_validation(self) -> None:
         # Refined width 0 < 5 → NOT_TRADEABLE upstream.
+        # Refinement now spans bars [low1.idx, low2.idx] inclusive — flatten
+        # the whole interior to 1900 so no body extends the zone.
         d = {k: list(v) for k, v in CLEAN_W_DATA.items()}
-        d["opens"][2] = 1900  # remove the body that gave width 5
+        for i in range(2, 10):
+            d["opens"][i] = 1900
+            d["closes"][i] = 1900
         df = make_ohlc(**d)
         zone = make_w_refined_zone(df)
         assert zone.is_tradeable is False  # sanity

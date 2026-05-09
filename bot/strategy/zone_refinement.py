@@ -6,35 +6,51 @@ Performs steps 2 + 3 of zone construction (spec Sections 3.1 and 7):
     2. Refine to candle bodies only        ← this module
     3. Apply size filter (5-80 points)     ← this module
 
-Refinement scope — the corrected spec
--------------------------------------
-Refinement uses **only the bars at the swing-point indices** —
-``low1.index`` and ``low2.index`` for W; ``high1.index`` and
-``high2.index`` for M. The peak (or trough) and any bars between are
-**excluded**. Including them — as the original spec wording suggested
-— would expand the zone to the full vertical extent of the W/M, which
-contradicts both S&D theory and the user-facing expectation that
-refinement narrows the zone. See PR #7 for the full rationale.
+Refinement scope — full pattern area
+------------------------------------
+Refinement reads candle bodies across **every bar between the two
+swing pivots, inclusive** (``low1.index`` through ``low2.index`` for
+W; ``high1.index`` through ``high2.index`` for M). This captures the
+full "bottom area" of a W (or "top area" of an M) the trader treats
+as the demand / supply zone — including any bars in a multi-bar low
+cluster that aren't themselves classified as swing pivots.
+
+Same scope applies to BOTH W and M — there's no asymmetry between
+directions; the math is identical, just the bar range changes per
+pattern type.
+
+History note: an earlier version of this module read only the two
+pivot bars (excluding everything between, including the peak/trough).
+That was too narrow for the user's trading style — see the
+calibration thread + PR diagnostic for the rationale behind the
+widening.
 
 Geometry
 --------
-For each pivot bar::
+For each bar in the inclusive range::
 
     body_top(bar)    = max(bar.open, bar.close)
     body_bottom(bar) = min(bar.open, bar.close)
 
-For W (BUY) and M (SELL), the formula is the same — the math doesn't
-care about direction. The only difference is *which two bars* the
-refinement reads from::
+Per pattern, the refined zone is::
 
-    refined_top    = max(body_top(pivot_a),    body_top(pivot_b))
-    refined_bottom = min(body_bottom(pivot_a), body_bottom(pivot_b))
+    refined_top    = max(body_top    of every bar in range)
+    refined_bottom = min(body_bottom of every bar in range)
 
 Bullish vs bearish candles are handled identically: ``max(open, close)``
-gives the body top regardless of direction. A bullish swing-low bar
-(close > open) has ``body_top == close``; a bearish swing-low bar
-(close < open) has ``body_top == open``. Either way, the wick above
-the body is excluded.
+gives the body top regardless of direction. A bullish bar (close > open)
+has ``body_top == close``; a bearish bar (close < open) has
+``body_top == open``. Either way, the wick above the body is excluded.
+
+Size-filter interaction
+-----------------------
+With the wider scope, a W with a tall middle peak (or an M with a
+deep middle trough) produces a correspondingly tall refined zone.
+The size filter's max width then rejects pathological cases: a W
+whose peak is so high above the lows that the resulting body box
+exceeds ``zone_max_size_points`` is correctly flagged as
+``ZONE_TOO_WIDE``. That's the system saying "the pattern is too
+stretched to be a tradeable demand zone" — desired behaviour.
 
 Size filter (spec Section 7)
 ----------------------------
@@ -69,6 +85,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+import numpy as np
 import pandas as pd
 from loguru import logger
 
@@ -109,30 +126,30 @@ def refine_zone(
     df: pd.DataFrame,
     config: RefinementConfig | None = None,
 ) -> RefinedZone:
-    """Strip wicks at the swing-point bars and apply the size filter."""
+    """Strip wicks across the full pattern area and apply the size filter."""
     cfg = config or RefinementConfig()
 
     if "open" not in df.columns or "close" not in df.columns:
         raise ValueError("df must have 'open' and 'close' columns")
 
-    pivot_indices = _pivot_indices(zone.source_pattern)
+    start_idx, end_idx = _refinement_range(zone.source_pattern)
     n = len(df)
-    for idx in pivot_indices:
-        if not 0 <= idx < n:
-            raise ValueError(
-                f"swing-point index {idx} out of df range (len={n})"
-            )
+    if not 0 <= start_idx < n:
+        raise ValueError(
+            f"swing-point index {start_idx} out of df range (len={n})"
+        )
+    if not 0 <= end_idx < n:
+        raise ValueError(
+            f"swing-point index {end_idx} out of df range (len={n})"
+        )
 
-    body_tops: list[float] = []
-    body_bottoms: list[float] = []
-    for idx in pivot_indices:
-        o = float(df["open"].iloc[idx])
-        c = float(df["close"].iloc[idx])
-        body_tops.append(max(o, c))
-        body_bottoms.append(min(o, c))
-
-    refined_top = max(body_tops)
-    refined_bottom = min(body_bottoms)
+    # Vectorised body extremes across every bar in [start_idx, end_idx].
+    opens = df["open"].iloc[start_idx : end_idx + 1].to_numpy()
+    closes = df["close"].iloc[start_idx : end_idx + 1].to_numpy()
+    body_tops_arr = np.maximum(opens, closes)
+    body_bottoms_arr = np.minimum(opens, closes)
+    refined_top = float(body_tops_arr.max())
+    refined_bottom = float(body_bottoms_arr.min())
 
     # Defensive — math guarantees this can't happen, but better to fail
     # loudly than silently return a corrupted zone.
@@ -162,8 +179,13 @@ def refine_zone(
     return refined
 
 
-def _pivot_indices(pattern: WPattern | MPattern) -> tuple[int, int]:
-    """The two bar indices refinement reads body extremes from."""
+def _refinement_range(pattern: WPattern | MPattern) -> tuple[int, int]:
+    """``(start_idx, end_idx)`` over which refinement reads body extremes.
+
+    Inclusive on both ends — for W, that's ``[low1.index, low2.index]``;
+    for M, ``[high1.index, high2.index]``. Same range semantics for both
+    directions.
+    """
     if isinstance(pattern, WPattern):
         return pattern.low1.index, pattern.low2.index
     if isinstance(pattern, MPattern):

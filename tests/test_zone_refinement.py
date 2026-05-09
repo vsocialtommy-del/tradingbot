@@ -107,24 +107,32 @@ def make_m_zone(
     return mark_zone_from_m(pattern, df)
 
 
-# Reusable W skeleton: lows at idx 2 and 9, peak at idx 6.
+# Reusable W skeleton: lows at idx 2 and 9, FLAT interior between pivots.
+#
+# After the PR #29 calibration, refine_zone reads body extremes across
+# EVERY bar in ``[low1.idx, low2.idx]`` (not just the two pivot bars).
+# Most boundary tests below set a single bar's open to control the
+# refined zone's exact width; that only works cleanly if the rest of
+# the interior is flat. The peak/trough that USED to live at bar 6
+# in this fixture has been removed — tests that need a real peak
+# build their own closes list inline.
 W_CLOSES_GOLD = [
     1910, 1905, 1900,        # bars 0..2 (low1 at 2)
-    1903, 1906, 1908,        # bars 3..5
-    1910,                    # bar 6 (peak)
-    1908, 1906,              # bars 7..8
+    1900, 1900, 1900,        # bars 3..5 (flat interior)
+    1900,                    # bar 6 (interior — was peak 1910)
+    1900, 1900,              # bars 7..8 (flat interior)
     1900,                    # bar 9 (low2)
-    1903, 1906, 1910,        # bars 10..12
+    1903, 1906, 1910,        # bars 10..12 (post-pivot, ignored)
 ]
 
-# Reusable M skeleton: highs at idx 2 and 9, trough at idx 6.
+# Reusable M skeleton: highs at idx 2 and 9, FLAT interior between pivots.
 M_CLOSES_GOLD = [
     1890, 1895, 1900,        # bars 0..2 (high1 at 2)
-    1897, 1894, 1892,        # bars 3..5
-    1890,                    # bar 6 (trough)
-    1892, 1894,              # bars 7..8
+    1900, 1900, 1900,        # bars 3..5 (flat interior — was 1897, 1894, 1892)
+    1900,                    # bar 6 (interior — was trough 1890)
+    1900, 1900,              # bars 7..8 (flat interior — was 1892, 1894)
     1900,                    # bar 9 (high2)
-    1897, 1894, 1890,        # bars 10..12
+    1897, 1894, 1890,        # bars 10..12 (post-pivot, ignored)
 ]
 
 
@@ -202,37 +210,79 @@ class TestWRefinementBasics:
 
 
 # --------------------------------------------------------------------------- #
-# Refinement scope — key correctness test (PR #7 spec correction)
+# Refinement scope — full pattern area (PR #29 calibration)
 # --------------------------------------------------------------------------- #
 
 
-class TestRefinementIgnoresPeak:
-    """Verify refinement uses ONLY the swing-low bars, not the peak."""
+class TestRefinementSpansFullPatternArea:
+    """Verify refinement spans EVERY bar between the pivots, inclusive.
 
-    def test_high_peak_does_not_inflate_refined_top(self) -> None:
-        # Peak bar at extremely high close (1950) — 50 points above lows.
-        # If refinement naively included all bars in [low1.idx, low2.idx],
-        # refined top would be 1950. With swing-bars-only, refined top
-        # stays at the swing-low bars' bodies.
+    The user's "visual W" definition treats the entire bottom area
+    (lows + everything between) as the demand zone, so the peak's body
+    and any other bar between the pivots IS part of the refined zone.
+    Pathologically wide W's get caught by the size filter — that's the
+    correct outcome.
+    """
+
+    def test_peak_inflates_refined_top(self) -> None:
+        # Peak at 1925, lows at 1900 (dojis). With the full-range scope
+        # the refined zone reaches up to the peak. Width 25 is well
+        # within [5, 80] → tradeable.
         closes = [
-            1910, 1905, 1900,      # bars 0..2
-            1925, 1940, 1950,      # bars 3..5
-            1950,                  # bar 6 (peak)
-            1950, 1925,            # bars 7..8
+            1910, 1905, 1900,      # bars 0..2 (low1 at 2)
+            1910, 1920, 1925,      # bars 3..5
+            1925,                  # bar 6 (peak)
+            1920, 1910,            # bars 7..8
             1900,                  # bar 9 (low2)
             1903, 1906, 1910,      # bars 10..12
         ]
-        df = make_ohlc(closes)  # all OHLC == close (dojis)
+        df = make_ohlc(closes)  # dojis throughout
         zone = make_w_zone(df, 2, 9, 6)
 
         refined = refine_zone(zone, df)
-        # Both swing-low bars are dojis at 1900. Refined zone is degenerate
-        # at 1900 — explicitly NOT pulled up to the peak's 1950.
-        assert refined.top == 1900.0
+        # Peak's body (1925) drives refined_top; lows drive refined_bottom.
+        assert refined.top == 1925.0
         assert refined.bottom == 1900.0
-        # Width 0 → fails size filter.
+        assert refined.top - refined.bottom == 25.0
+        assert refined.is_tradeable is True
+
+    def test_excessive_peak_height_caught_by_size_filter(self) -> None:
+        # Peak at 2000, lows at 1900 → refined zone width = 100 →
+        # rejected as ZONE_TOO_WIDE (default max=80). The wider scope
+        # exposes pathological W's the old narrow-scope refinement
+        # silently accepted.
+        closes = [
+            1910, 1905, 1900,      # bars 0..2
+            1950, 1980, 2000,      # bars 3..5
+            2000,                  # bar 6 (peak)
+            1980, 1950,            # bars 7..8
+            1900,                  # bar 9 (low2)
+            1903, 1906, 1910,      # bars 10..12
+        ]
+        df = make_ohlc(closes)
+        zone = make_w_zone(df, 2, 9, 6)
+        refined = refine_zone(zone, df)
+        assert refined.top - refined.bottom == 100.0
         assert refined.is_tradeable is False
-        assert refined.rejection_reason == "ZONE_TOO_NARROW"
+        assert refined.rejection_reason == "ZONE_TOO_WIDE"
+
+    def test_multi_bar_low_cluster_spans_whole_cluster(self) -> None:
+        # Five-bar low cluster between pivots — all at body bottom 1895.
+        # Refinement should span the cluster's full width: every bar
+        # contributes its body extremes.
+        closes = [1910, 1905, 1900, 1899, 1898, 1897, 1898, 1899, 1900, 1900,
+                  1903, 1906, 1910]
+        opens =  [1910, 1905, 1900, 1898, 1898, 1897, 1898, 1899, 1900, 1900,
+                  1903, 1906, 1910]
+        df = make_ohlc(closes, opens=opens)
+        zone = make_w_zone(df, 2, 9, 6)
+        refined = refine_zone(zone, df)
+        # Refined bottom should be 1897 (deepest body in the cluster),
+        # NOT 1900 (which would happen if we only read the pivot bars).
+        assert refined.bottom == 1897.0
+        # Refined top is the highest body across [2..9] = 1900.
+        assert refined.top == 1900.0
+        assert refined.top - refined.bottom == 3.0
 
 
 # --------------------------------------------------------------------------- #

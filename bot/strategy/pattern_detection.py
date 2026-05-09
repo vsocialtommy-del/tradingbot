@@ -83,19 +83,38 @@ class PatternType(str, Enum):
 class PatternConfig:
     """Tunables for pattern detection.
 
-    Defaults match the seeded ``bot_config`` keys; the orchestrator pulls
-    values from Supabase and passes them in here.
+    Defaults are calibrated for **visual W/M shapes on the M5 line chart**
+    (closes only) — the way the user reads them — not for strict
+    mathematical double-bottoms. Same calibration applies symmetrically
+    to W (bullish) and M (bearish); there is no asymmetry between
+    directions.
+
+    Calibration rationale (see PR diagnostic + tuning thread)
+    --------------------------------------------------------
+    * ``pattern_tolerance_pct = 2.0`` — the 0.1% spec default rejected
+      virtually all asymmetric W's typical of XAUUSD intraday action.
+      At Gold ≈ $2300 the new 2% tolerance corresponds to roughly
+      $46 between the two lows (or highs for M) which comfortably
+      accommodates the visual "double-bottom-ish" shapes the trader
+      identifies on a line chart, including ones where one low is
+      visibly higher or lower than the other.
+    * ``swing_strength = 2`` — strength=3 forces a 7-bar window
+      (3+1+3) for a swing to be confirmed, which filters out sharp
+      V-tip reversals (1-2 bar bottoms) that the trader treats as
+      legitimate W legs. Strength=2 uses a 5-bar window and catches
+      these.
+    * ``peak_threshold_pct = 0.3`` — the peak between the two lows
+      must clear the higher low by 0.3% (~$7 at Gold $2300). Slightly
+      larger than the 0.2% spec to keep the W shape meaningful after
+      the looser tolerance — without this, two near-identical lows
+      with a near-flat middle would still be flagged.
+    * ``lookback_bars = 50`` — unchanged. ~4 hours on M5; the trader
+      generally evaluates patterns formed in the recent session.
     """
 
-    swing_strength: int = 3
-    # Maximum percentage difference between the two pivots, calculated
-    # against their average (see module docstring). 0.1% is the spec's
-    # default (Section 13).
-    pattern_tolerance_pct: float = 0.1
-    # Minimum percentage by which the peak must clear the higher low
-    # (or trough below the lower high). 0.2% is a reasonable default
-    # for Gold; tunable in backtest.
-    peak_threshold_pct: float = 0.2
+    swing_strength: int = 2
+    pattern_tolerance_pct: float = 2.0
+    peak_threshold_pct: float = 0.3
     # Both pivots must lie within the most recent N bars of the
     # DataFrame. On M5 (the v1 strategy timeframe) 50 bars ≈ 4 hours.
     lookback_bars: int = 50
