@@ -125,6 +125,73 @@ class TestLoadDukascopyCSV:
         assert len(df) == 1
         assert df.index[0] == pd.Timestamp("2025-11-09T23:00:00", tz="UTC")
 
+    def test_mt5_format_yyyy_dot_mm_dot_dd_no_seconds(
+        self, tmp_path: Path,
+    ) -> None:
+        # MT5's default CSV export: YYYY.MM.DD HH:MM (no seconds).
+        # Year-first detection must pick this up despite the dot
+        # separator (which my old detection only handled for `-`/`/`).
+        content = "\n".join([
+            "timestamp,open,high,low,close,volume",
+            "2026.04.30 23:55,4005.65,4006.20,4005.10,4005.80,134",
+            "2026.05.01 00:00,4005.80,4006.50,4005.50,4006.20,98",
+        ])
+        p = _write(tmp_path, "mt5.csv", content)
+        df = load_dukascopy_csv(p)
+        assert len(df) == 2
+        assert df.index[0] == pd.Timestamp("2026-04-30T23:55:00", tz="UTC")
+        # Missing seconds default to :00 (pandas standard).
+        assert df.index[0].second == 0
+        assert df["close"].iloc[1] == 4006.20
+
+    def test_mt5_format_with_seconds(self, tmp_path: Path) -> None:
+        # Some MT5 configurations export seconds.
+        content = "\n".join([
+            "timestamp,open,high,low,close",
+            "2026.04.30 23:55:00,4005.65,4006.20,4005.10,4005.80",
+            "2026.04.30 23:55:30,4005.80,4006.00,4005.70,4005.90",
+        ])
+        p = _write(tmp_path, "mt5_sec.csv", content)
+        df = load_dukascopy_csv(p)
+        assert len(df) == 2
+        assert df.index[0] == pd.Timestamp("2026-04-30T23:55:00", tz="UTC")
+        assert df.index[1] == pd.Timestamp("2026-04-30T23:55:30", tz="UTC")
+
+    def test_three_formats_produce_equivalent_frames(
+        self, tmp_path: Path,
+    ) -> None:
+        """The same instant in MT5 / Dukascopy / ISO formats should
+        produce identical rows after loading."""
+        rows_mt5 = "\n".join([
+            "timestamp,open,high,low,close",
+            "2026.04.30 23:55,1900.0,1901.0,1899.0,1900.5",
+            "2026.05.01 00:00,1900.5,1901.5,1900.0,1901.0",
+        ])
+        rows_duka = "\n".join([
+            "Gmt time,Open,High,Low,Close",
+            "30.04.2026 23:55:00.000 UTC,1900.0,1901.0,1899.0,1900.5",
+            "01.05.2026 00:00:00.000 UTC,1900.5,1901.5,1900.0,1901.0",
+        ])
+        rows_iso = "\n".join([
+            "timestamp,open,high,low,close",
+            "2026-04-30T23:55:00Z,1900.0,1901.0,1899.0,1900.5",
+            "2026-05-01T00:00:00Z,1900.5,1901.5,1900.0,1901.0",
+        ])
+        df_mt5 = load_dukascopy_csv(_write(tmp_path, "mt5.csv", rows_mt5))
+        df_duka = load_dukascopy_csv(_write(tmp_path, "duka.csv", rows_duka))
+        df_iso = load_dukascopy_csv(_write(tmp_path, "iso.csv", rows_iso))
+
+        # Index, columns, and values all match.
+        pd.testing.assert_index_equal(df_mt5.index, df_duka.index)
+        pd.testing.assert_index_equal(df_mt5.index, df_iso.index)
+        for col in ("open", "high", "low", "close"):
+            pd.testing.assert_series_equal(
+                df_mt5[col], df_duka[col], check_names=False,
+            )
+            pd.testing.assert_series_equal(
+                df_mt5[col], df_iso[col], check_names=False,
+            )
+
     def test_sorts_by_timestamp(self, tmp_path: Path) -> None:
         # Out-of-order rows should be sorted ascending.
         content = "\n".join([

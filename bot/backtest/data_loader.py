@@ -36,6 +36,7 @@ What we explicitly do NOT do
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Iterable
 
@@ -194,19 +195,27 @@ def _parse_timestamps(
         .str.replace(r"\s+(UTC|GMT)\s*$", "", regex=True, case=False)
     )
 
-    # ``dayfirst`` only applies to ambiguous formats (Dukascopy's
-    # dd.mm.yyyy). For unambiguous ISO 8601 (yyyy-mm-dd / yyyy-mm-ddT...)
-    # pandas would otherwise still swap month/day when dayfirst=True is
-    # passed — so we sniff the first value and disable dayfirst for ISO.
+    # Detect year-first vs day-first format by sniffing the FIRST
+    # numeric chunk of a sample value. ``dayfirst`` only applies to
+    # ambiguous formats; for year-first we must pass ``dayfirst=False``
+    # explicitly or pandas (older versions; Colab is 1.5.x in places)
+    # may either fail outright or emit a deprecation warning. Examples:
+    #
+    #   "2026.04.30 23:55"       (MT5 export)        → year-first
+    #   "2026-04-30T08:00:00Z"   (ISO 8601)          → year-first
+    #   "30.04.2026 23:55:00"    (Dukascopy DD-first)→ day-first
+    #
+    # The separator (``.``, ``-``, ``/``) is irrelevant — what matters
+    # is whether the first numeric chunk is 4 digits (year) or 1–2
+    # digits (day).
     sample = str(df["timestamp"].dropna().iloc[0]).strip()
-    looks_iso = (
-        len(sample) >= 4
-        and sample[:4].isdigit()
-        and (len(sample) == 4 or sample[4] in "-/")
+    first_chunk_match = re.match(r"^(\d+)", sample)
+    year_first = bool(
+        first_chunk_match and len(first_chunk_match.group(1)) == 4
     )
+
     parse_kwargs: dict = {"errors": "coerce"}
-    if not looks_iso:
-        parse_kwargs["dayfirst"] = dayfirst
+    parse_kwargs["dayfirst"] = False if year_first else dayfirst
     ts = pd.to_datetime(df["timestamp"], **parse_kwargs)
     if ts.isna().any():
         bad = df.loc[ts.isna(), "timestamp"].iloc[0]
