@@ -50,8 +50,15 @@ OPTIONAL_VOLUME = "volume"
 
 # Header name aliases → canonical lowercase column names.
 # The keys are matched case-insensitively after stripping whitespace.
+# Dukascopy's column name has shifted across export versions:
+#   * old: "Gmt time"
+#   * newer (2024+): "UTC"
+#   * some clients export "Local time"
+# All three end up here as ``timestamp``.
 _HEADER_ALIASES: dict[str, str] = {
     "gmt time": "timestamp",
+    "utc": "timestamp",
+    "local time": "timestamp",
     "time": "timestamp",
     "date": "timestamp",
     "datetime": "timestamp",
@@ -172,8 +179,21 @@ def _parse_timestamps(
     if "timestamp" not in df.columns:
         raise ValueError(
             "OHLC CSV missing timestamp column "
-            "(expected one of: gmt time, time, date, datetime, timestamp)"
+            "(expected one of: gmt time, utc, local time, time, "
+            "date, datetime, timestamp)"
         )
+    # Strip trailing tz markers Dukascopy embeds in the value
+    # itself (e.g. ``"09.11.2025 23:00:00.000 UTC"``). Without this
+    # pandas can't parse the value; rather than fight to_datetime's
+    # format detection, we drop the suffix at the boundary. Always
+    # safe — we re-localise to UTC below either way, so a trailing
+    # ``UTC`` / ``GMT`` is just metadata not direction.
+    df = df.copy()
+    df["timestamp"] = (
+        df["timestamp"].astype(str)
+        .str.replace(r"\s+(UTC|GMT)\s*$", "", regex=True, case=False)
+    )
+
     # ``dayfirst`` only applies to ambiguous formats (Dukascopy's
     # dd.mm.yyyy). For unambiguous ISO 8601 (yyyy-mm-dd / yyyy-mm-ddT...)
     # pandas would otherwise still swap month/day when dayfirst=True is

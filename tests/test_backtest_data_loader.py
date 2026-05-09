@@ -70,6 +70,61 @@ class TestLoadDukascopyCSV:
         df = load_dukascopy_csv(p)
         assert "volume" not in df.columns
 
+    def test_dukascopy_utc_header_with_utc_suffix_in_values(
+        self, tmp_path: Path,
+    ) -> None:
+        # Dukascopy's 2024+ exports use "UTC" as the column header AND
+        # embed " UTC" in each timestamp value.
+        content = "\n".join([
+            "UTC,Open,High,Low,Close,Volume",
+            "09.11.2025 23:00:00.000 UTC,1900.00,1901.50,1899.50,1901.00,123",
+            "09.11.2025 23:05:00.000 UTC,1901.00,1902.00,1900.50,1901.75,134",
+        ])
+        p = _write(tmp_path, "duka_utc.csv", content)
+        df = load_dukascopy_csv(p)
+        assert len(df) == 2
+        assert df.index[0] == pd.Timestamp("2025-11-09T23:00:00", tz="UTC")
+        assert df["close"].iloc[1] == 1901.75
+
+    def test_dukascopy_utc_header_lowercase_value_suffix(
+        self, tmp_path: Path,
+    ) -> None:
+        # Defensive: lowercase " utc" suffix should also strip cleanly.
+        content = "\n".join([
+            "utc,Open,High,Low,Close",
+            "09.11.2025 23:00:00.000 utc,1900,1901,1899,1900.5",
+        ])
+        p = _write(tmp_path, "duka_utc_lower.csv", content)
+        df = load_dukascopy_csv(p)
+        assert len(df) == 1
+        assert df.index.tz is not None
+
+    def test_dukascopy_gmt_value_suffix_stripped(
+        self, tmp_path: Path,
+    ) -> None:
+        # Some older clients emit " GMT" instead of " UTC". Same fix.
+        content = "\n".join([
+            "Gmt time,Open,High,Low,Close",
+            "09.11.2025 23:00:00.000 GMT,1900,1901,1899,1900.5",
+        ])
+        p = _write(tmp_path, "duka_gmt_suffix.csv", content)
+        df = load_dukascopy_csv(p)
+        assert len(df) == 1
+        assert df.index[0] == pd.Timestamp("2025-11-09T23:00:00", tz="UTC")
+
+    def test_dukascopy_local_time_header(self, tmp_path: Path) -> None:
+        # Some Dukascopy export configurations label the column
+        # "Local time" even when the timestamps are UTC. We accept the
+        # header; the user is responsible for confirming the actual tz.
+        content = "\n".join([
+            "Local time,Open,High,Low,Close",
+            "09.11.2025 23:00:00.000,1900,1901,1899,1900.5",
+        ])
+        p = _write(tmp_path, "duka_local.csv", content)
+        df = load_dukascopy_csv(p)
+        assert len(df) == 1
+        assert df.index[0] == pd.Timestamp("2025-11-09T23:00:00", tz="UTC")
+
     def test_sorts_by_timestamp(self, tmp_path: Path) -> None:
         # Out-of-order rows should be sorted ascending.
         content = "\n".join([
