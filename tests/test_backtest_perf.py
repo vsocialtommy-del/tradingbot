@@ -91,6 +91,42 @@ class TestPerfBudget:
             f"at detect_swings call counts."
         )
 
+    def test_per_bar_runtime_scales_linearly_not_quadratically(self) -> None:
+        """Catch O(n²) regressions like the one fixed by the
+        ``pipeline_window_bars`` slice.
+
+        With a fixed pipeline window, doubling bar count should at
+        most double total runtime. The old (no-window) implementation
+        was O(n²) so 2000 bars ran ~4× slower than 500. We assert the
+        ratio stays under 6× (generous so flaky CI hosts pass).
+        """
+        cfg = BacktestConfig(
+            min_history_bars=100, progress_log_every_bars=0,
+        )
+
+        def time_run(n_bars: int) -> float:
+            df = _make_synthetic(n_bars)
+            t0 = time.perf_counter()
+            BacktestEngine(cfg).run(df)
+            return time.perf_counter() - t0
+
+        # Warm-up — JIT-y caches, import overhead, etc.
+        time_run(500)
+
+        small = time_run(500)
+        big = time_run(2000)
+        # 2000 / 500 = 4× more bars. With linear scaling the ratio is
+        # ~4×; with O(n²) it'd be ~16×. Budget of 6× catches the
+        # quadratic regression while leaving CI headroom.
+        ratio = big / small if small > 0 else float("inf")
+        assert ratio < 6.0, (
+            f"backtest runtime scaling regressed: 500 bars = {small:.2f}s, "
+            f"2000 bars = {big:.2f}s (ratio {ratio:.1f}×). Expected linear "
+            f"scaling (~4×); a much larger ratio means the pipeline is "
+            f"doing O(n²) work — most likely the engine stopped passing "
+            f"a fixed-size window to ``run_strategy_pipeline``."
+        )
+
 
 # --------------------------------------------------------------------------- #
 # Lock the swing-reuse optimisation
