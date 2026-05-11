@@ -268,6 +268,58 @@ class TestInitialize:
 
 
 # --------------------------------------------------------------------------- #
+# _safe_get_active_setups — transient httpx errors get brief logs, not
+# full tracebacks. Regression guard for the 10K-request connection-cycle
+# noise reported during Windows demo trading.
+# --------------------------------------------------------------------------- #
+
+
+class TestSafeGetActiveSetupsLogging:
+    def test_httpx_request_error_logged_briefly_no_traceback(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        import httpx
+        b, mgrs = bot
+        mgrs["position_tracker"].get_active_setups.side_effect = (
+            httpx.RemoteProtocolError("ConnectionTerminated error_code:0")
+        )
+        # Spy on loguru handlers.
+        exception_spy = mocker.patch.object(
+            __import__("bot.main", fromlist=["logger"]).logger, "exception",
+        )
+        warning_spy = mocker.patch.object(
+            __import__("bot.main", fromlist=["logger"]).logger, "warning",
+        )
+
+        result = b._safe_get_active_setups()
+
+        assert result == []
+        # WARN-level brief message, not exception-level full traceback.
+        warning_spy.assert_called_once()
+        exception_spy.assert_not_called()
+
+    def test_unexpected_error_still_gets_full_traceback(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        # Anything that's NOT an httpx.RequestError keeps the full
+        # exception logger so genuine bugs surface.
+        b, mgrs = bot
+        mgrs["position_tracker"].get_active_setups.side_effect = (
+            RuntimeError("something genuinely broken")
+        )
+        exception_spy = mocker.patch.object(
+            __import__("bot.main", fromlist=["logger"]).logger, "exception",
+        )
+
+        result = b._safe_get_active_setups()
+
+        assert result == []
+        exception_spy.assert_called_once()
+
+
+# --------------------------------------------------------------------------- #
 # run_iteration() — orchestration core
 # --------------------------------------------------------------------------- #
 
@@ -827,7 +879,10 @@ class TestDefaults:
     def test_loop_config_defaults(self) -> None:
         c = BotLoopConfig()
         assert c.symbol == "XAUUSD"
-        assert c.main_loop_sleep_ms == 100
+        # 1 Hz loop pacing — see BotLoopConfig docstring for rationale.
+        # Tests that change this must justify why the bot needs faster
+        # polling, given Supabase's ~10K-request HTTP/2 connection limit.
+        assert c.main_loop_sleep_ms == 1000
         assert c.config_refresh_seconds == 30
         assert c.detect_closed_seconds == 30
         assert c.reconcile_seconds == 300

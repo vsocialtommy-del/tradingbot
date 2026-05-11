@@ -168,15 +168,57 @@ class PositionTracker:
         self,
         mt5: MT5Connector,
         supabase: SupabaseLogger,
+        *,
+        active_setups_cache_ttl_seconds: float = 5.0,
     ) -> None:
         self._mt5 = mt5
         self._supabase = supabase
+        # TTL cache for ``get_active_setups()``. The Bot's run-iteration
+        # loop calls this 2-3× per tick (entry_trigger + per-active-setup
+        # tp1_manager + safe wrappers). At 1 Hz that's ~3 Supabase
+        # queries/sec uncached, which trips Supabase's HTTP/2 max-
+        # requests-per-connection limit (~10K) every ~55 min. With a
+        # 5-second TTL the rate drops to ~0.6/sec ≈ 10K/4.6 h — well
+        # below the threshold while still picking up new setups within
+        # one strategy-pipeline cycle. Mutators below invalidate the
+        # cache explicitly so we never serve stale "this setup is
+        # ACTIVE" data after we ourselves transitioned it.
+        self._cache_ttl_seconds = active_setups_cache_ttl_seconds
+        self._cached_active: list[Setup] | None = None
+        self._cached_at: datetime | None = None
 
     # ---- queries -----------------------------------------------------------
 
-    def get_active_setups(self) -> list[Setup]:
-        """Return setups in PENDING / ACTIVE / TP1_HIT — i.e. consuming exposure."""
-        return self._supabase.get_setups_by_status(list(ACTIVE_SETUP_STATUSES))
+    def get_active_setups(self, *, force_refresh: bool = False) -> list[Setup]:
+        """Return setups in PENDING / ACTIVE / TP1_HIT — i.e. consuming exposure.
+
+        TTL-cached. Pass ``force_refresh=True`` to bypass the cache
+        when you need fresh data (e.g. after a reconcile that may
+        have updated statuses externally).
+        """
+        if not force_refresh and self._cache_valid():
+            # Return a copy so callers can't mutate the cache by
+            # accident (e.g. `setups.append(...)` on the result).
+            return list(self._cached_active or [])
+        result = self._supabase.get_setups_by_status(list(ACTIVE_SETUP_STATUSES))
+        self._cached_active = list(result)
+        self._cached_at = datetime.now(tz=timezone.utc)
+        return result
+
+    def invalidate_active_setups_cache(self) -> None:
+        """Force the next ``get_active_setups()`` call to re-query Supabase.
+
+        Called by mutation methods on this class. External callers
+        can use it after writes that go around the tracker
+        (rare — discourage this).
+        """
+        self._cached_at = None
+
+    def _cache_valid(self) -> bool:
+        if self._cached_active is None or self._cached_at is None:
+            return False
+        age = (datetime.now(tz=timezone.utc) - self._cached_at).total_seconds()
+        return age < self._cache_ttl_seconds
 
     def get_setup_by_id(self, setup_id: UUID | str) -> Setup | None:
         return self._supabase.get_setup_by_id(setup_id)
@@ -211,6 +253,8 @@ class PositionTracker:
             fields["closed_at"] = now_iso
 
         updated = self._supabase.update_setup(setup_id, **fields)
+        # Status changed → active-setups membership may have shifted.
+        self.invalidate_active_setups_cache()
 
         # Cascade: terminating a setup or hitting TP1 cancels WAITING layers.
         # Terminal: ACTIVE → STOPPED_OUT shouldn't leave un-fired Layer 2/3
