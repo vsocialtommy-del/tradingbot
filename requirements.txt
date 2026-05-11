@@ -9,10 +9,15 @@ MetaTrader5>=5.0.45
 
 # ---- Data handling ----
 pandas>=2.2,<3.0
-# numpy<2 for compatibility with pandas-ta and MetaTrader5 (numpy 2.x
-# has breaking ABI changes some libs haven't caught up with).
+# numpy<2 for MetaTrader5 ABI compat (numpy 2.x has breaking changes
+# some downstream libs haven't caught up with).
 numpy>=1.26,<2.0
-pandas-ta>=0.3.14b0
+# pandas-ta was speculatively added during Phase B but never imported —
+# the S&D strategy modules (PR #31) use raw pandas/numpy, not an
+# indicator library. Removed because pandas-ta 0.4.x bumped its numpy
+# floor to >=2.2.6, which conflicts with our numpy<2.0 pin and broke
+# fresh-env installs (reported against Python 3.12.7). Add back only
+# when an indicator is genuinely needed.
 
 # ---- Database ----
 supabase>=2.3
