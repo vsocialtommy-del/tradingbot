@@ -74,6 +74,7 @@ from typing import Literal
 from uuid import UUID
 
 import pandas as pd
+from dotenv import load_dotenv
 from loguru import logger
 
 from bot.data.ohlc_provider import OHLCProvider
@@ -734,7 +735,20 @@ class _NotHalted:
 
 
 def main() -> None:
-    """``python -m bot.main`` entry point."""
+    """``python -m bot.main`` entry point.
+
+    Loads ``.env`` from the current working directory (or any parent)
+    BEFORE constructing the Bot, so ``MT5Connector.from_env()`` and
+    ``SupabaseLogger.from_env()`` see the env vars. dotenv discovery
+    walks upward to the filesystem root so running from a sub-
+    directory still works.
+
+    ``load_dotenv()`` is a no-op when no ``.env`` is found — env
+    vars from the shell still take precedence (override=False by
+    default), which is the right behaviour for CI / Docker / VPS
+    where vars come from the orchestration layer.
+    """
+    load_dotenv()
     bot = Bot(
         mt5=MT5Connector.from_env(),
         supabase=SupabaseLogger.from_env(),
