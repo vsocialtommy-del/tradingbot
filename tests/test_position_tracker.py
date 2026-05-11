@@ -775,3 +775,89 @@ class TestReconcile:
         assert result.ghost_tickets == [99999]
         assert trades[1].id in result.lost_trade_ids
         assert result.matched_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# TTL cache on get_active_setups()
+#
+# Why this exists: bot loop polls Supabase via get_active_setups() ~3× per
+# tick. At the old 10 Hz pace that was ~18 queries/sec, tripping Supabase's
+# HTTP/2 max-requests-per-connection limit (~10K) every ~14 minutes and
+# cycling the connection with a noisy traceback. A short TTL cache cuts
+# steady-state query rate by ~30× without losing correctness — the
+# cache is invalidated explicitly on every mutation that could change
+# active-setups membership.
+# --------------------------------------------------------------------------- #
+
+
+class TestActiveSetupsCache:
+    def test_two_calls_within_ttl_hit_supabase_once(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        mock_supabase.get_setups_by_status.return_value = [make_setup()]
+        a = tracker.get_active_setups()
+        b = tracker.get_active_setups()
+        assert mock_supabase.get_setups_by_status.call_count == 1
+        # Both calls return equivalent data.
+        assert len(a) == len(b) == 1
+
+    def test_force_refresh_bypasses_cache(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        mock_supabase.get_setups_by_status.return_value = [make_setup()]
+        tracker.get_active_setups()
+        tracker.get_active_setups(force_refresh=True)
+        assert mock_supabase.get_setups_by_status.call_count == 2
+
+    def test_explicit_invalidate_forces_re_query(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        mock_supabase.get_setups_by_status.return_value = [make_setup()]
+        tracker.get_active_setups()
+        tracker.invalidate_active_setups_cache()
+        tracker.get_active_setups()
+        assert mock_supabase.get_setups_by_status.call_count == 2
+
+    def test_cache_expires_after_ttl(
+        self, mock_mt5: MagicMock, mock_supabase: MagicMock,
+        mocker: MockerFixture,
+    ) -> None:
+        # Tiny TTL so we don't have to sleep.
+        t = PositionTracker(
+            mt5=mock_mt5, supabase=mock_supabase,
+            active_setups_cache_ttl_seconds=0.05,
+        )
+        mock_supabase.get_setups_by_status.return_value = [make_setup()]
+        t.get_active_setups()
+        import time as _time
+        _time.sleep(0.1)
+        t.get_active_setups()
+        assert mock_supabase.get_setups_by_status.call_count == 2
+
+    def test_update_setup_status_invalidates_cache(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        setup = make_setup(status="PENDING")
+        mock_supabase.get_setups_by_status.return_value = [setup]
+        mock_supabase.get_setup_by_id.return_value = setup
+        mock_supabase.update_setup.return_value = make_setup(status="ACTIVE")
+        mock_supabase.get_trades_for_setup.return_value = []
+
+        # Prime cache.
+        tracker.get_active_setups()
+        # Mutation should invalidate.
+        tracker.update_setup_status(setup.id, "ACTIVE")
+        tracker.get_active_setups()
+        assert mock_supabase.get_setups_by_status.call_count == 2
+
+    def test_cache_returns_defensive_copy(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        # Mutating the returned list must not poison subsequent reads.
+        mock_supabase.get_setups_by_status.return_value = [make_setup()]
+        first = tracker.get_active_setups()
+        first.clear()
+        # Within TTL — still a cache hit, but result should be fresh
+        # (length 1, not 0).
+        second = tracker.get_active_setups()
+        assert len(second) == 1

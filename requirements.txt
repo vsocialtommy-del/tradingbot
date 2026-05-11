@@ -29,6 +29,13 @@ pydantic-settings>=2.1
 
 # ---- HTTP (Telegram alerts, ad-hoc; bot itself doesn't call Finnhub) ----
 requests>=2.31
+# httpx is a transitive dep of supabase-py, but bot/main.py imports it
+# directly to catch ``httpx.RequestError`` specifically (and log it
+# briefly rather than dumping the full traceback every ~15 min when
+# Supabase cycles the HTTP/2 connection at its 10K-request limit). Pin
+# explicitly so the import doesn't silently break if supabase ever
+# drops httpx.
+httpx>=0.27
 
 # ---- Logging ----
 loguru>=0.7

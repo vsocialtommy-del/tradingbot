@@ -73,6 +73,7 @@ from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
+import httpx
 import pandas as pd
 from dotenv import load_dotenv
 from loguru import logger
@@ -121,8 +122,17 @@ class BotLoopConfig:
     """Cadence + assembly knobs for the orchestrator."""
 
     symbol: str = "XAUUSD"
-    main_loop_sleep_ms: int = 100
-    """Per-iteration sleep. 100 ms = ~10 Hz."""
+    main_loop_sleep_ms: int = 1000
+    """Per-iteration sleep. 1000 ms = ~1 Hz.
+
+    M5 trading doesn't need sub-second responsiveness — bars only
+    change every 5 minutes. The pre-2026-05 default of 100 ms hammered
+    Supabase at ~18 queries/sec (entry_trigger + tp1_manager loops
+    each call ``get_active_setups()``), tripping Supabase's HTTP/2
+    max-requests-per-connection limit (~10K) every ~14 minutes and
+    cycling the connection with a noisy traceback. 1 Hz is plenty for
+    Layer 2/3 trigger detection on M5; the worst-case fill delay
+    (~1 s) is negligible vs spread + slippage."""
 
     config_refresh_seconds: int = 30
     detect_closed_seconds: int = 30
@@ -604,6 +614,12 @@ class Bot:
             return False
 
         if result.status == "PLACED":
+            # New setup written to Supabase via order_manager — that
+            # path bypasses position_tracker, so the active-setups
+            # cache won't see the new row until its TTL expires.
+            # Invalidate now so entry_trigger picks it up on the next
+            # tick rather than waiting up to 5 s.
+            self.position_tracker.invalidate_active_setups_cache()
             logger.info(
                 f"new setup placed: id={result.setup_id} "
                 f"direction={zone.direction} "
@@ -658,8 +674,26 @@ class Bot:
     # ------------------------------------------------------------------ #
 
     def _safe_get_active_setups(self) -> list[Setup]:
+        """Read the active-setups list; return ``[]`` on any failure.
+
+        Transient httpx errors (e.g. Supabase cycling the HTTP/2
+        connection at its 10K-request limit) are logged briefly at
+        WARN level — the next iteration will reconnect. Unexpected
+        exceptions still get the full traceback so genuine bugs
+        surface.
+        """
         try:
             return self.position_tracker.get_active_setups()
+        except httpx.RequestError as e:
+            # Transport-layer (connection cycled, timeout, network
+            # blip). Recoverable. Don't dump the full traceback every
+            # ~15 min as the HTTP/2 connection rotates.
+            logger.warning(
+                "get_active_setups: transient transport error "
+                "({}: {}); returning empty, next iteration will reconnect",
+                type(e).__name__, e,
+            )
+            return []
         except Exception:
             logger.exception("get_active_setups failed; returning empty")
             return []
