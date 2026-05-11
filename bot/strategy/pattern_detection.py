@@ -1,345 +1,467 @@
-"""W and M pattern detection on close prices.
+"""Supply & Demand pattern detection — RBR / DBD / DBR / RBD.
 
-Builds on :mod:`bot.strategy.structure` for swing detection. Pure-Python
-logic on pandas DataFrames — no MT5, no Supabase, no I/O.
+The four S&D base patterns the entire methodology is built on. Every
+tradeable zone in the bot's universe is the **base** of one of these:
 
-Definitions
------------
-W pattern (BUY signal, double-bottom)
-    Two swing lows whose prices are within ``pattern_tolerance_pct`` of
-    each other (computed against their **average** — see "Conventions"
-    below), with a higher peak between them. The peak is the highest
-    close strictly between ``low1`` and ``low2``; it must clear the
-    higher of the two lows by at least ``peak_threshold_pct``.
+==== === ===================== ====== =============
+Code     Composition           Zone   Direction
+==== === ===================== ====== =============
+RBR      Rally → Base → Rally  demand BUY (cont.)
+DBD      Drop  → Base → Drop   supply SELL (cont.)
+DBR      Drop  → Base → Rally  demand BUY (rev.)
+RBD      Rally → Base → Drop   supply SELL (rev.)
+==== === ===================== ====== =============
 
-M pattern (SELL signal, double-top)
-    Mirror of W. Two swing highs within tolerance, a lower trough
-    between them clearing the lower of the two highs by the threshold
-    on the downside.
+Detection pipeline
+------------------
 
-N pattern
-    Reserved — explicitly deferred to v2 per spec Section 2.3 (often
-    overlaps with CHoCH and is harder to codify in isolation). No
-    detection function is provided in v1.
+``detect_impulses(df, config)`` finds all runs of strong same-direction
+candles. Each run is one ``Impulse`` (1-5 bars). A weak / opposite
+candle ends the run.
 
-Conventions
------------
-1. **Tolerance reference = average of the two pivots.**
-   ``diff_pct = |p1 - p2| / mean(p1, p2) * 100``.
-   Symmetric (order-independent), and the most defensible choice when
-   asking "are these two prices essentially the same?".
+``detect_bases(df, impulses, config)`` finds compact consolidations
+between adjacent impulses. A base is 1-N bars whose **total range**
+is small relative to the surrounding impulses' ranges and where no
+single base candle has a body comparable to an impulse body.
 
-2. **Peak threshold reference = the higher of the two lows** (and
-   symmetrically, the lower of the two highs for M). Requires the peak
-   to clear the *more conservative* low so the pattern is meaningfully
-   shaped, not just barely above the lower low.
+``classify_patterns(impulses, bases)`` glues each base to its
+preceding and following impulse and classifies the resulting trio as
+RBR / DBD / DBR / RBD.
 
-3. **Peak / trough need not be a swing.** We take the highest (lowest)
-   close strictly between the two pivots. Often it'll coincide with a
-   swing high (low), but we don't require it — the spec's "higher peak
-   between them" is a price-level requirement, not a structural one.
+``detect_patterns(df, config)`` is the top-level convenience that
+chains all three. The strategy pipeline calls this.
 
-4. **All-pairs detection.** With more than two same-kind swings in the
-   window, every pair ``(low_i, low_j)`` with ``i < j`` is a candidate.
-   ``detect_latest_w`` then picks the W with the highest ``low2.index``
-   (latest second low), tie-breaking on the highest ``low1.index`` (the
-   tightest most-recent W).
+Strength criteria
+-----------------
 
-5. **"Completed" = both pivots are confirmed swings.** :func:`detect_swings`
-   only returns swings with a full right-shoulder (``strength`` bars after
-   the pivot). So a pattern whose second low is still forming (no
-   right-shoulder yet) simply never appears in the swing list and is not
-   returned. The :class:`WPattern` / :class:`MPattern` dataclasses carry
-   a ``completed`` flag that is always ``True`` in v1 — preserved as a
-   field so a future "forming-pattern" detector (e.g. for live entry
-   anticipation) can be added without an API break.
+An **impulse candle** requires BOTH:
 
-6. **Lookback window.** Both pivots must satisfy
-   ``index >= latest_bar - lookback_bars + 1`` — i.e. they must lie in
-   the most recent ``lookback_bars`` of the DataFrame. Patterns formed
-   earlier in the data are filtered out.
+1. ``body / total_range ≥ impulse_body_to_range_ratio_min`` (default
+   0.6) — filters wick-heavy candles.
+2. ``body_size ≥ impulse_atr_multiple_min × ATR(atr_period)``
+   (default 1.0 × ATR(14)) — filters small candles in low vol.
+
+A **tight base** requires BOTH:
+
+1. Total base range ≤ ``base_range_to_impulse_ratio_max`` × mean of
+   the two adjacent impulses' ranges (default 0.6).
+2. Largest base candle body ≤ ``base_max_body_to_impulse_body_ratio``
+   × the larger of the two adjacent impulses' largest bodies
+   (default 0.4).
+
+Both criteria must hold; either fails, the gap isn't a base.
+
+Multi-candle impulses
+---------------------
+
+Per spec: an impulse is a **run** of 1 to ``max_impulse_run_candles``
+consecutive same-direction strong candles. The run's ``range_size``
+is computed once over the entire run, not summed across bars:
+
+* RALLY: ``high(last_bar) - low(first_bar)``
+* DROP:  ``high(first_bar) - low(last_bar)``
+
+This avoids over-counting when a 3-bar rally is rolled into a single
+impulse.
+
+Bar-by-bar processing
+---------------------
+
+Detection runs over the whole df slice the pipeline passes in. A
+pattern's ``formed_at`` is ``impulse_after.end_time`` — the moment
+the pattern is CONFIRMED. The bot processes bars forward; nothing
+is detected before its impulse_after has closed.
+
+No retrospective magic. Backtest and live use identical logic.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Literal
 
+import numpy as np
 import pandas as pd
 from loguru import logger
 
-from bot.strategy.structure import Swing, detect_swings
+
+# --------------------------------------------------------------------------- #
+# Public types
+# --------------------------------------------------------------------------- #
 
 
 class PatternType(str, Enum):
-    """The shape of a detected pattern."""
+    """The four S&D base patterns."""
 
-    W = "W"  # double-bottom (BUY signal)
-    M = "M"  # double-top (SELL signal)
-    N = "N"  # reserved — deferred to v2 (spec Section 2.3)
+    RBR = "RBR"  # Rally-Base-Rally  → demand zone, BUY (continuation)
+    DBD = "DBD"  # Drop-Base-Drop    → supply zone, SELL (continuation)
+    DBR = "DBR"  # Drop-Base-Rally   → demand zone, BUY (reversal)
+    RBD = "RBD"  # Rally-Base-Drop   → supply zone, SELL (reversal)
+
+
+ImpulseDirection = Literal["RALLY", "DROP"]
+ZoneDirection = Literal["BUY", "SELL"]
+
+
+@dataclass(frozen=True)
+class Impulse:
+    """A run of 1-5 consecutive strong same-direction candles."""
+
+    direction: ImpulseDirection
+    start_index: int                # first bar of the run (inclusive)
+    end_index: int                  # last bar of the run (inclusive)
+    start_time: pd.Timestamp
+    end_time: pd.Timestamp
+    range_size: float
+    """RALLY: ``high(end_bar) - low(start_bar)``;
+    DROP: ``high(start_bar) - low(end_bar)``.
+    Whole-run extent, NOT per-bar sum."""
+    largest_body: float             # max |close − open| across the run
+    candle_count: int               # 1..max_impulse_run_candles
+
+    @property
+    def is_rally(self) -> bool:
+        return self.direction == "RALLY"
+
+
+@dataclass(frozen=True)
+class Base:
+    """A compact consolidation between two impulses (1-N candles)."""
+
+    start_index: int
+    end_index: int
+    candle_count: int
+    top: float                      # max(max(open, close)) across base candles
+    bottom: float                   # min(min(open, close))
+    range_size: float               # top - bottom
+    largest_body: float
+
+
+@dataclass(frozen=True)
+class Pattern:
+    """A confirmed RBR/DBD/DBR/RBD pattern."""
+
+    pattern_type: PatternType
+    impulse_before: Impulse
+    base: Base
+    impulse_after: Impulse
+    direction: ZoneDirection        # BUY (RBR/DBR) or SELL (DBD/RBD)
+    formed_at: pd.Timestamp         # impulse_after.end_time
+
+    @property
+    def base_start_index(self) -> int:
+        return self.base.start_index
+
+    @property
+    def base_end_index(self) -> int:
+        return self.base.end_index
 
 
 @dataclass(frozen=True)
 class PatternConfig:
-    """Tunables for pattern detection.
+    """Tunables for S&D pattern detection.
 
-    Defaults are calibrated for **visual W/M shapes on the M5 line chart**
-    (closes only) — the way the user reads them — not for strict
-    mathematical double-bottoms. Same calibration applies symmetrically
-    to W (bullish) and M (bearish); there is no asymmetry between
-    directions.
-
-    Calibration rationale (see PR diagnostic + tuning thread)
-    --------------------------------------------------------
-    * ``pattern_tolerance_pct = 2.0`` — the 0.1% spec default rejected
-      virtually all asymmetric W's typical of XAUUSD intraday action.
-      At Gold ≈ $2300 the new 2% tolerance corresponds to roughly
-      $46 between the two lows (or highs for M) which comfortably
-      accommodates the visual "double-bottom-ish" shapes the trader
-      identifies on a line chart, including ones where one low is
-      visibly higher or lower than the other.
-    * ``swing_strength = 2`` — strength=3 forces a 7-bar window
-      (3+1+3) for a swing to be confirmed, which filters out sharp
-      V-tip reversals (1-2 bar bottoms) that the trader treats as
-      legitimate W legs. Strength=2 uses a 5-bar window and catches
-      these.
-    * ``peak_threshold_pct = 0.3`` — the peak between the two lows
-      must clear the higher low by 0.3% (~$7 at Gold $2300). Slightly
-      larger than the 0.2% spec to keep the W shape meaningful after
-      the looser tolerance — without this, two near-identical lows
-      with a near-flat middle would still be flagged.
-    * ``lookback_bars = 50`` — unchanged. ~4 hours on M5; the trader
-      generally evaluates patterns formed in the recent session.
+    Defaults calibrated for XAUUSD M5; live values come from
+    ``bot_config`` (Phase E) and override these.
     """
 
-    swing_strength: int = 2
-    pattern_tolerance_pct: float = 2.0
-    peak_threshold_pct: float = 0.3
-    # Both pivots must lie within the most recent N bars of the
-    # DataFrame. On M5 (the v1 strategy timeframe) 50 bars ≈ 4 hours.
+    # Impulse strength
+    impulse_body_to_range_ratio_min: float = 0.6
+    """Body ≥ 60% of total range. Filters wick-heavy candles."""
+    impulse_atr_multiple_min: float = 1.0
+    """Body ≥ 1.0 × ATR(14). Filters small candles in low vol."""
+    atr_period: int = 14
+    max_impulse_run_candles: int = 5
+    """Cap on consecutive strong same-direction candles in one impulse."""
+
+    # Base shape
+    min_base_candles: int = 1
+    max_base_candles: int = 5
+    base_range_to_impulse_ratio_max: float = 0.6
+    """Total base range ≤ this × mean(impulse_before.range, impulse_after.range)."""
+    base_max_body_to_impulse_body_ratio: float = 0.4
+    """No single base body ≥ this × largest impulse body."""
+
+    # Pattern lookback (within-window cutoff at the caller)
     lookback_bars: int = 50
 
 
-@dataclass(frozen=True)
-class WPattern:
-    """A detected double-bottom pattern."""
-
-    low1: Swing
-    low2: Swing
-    peak_index: int
-    peak_time: pd.Timestamp
-    peak_price: float
-    formed_at: pd.Timestamp  # = low2.time
-    completed: bool  # always True in v1 — see module docstring
-
-    @property
-    def pattern_type(self) -> PatternType:
-        return PatternType.W
-
-
-@dataclass(frozen=True)
-class MPattern:
-    """A detected double-top pattern."""
-
-    high1: Swing
-    high2: Swing
-    trough_index: int
-    trough_time: pd.Timestamp
-    trough_price: float
-    formed_at: pd.Timestamp  # = high2.time
-    completed: bool
-
-    @property
-    def pattern_type(self) -> PatternType:
-        return PatternType.M
-
-
 # --------------------------------------------------------------------------- #
-# W detection
+# Top-level detection
 # --------------------------------------------------------------------------- #
 
 
-def detect_w_patterns(
+def detect_patterns(
     df: pd.DataFrame,
     config: PatternConfig | None = None,
-    *,
-    swings: list[Swing] | None = None,
-) -> list[WPattern]:
-    """Find every W pattern in ``df`` (all-pairs over confirmed swing lows).
+) -> list[Pattern]:
+    """Detect all RBR/DBD/DBR/RBD patterns in ``df``.
 
-    ``swings`` is an optional pre-computed swing list. When supplied,
-    we skip the internal ``detect_swings`` call. The strategy pipeline
-    passes ``analyze_structure``'s swings here so they aren't recomputed
-    a second time per pipeline iteration — a 3× speedup on the hot
-    path.
+    Chains impulse detection → base detection → classification. The
+    pipeline calls this from each per-bar invocation; lookback
+    filtering (limit to recent ``lookback_bars``) is the caller's
+    responsibility (it depends on the pipeline's per-bar window
+    semantics).
     """
     cfg = config or PatternConfig()
     if len(df) == 0:
         return []
+    impulses = detect_impulses(df, cfg)
+    bases = detect_bases(df, impulses, cfg)
+    patterns = classify_patterns(impulses, bases)
 
-    if swings is None:
-        swings = detect_swings(df, cfg.swing_strength)
-    lows = sorted(
-        (s for s in swings if s.kind == "LOW"), key=lambda s: s.index
-    )
-    if len(lows) < 2:
-        return []
-
-    closes = df["close"].to_numpy()
-    latest_bar = len(df) - 1
-    lookback_cutoff = latest_bar - cfg.lookback_bars + 1
-
-    patterns: list[WPattern] = []
-    for i in range(len(lows)):
-        low1 = lows[i]
-        if low1.index < lookback_cutoff:
-            continue
-        for j in range(i + 1, len(lows)):
-            low2 = lows[j]
-            # low2.index is necessarily >= low1.index, so the lookback
-            # check above already covers low2 — no need to recheck.
-
-            if not _within_tolerance(
-                low1.price, low2.price, cfg.pattern_tolerance_pct
-            ):
-                continue
-
-            peak_idx_offset, peak_price = _highest_close_between(
-                closes, low1.index, low2.index
-            )
-            if peak_idx_offset is None:
-                continue
-            peak_index = low1.index + 1 + peak_idx_offset
-
-            if not _peak_clears_threshold(
-                peak_price,
-                higher_low=max(low1.price, low2.price),
-                threshold_pct=cfg.peak_threshold_pct,
-            ):
-                continue
-
-            patterns.append(
-                WPattern(
-                    low1=low1,
-                    low2=low2,
-                    peak_index=peak_index,
-                    peak_time=df.index[peak_index],
-                    peak_price=peak_price,
-                    formed_at=low2.time,
-                    completed=True,
-                )
-            )
-
-    # Lazy format — loguru skips str-build when DEBUG is filtered.
+    # Lazy DEBUG — loguru skips str-build when filtered.
     logger.debug(
-        "detect_w_patterns: {} lows, {} W patterns", len(lows), len(patterns),
+        "detect_patterns: {} impulses, {} bases, {} patterns",
+        len(impulses), len(bases), len(patterns),
     )
     return patterns
 
 
-def detect_latest_w(
-    df: pd.DataFrame,
-    config: PatternConfig | None = None,
-) -> WPattern | None:
-    """Return the most recent W pattern, or ``None`` if none exists.
-
-    "Most recent" = highest ``low2.index``. Ties (same second low,
-    different first lows) are broken by preferring the highest
-    ``low1.index`` — the tightest most-recent W.
-    """
-    patterns = detect_w_patterns(df, config)
-    if not patterns:
-        return None
-    return max(patterns, key=lambda p: (p.low2.index, p.low1.index))
-
-
 # --------------------------------------------------------------------------- #
-# M detection
+# Stage 1 — impulses
 # --------------------------------------------------------------------------- #
 
 
-def detect_m_patterns(
+def detect_impulses(
     df: pd.DataFrame,
     config: PatternConfig | None = None,
-    *,
-    swings: list[Swing] | None = None,
-) -> list[MPattern]:
-    """Find every M pattern in ``df`` (all-pairs over confirmed swing highs).
+) -> list[Impulse]:
+    """Find every impulse run in ``df``.
 
-    See :func:`detect_w_patterns` for the rationale behind the optional
-    ``swings`` parameter — pipeline pre-computes swings once and shares.
+    Walks the df once, identifying which bars are individually
+    "strong" (body/range and ATR criteria), then groups same-direction
+    consecutive strong bars into runs up to ``max_impulse_run_candles``.
+
+    A bar that fails either strength criterion ends any run in progress.
     """
     cfg = config or PatternConfig()
-    if len(df) == 0:
+    if len(df) < cfg.atr_period + 1:
         return []
+    for col in ("open", "high", "low", "close"):
+        if col not in df.columns:
+            raise ValueError(f"df must have a '{col}' column")
 
-    if swings is None:
-        swings = detect_swings(df, cfg.swing_strength)
-    highs = sorted(
-        (s for s in swings if s.kind == "HIGH"), key=lambda s: s.index
-    )
-    if len(highs) < 2:
-        return []
-
+    opens = df["open"].to_numpy()
+    highs = df["high"].to_numpy()
+    lows = df["low"].to_numpy()
     closes = df["close"].to_numpy()
-    latest_bar = len(df) - 1
-    lookback_cutoff = latest_bar - cfg.lookback_bars + 1
+    times = df.index
 
-    patterns: list[MPattern] = []
-    for i in range(len(highs)):
-        high1 = highs[i]
-        if high1.index < lookback_cutoff:
+    atr = _atr(highs, lows, closes, period=cfg.atr_period)
+
+    n = len(df)
+    impulses: list[Impulse] = []
+    i = 0
+    while i < n:
+        # Skip until we find a strong candle.
+        if not _is_strong_candle(
+            i, opens, highs, lows, closes, atr, cfg,
+        ):
+            i += 1
             continue
-        for j in range(i + 1, len(highs)):
-            high2 = highs[j]
 
-            if not _within_tolerance(
-                high1.price, high2.price, cfg.pattern_tolerance_pct
-            ):
-                continue
+        direction: ImpulseDirection = "RALLY" if closes[i] >= opens[i] else "DROP"
+        run_start = i
+        run_end = i  # inclusive
 
-            trough_offset, trough_price = _lowest_close_between(
-                closes, high1.index, high2.index
+        # Extend the run forward while same-direction strong candles
+        # continue, up to the cap.
+        for j in range(i + 1, min(n, i + cfg.max_impulse_run_candles)):
+            if not _is_strong_candle(j, opens, highs, lows, closes, atr, cfg):
+                break
+            j_direction: ImpulseDirection = (
+                "RALLY" if closes[j] >= opens[j] else "DROP"
             )
-            if trough_offset is None:
-                continue
-            trough_index = high1.index + 1 + trough_offset
+            if j_direction != direction:
+                break
+            run_end = j
 
-            if not _trough_clears_threshold(
-                trough_price,
-                lower_high=min(high1.price, high2.price),
-                threshold_pct=cfg.peak_threshold_pct,
-            ):
-                continue
+        impulses.append(_build_impulse(
+            direction, run_start, run_end,
+            opens, highs, lows, closes, times,
+        ))
+        i = run_end + 1
 
-            patterns.append(
-                MPattern(
-                    high1=high1,
-                    high2=high2,
-                    trough_index=trough_index,
-                    trough_time=df.index[trough_index],
-                    trough_price=trough_price,
-                    formed_at=high2.time,
-                    completed=True,
-                )
-            )
+    logger.debug("detect_impulses: {} impulses found", len(impulses))
+    return impulses
 
-    # Lazy format — loguru skips str-build when DEBUG is filtered.
-    logger.debug(
-        "detect_m_patterns: {} highs, {} M patterns", len(highs), len(patterns),
+
+def _is_strong_candle(
+    i: int,
+    opens: np.ndarray, highs: np.ndarray,
+    lows: np.ndarray, closes: np.ndarray,
+    atr: np.ndarray, cfg: PatternConfig,
+) -> bool:
+    """Both strength criteria: body/range ratio AND body ≥ ATR multiple."""
+    body = abs(closes[i] - opens[i])
+    total_range = highs[i] - lows[i]
+    if total_range <= 0:
+        return False
+    if body / total_range < cfg.impulse_body_to_range_ratio_min:
+        return False
+    if not np.isfinite(atr[i]) or atr[i] <= 0:
+        return False
+    if body < cfg.impulse_atr_multiple_min * atr[i]:
+        return False
+    return True
+
+
+def _build_impulse(
+    direction: ImpulseDirection,
+    start_index: int, end_index: int,
+    opens: np.ndarray, highs: np.ndarray,
+    lows: np.ndarray, closes: np.ndarray,
+    times: pd.DatetimeIndex,
+) -> Impulse:
+    """Compose an Impulse dataclass from the run boundaries."""
+    if direction == "RALLY":
+        range_size = float(highs[end_index] - lows[start_index])
+    else:
+        range_size = float(highs[start_index] - lows[end_index])
+    bodies = np.abs(closes[start_index : end_index + 1]
+                    - opens[start_index : end_index + 1])
+    largest_body = float(bodies.max())
+    return Impulse(
+        direction=direction,
+        start_index=start_index,
+        end_index=end_index,
+        start_time=times[start_index],
+        end_time=times[end_index],
+        range_size=range_size,
+        largest_body=largest_body,
+        candle_count=end_index - start_index + 1,
     )
-    return patterns
 
 
-def detect_latest_m(
+# --------------------------------------------------------------------------- #
+# Stage 2 — bases
+# --------------------------------------------------------------------------- #
+
+
+def detect_bases(
     df: pd.DataFrame,
+    impulses: list[Impulse],
     config: PatternConfig | None = None,
-) -> MPattern | None:
-    """Return the most recent M pattern, or ``None``."""
-    patterns = detect_m_patterns(df, config)
-    if not patterns:
-        return None
-    return max(patterns, key=lambda p: (p.high2.index, p.high1.index))
+) -> list[Base]:
+    """Find every compact consolidation between adjacent impulses.
+
+    For each consecutive pair ``(imp_a, imp_b)``, the gap between
+    ``imp_a.end_index + 1`` and ``imp_b.start_index - 1`` (inclusive)
+    is a candidate base. It must satisfy:
+
+    * ``min_base_candles ≤ gap_length ≤ max_base_candles``
+    * Total base range ≤ ``base_range_to_impulse_ratio_max`` × mean
+      of imp_a and imp_b range sizes
+    * Largest base body ≤ ``base_max_body_to_impulse_body_ratio`` ×
+      max(imp_a.largest_body, imp_b.largest_body)
+    """
+    cfg = config or PatternConfig()
+    if len(impulses) < 2:
+        return []
+
+    opens = df["open"].to_numpy()
+    closes = df["close"].to_numpy()
+    bases: list[Base] = []
+    for imp_a, imp_b in zip(impulses, impulses[1:]):
+        gap_start = imp_a.end_index + 1
+        gap_end = imp_b.start_index - 1
+        n_gap = gap_end - gap_start + 1
+        if n_gap < cfg.min_base_candles or n_gap > cfg.max_base_candles:
+            continue
+
+        base = _build_base(gap_start, gap_end, opens, closes)
+        if not _tight_enough(base, imp_a, imp_b, cfg):
+            continue
+        bases.append(base)
+
+    logger.debug("detect_bases: {} bases from {} impulse pairs",
+                 len(bases), len(impulses) - 1)
+    return bases
+
+
+def _build_base(
+    start_index: int, end_index: int,
+    opens: np.ndarray, closes: np.ndarray,
+) -> Base:
+    """Compute body-only extremes across the base range."""
+    o = opens[start_index : end_index + 1]
+    c = closes[start_index : end_index + 1]
+    body_tops = np.maximum(o, c)
+    body_bottoms = np.minimum(o, c)
+    top = float(body_tops.max())
+    bottom = float(body_bottoms.min())
+    largest_body = float(np.abs(c - o).max())
+    return Base(
+        start_index=start_index,
+        end_index=end_index,
+        candle_count=end_index - start_index + 1,
+        top=top,
+        bottom=bottom,
+        range_size=top - bottom,
+        largest_body=largest_body,
+    )
+
+
+def _tight_enough(
+    base: Base, imp_a: Impulse, imp_b: Impulse, cfg: PatternConfig,
+) -> bool:
+    """Both tightness criteria: total range AND no big-body candle."""
+    mean_impulse_range = (imp_a.range_size + imp_b.range_size) / 2.0
+    if mean_impulse_range <= 0:
+        return False
+    if base.range_size > cfg.base_range_to_impulse_ratio_max * mean_impulse_range:
+        return False
+    max_imp_body = max(imp_a.largest_body, imp_b.largest_body)
+    if max_imp_body <= 0:
+        return False
+    if base.largest_body > cfg.base_max_body_to_impulse_body_ratio * max_imp_body:
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# Stage 3 — classification
+# --------------------------------------------------------------------------- #
+
+
+_PATTERN_TABLE: dict[
+    tuple[ImpulseDirection, ImpulseDirection],
+    tuple[PatternType, ZoneDirection],
+] = {
+    ("RALLY", "RALLY"): (PatternType.RBR, "BUY"),   # demand, continuation
+    ("DROP",  "DROP"):  (PatternType.DBD, "SELL"),  # supply, continuation
+    ("DROP",  "RALLY"): (PatternType.DBR, "BUY"),   # demand, reversal
+    ("RALLY", "DROP"):  (PatternType.RBD, "SELL"),  # supply, reversal
+}
+
+
+def classify_patterns(
+    impulses: list[Impulse], bases: list[Base],
+) -> list[Pattern]:
+    """Glue bases to their adjacent impulses and assign pattern_type."""
+    if not bases:
+        return []
+    by_start: dict[int, Base] = {b.start_index: b for b in bases}
+    patterns: list[Pattern] = []
+    for imp_a, imp_b in zip(impulses, impulses[1:]):
+        gap_start = imp_a.end_index + 1
+        base = by_start.get(gap_start)
+        if base is None or base.end_index != imp_b.start_index - 1:
+            continue
+        pattern_type, zone_direction = _PATTERN_TABLE[
+            (imp_a.direction, imp_b.direction)
+        ]
+        patterns.append(Pattern(
+            pattern_type=pattern_type,
+            impulse_before=imp_a,
+            base=base,
+            impulse_after=imp_b,
+            direction=zone_direction,
+            formed_at=imp_b.end_time,
+        ))
+    return patterns
 
 
 # --------------------------------------------------------------------------- #
@@ -347,59 +469,31 @@ def detect_latest_m(
 # --------------------------------------------------------------------------- #
 
 
-def _within_tolerance(p1: float, p2: float, tolerance_pct: float) -> bool:
-    """``|p1 - p2| / mean(p1, p2) * 100 <= tolerance_pct``.
+def _atr(
+    highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int,
+) -> np.ndarray:
+    """ATR via Wilder's smoothing; returns ``NaN`` for the first ``period`` bars.
 
-    Inclusive at the boundary so a pair sitting exactly at the tolerance
-    threshold is accepted.
+    Result is aligned to the input arrays — index ``i`` is the ATR
+    *available at the close of bar i*. The first ``period`` entries
+    are NaN because there isn't enough history to compute.
     """
-    avg = (p1 + p2) / 2.0
-    if avg <= 0:
-        return False
-    diff_pct = abs(p1 - p2) / avg * 100.0
-    return diff_pct <= tolerance_pct
-
-
-def _highest_close_between(
-    closes,
-    left_idx: int,
-    right_idx: int,
-) -> tuple[int | None, float]:
-    """Highest close strictly between ``left_idx`` and ``right_idx``.
-
-    Returns ``(offset_from_left_plus_1, price)`` so the absolute bar
-    index is ``left_idx + 1 + offset``. Returns ``(None, 0.0)`` if the
-    interval is empty (adjacent pivots).
-    """
-    sl = closes[left_idx + 1 : right_idx]
-    if len(sl) == 0:
-        return None, 0.0
-    offset = int(sl.argmax())
-    return offset, float(sl[offset])
-
-
-def _lowest_close_between(
-    closes,
-    left_idx: int,
-    right_idx: int,
-) -> tuple[int | None, float]:
-    """Lowest close strictly between ``left_idx`` and ``right_idx``."""
-    sl = closes[left_idx + 1 : right_idx]
-    if len(sl) == 0:
-        return None, 0.0
-    offset = int(sl.argmin())
-    return offset, float(sl[offset])
-
-
-def _peak_clears_threshold(
-    peak_price: float, higher_low: float, threshold_pct: float
-) -> bool:
-    """``peak_price >= higher_low * (1 + threshold_pct / 100)``."""
-    return peak_price >= higher_low * (1.0 + threshold_pct / 100.0)
-
-
-def _trough_clears_threshold(
-    trough_price: float, lower_high: float, threshold_pct: float
-) -> bool:
-    """``trough_price <= lower_high * (1 - threshold_pct / 100)``."""
-    return trough_price <= lower_high * (1.0 - threshold_pct / 100.0)
+    n = len(closes)
+    if n == 0:
+        return np.array([], dtype=float)
+    true_range = np.empty(n, dtype=float)
+    true_range[0] = highs[0] - lows[0]
+    for i in range(1, n):
+        a = highs[i] - lows[i]
+        b = abs(highs[i] - closes[i - 1])
+        c = abs(lows[i] - closes[i - 1])
+        true_range[i] = max(a, b, c)
+    atr = np.full(n, np.nan, dtype=float)
+    if n < period:
+        return atr
+    # Seed: simple mean over the first ``period`` true ranges.
+    atr[period - 1] = true_range[:period].mean()
+    # Wilder smoothing afterwards.
+    for i in range(period, n):
+        atr[i] = (atr[i - 1] * (period - 1) + true_range[i]) / period
+    return atr

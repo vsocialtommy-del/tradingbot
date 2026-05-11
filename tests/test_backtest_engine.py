@@ -28,9 +28,13 @@ from bot.backtest.engine import (
     BacktestResult,
 )
 from bot.backtest.simulator import CloseReason
-from bot.exits.sl_manager import SLCalculation
-from bot.strategy.imbalance import ImbalanceZone
-from bot.strategy.pattern_detection import WPattern
+from bot.strategy.structure import Swing
+from bot.strategy.pattern_detection import (
+    Base,
+    Impulse,
+    Pattern,
+    PatternType,
+)
 from bot.strategy.strong_point import ValidatedZone
 from bot.strategy.structure import BosEvent, Swing
 from bot.strategy.zone_marking import Zone
@@ -61,15 +65,17 @@ def make_flat_df(
     )
 
 
-def stub_sl(
-    *, sl_price: float = 1880.0, direction: str = "BUY",
-) -> SLCalculation:
-    """Convenience: SLCalculation tests can patch into _calculate_sl."""
-    return SLCalculation(
-        sl_price=sl_price, reference_swing_price=1899.5,
-        buffer_used=17.5, lookback_used=20,
-        direction=direction,  # type: ignore[arg-type]
-        fallback_used=False,
+def patch_sl_price(mocker, sl_price: float = 1880.0) -> None:
+    """Stub ``strong_point.compute_sl_price`` to a fixed value.
+
+    Replaces the pre-PR-31 ``stub_sl`` helper that targeted the
+    removed ``_calculate_sl`` engine helper. The engine now reads
+    ``zone.sl_anchor_swing`` and calls ``compute_sl_price`` on it;
+    tests can patch the latter to control SL.
+    """
+    mocker.patch(
+        "bot.backtest.engine.compute_sl_price",
+        return_value=float(sl_price),
     )
 
 
@@ -77,56 +83,56 @@ def make_imbalance_zone(
     *, direction: str = "BUY",
     top: float = 1900.0, bottom: float = 1895.0,
     formed_index: int = 5,
-) -> ImbalanceZone:
+) -> ValidatedZone:
+    """Build a ValidatedZone (PR #31).
+
+    Name retained for call-site stability; returns the post-PR-31
+    type. Default ``broken_swing`` price is ``top + 5`` (BUY) /
+    ``bottom - 5`` (SELL), matching the v1 spec's break level
+    semantics.
+    """
     ts = pd.Timestamp(NOW)
-    if direction == "BUY":
-        pat: Any = WPattern(
-            low1=Swing(index=formed_index - 3, time=ts, price=bottom, kind="LOW"),
-            low2=Swing(index=formed_index, time=ts, price=bottom, kind="LOW"),
-            peak_index=formed_index - 2, peak_time=ts, peak_price=top + 5,
-            formed_at=ts, completed=True,
-        )
-    else:
-        from bot.strategy.pattern_detection import MPattern
-        pat = MPattern(
-            high1=Swing(index=formed_index - 3, time=ts, price=top, kind="HIGH"),
-            high2=Swing(index=formed_index, time=ts, price=top, kind="HIGH"),
-            trough_index=formed_index - 2, trough_time=ts, trough_price=bottom - 5,
-            formed_at=ts, completed=True,
-        )
-    bos = BosEvent(
-        bar_index=formed_index + 5, time=ts,
-        direction="UP" if direction == "BUY" else "DOWN",
-        broken_swing_index=formed_index - 1,
-        broken_level=top + 5 if direction == "BUY" else bottom - 5,
-        break_close=top + 6 if direction == "BUY" else bottom - 6,
+    impulse_dir = "RALLY" if direction == "BUY" else "DROP"
+    impulse = Impulse(
+        direction=impulse_dir, start_index=0, end_index=0,
+        start_time=ts, end_time=ts,
+        range_size=5.0, largest_body=5.0, candle_count=1,
     )
-    initial = Zone(
+    base = Base(
+        start_index=1, end_index=1, candle_count=1,
+        top=top, bottom=bottom, range_size=top - bottom, largest_body=0.5,
+    )
+    pattern = Pattern(
+        pattern_type=PatternType.RBR if direction == "BUY" else PatternType.DBD,
+        impulse_before=impulse, base=base, impulse_after=impulse,
         direction=direction,  # type: ignore[arg-type]
-        top=top, bottom=bottom, formed_at=ts, source_pattern=pat,
+        formed_at=ts,
+    )
+    zone = Zone(
+        direction=direction,  # type: ignore[arg-type]
+        top=top, bottom=bottom, formed_at=ts, source_pattern=pattern,
     )
     refined = RefinedZone(
         direction=direction,  # type: ignore[arg-type]
-        top=top, bottom=bottom, formed_at=ts, source_pattern=pat,
-        is_tradeable=True, rejection_reason=None,
-        original_zone=initial,
+        top=top, bottom=bottom, formed_at=ts, source_pattern=pattern,
+        is_tradeable=True, rejection_reason=None, original_zone=zone,
     )
-    validated = ValidatedZone(
-        direction=direction,  # type: ignore[arg-type]
-        top=top, bottom=bottom, formed_at=ts, source_pattern=pat,
-        is_tradeable=True, rejection_reason=None,
-        original_zone=initial, refined_zone=refined,
-        is_strong_point=True, validation_failures=[], bos_event=bos,
+    broken = Swing(
+        index=formed_index + 5, time=ts,
+        price=top + 5.0 if direction == "BUY" else bottom - 5.0,
+        kind="HIGH" if direction == "BUY" else "LOW",
     )
-    return ImbalanceZone(
+    anchor = Swing(
+        index=formed_index - 1, time=ts,
+        price=bottom - 5.0 if direction == "BUY" else top + 5.0,
+        kind="LOW" if direction == "BUY" else "HIGH",
+    )
+    return ValidatedZone(
         direction=direction,  # type: ignore[arg-type]
-        top=top, bottom=bottom, formed_at=ts, source_pattern=pat,
-        is_tradeable=True, rejection_reason=None,
-        original_zone=initial, refined_zone=refined,
-        is_strong_point=True, validation_failures=[], bos_event=bos,
-        validated_zone=validated,
-        approach_count=2, is_imbalance=True, approach_events=[],
-        qualified_at=ts, is_tapped=False, tapped_at=None,
+        top=top, bottom=bottom, formed_at=ts, source_pattern=pattern,
+        refined_zone=refined,
+        is_strong_point=True, validation_failures=[],
+        broken_swing=broken, broken_at=ts, sl_anchor_swing=anchor,
     )
 
 
@@ -178,9 +184,7 @@ class TestSetupCreation:
         )
         # Stub SL — the synthetic flat OHLC's fallback-low produces an
         # unhelpful SL above entry; this test isn't checking SL calc.
-        mocker.patch(
-            "bot.backtest.engine._calculate_sl", return_value=stub_sl(),
-        )
+        patch_sl_price(mocker, sl_price=1880.0)
         df = make_flat_df(n=110, base_price=1920.0)  # price well above zone
         cfg = BacktestConfig(min_history_bars=100, progress_log_every_bars=0)
         result = BacktestEngine(cfg).run(df)
@@ -197,9 +201,7 @@ class TestSetupCreation:
             "bot.backtest.engine.run_strategy_pipeline",
             return_value=[zone],
         )
-        mocker.patch(
-            "bot.backtest.engine._calculate_sl", return_value=stub_sl(),
-        )
+        patch_sl_price(mocker, sl_price=1880.0)
         df = make_flat_df(n=120, base_price=1920.0)
         cfg = BacktestConfig(min_history_bars=100, progress_log_every_bars=0)
         result = BacktestEngine(cfg).run(df)
@@ -207,6 +209,37 @@ class TestSetupCreation:
         # but only 1 unique zone → 1 setup taken.
         assert result.setups_detected == 20
         assert result.setups_taken == 1
+
+    def test_zone_without_sl_anchor_skipped_with_skip_reason(
+        self, mocker: MockerFixture,
+    ) -> None:
+        # Defensive: a zone reaching the engine without an
+        # ``sl_anchor_swing`` means Strong Point validation produced
+        # a malformed result (shouldn't happen in practice since the
+        # pipeline only emits is_strong_point=True zones which always
+        # have an anchor). The engine should skip with ``no_sl_anchor``
+        # rather than crash on the None-deref in compute_sl_price.
+        zone = make_imbalance_zone(top=1900.0, bottom=1895.0, direction="BUY")
+        broken_zone = ValidatedZone(
+            direction=zone.direction, top=zone.top, bottom=zone.bottom,
+            formed_at=zone.formed_at, source_pattern=zone.source_pattern,
+            refined_zone=zone.refined_zone,
+            is_strong_point=zone.is_strong_point,
+            validation_failures=zone.validation_failures,
+            broken_swing=zone.broken_swing,
+            broken_at=zone.broken_at,
+            sl_anchor_swing=None,        # <-- anchor missing
+        )
+        mocker.patch(
+            "bot.backtest.engine.run_strategy_pipeline",
+            return_value=[broken_zone],
+        )
+        df = make_flat_df(n=110, base_price=1920.0)
+        cfg = BacktestConfig(min_history_bars=100, progress_log_every_bars=0)
+        result = BacktestEngine(cfg).run(df)
+
+        assert result.setups_taken == 0
+        assert "no_sl_anchor" in result.skip_reasons
 
 
 # --------------------------------------------------------------------------- #
@@ -242,9 +275,7 @@ class TestExposureCap:
         mocker.patch(
             "bot.backtest.engine.run_strategy_pipeline", side_effect=pipeline,
         )
-        mocker.patch(
-            "bot.backtest.engine._calculate_sl", return_value=stub_sl(),
-        )
+        patch_sl_price(mocker, sl_price=1880.0)
         df = make_flat_df(n=110, base_price=1950.0)  # well above all zones
         cfg = BacktestConfig(
             min_history_bars=100, progress_log_every_bars=0,
@@ -275,10 +306,7 @@ class TestSLCascadeCancel:
             return_value=[zone],
         )
         # SL stub at 1882 — well above the crash level used below.
-        mocker.patch(
-            "bot.backtest.engine._calculate_sl",
-            return_value=stub_sl(sl_price=1882.0),
-        )
+        patch_sl_price(mocker, sl_price=1882.0)
 
         # OHLC: bars 0-100 flat at 1900 (Layer 1 limit fills naturally
         # via the OHLC walk's 1899.5 dip on bar 101). Bar 102 crashes
@@ -340,10 +368,7 @@ class TestTP1HitMovesSLToBE:
             "bot.backtest.engine.run_strategy_pipeline",
             return_value=[zone],
         )
-        mocker.patch(
-            "bot.backtest.engine._calculate_sl",
-            return_value=stub_sl(sl_price=1882.0),
-        )
+        patch_sl_price(mocker, sl_price=1882.0)
         n = 110
         times = pd.date_range(
             "2026-05-01T08:00:00Z", periods=n, freq="5min", tz="UTC",
@@ -396,10 +421,7 @@ class TestDailyHalt:
             side_effect=lambda df, cfg: next(seq, []),
         )
         # Stub SL so the SL is sensible despite synthetic flat data.
-        mocker.patch(
-            "bot.backtest.engine._calculate_sl",
-            return_value=stub_sl(sl_price=1882.0),
-        )
+        patch_sl_price(mocker, sl_price=1882.0)
 
         # Build OHLC so Layer 1 of zone1 fills then SL hits hard.
         n = 200

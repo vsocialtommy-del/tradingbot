@@ -326,9 +326,12 @@ def get_swings_within_lookback(
 ) -> list[Swing]:
     """Return swings whose ``index`` is in ``(from_bar - lookback, from_bar]``.
 
-    Used by ``sl_manager`` to find the structural high/low for SL
-    placement (spec Section 5.1, ``recent_swing_lookback`` = 20 by
-    default).
+    Historical helper: ``sl_manager`` used this for the lookback
+    heuristic that selected the SL anchor swing. PR #31 moved anchor
+    selection into the strategy layer (``strong_point.validate_strong_point``
+    publishes ``sl_anchor_swing`` on the ValidatedZone), so this
+    helper has no production callers any more. Retained for future
+    re-use and its own test coverage.
     """
     if lookback < 1:
         raise ValueError(f"lookback must be >= 1, got {lookback}")

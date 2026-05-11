@@ -60,48 +60,30 @@ class TestDiagnose:
         assert counts.bars_processed == 200
         assert counts.detection_bars == 100
 
-    def test_w_plus_m_sum_equals_total_pattern_candidates(self) -> None:
+    def test_pattern_subtype_counts_sum_to_total(self) -> None:
         df = _make_synthetic(n_bars=300)
-        counts = diagnose(df)
-        assert counts.w_candidates + counts.m_candidates == counts.pattern_candidates
+        c = diagnose(df)
+        assert (
+            c.rbr_candidates + c.dbd_candidates
+            + c.dbr_candidates + c.rbd_candidates
+        ) == c.pattern_candidates
 
     def test_strong_point_failures_mutually_exclusive(self) -> None:
-        # Sum of the four bucket counts must equal
-        # (refined_tradeable − strong_points). If a zone with multiple
-        # failures was counted in multiple buckets, the sum would
-        # overshoot.
+        # Sum of the four buckets must equal (refined_tradeable − strong_points).
+        # PR #31 buckets: no_swing, no_sl_anchor, no_break_yet, invalidated.
         df = _make_synthetic(n_bars=400)
         c = diagnose(df)
         sp_failures_sum = (
-            c.sp_failed_no_bos + c.sp_failed_base
-            + c.sp_failed_impulse + c.sp_failed_other
+            c.sp_failed_no_swing + c.sp_failed_no_sl_anchor
+            + c.sp_failed_no_break_yet + c.sp_failed_invalidated
         )
         assert sp_failures_sum == c.refined_tradeable - c.strong_points
 
-    def test_imbalance_breakdown_sums_correctly(self) -> None:
-        # Of strong_points: either (qualified) or (rejected). The two
-        # rejection sub-buckets must sum to (strong_points − qualified).
+    def test_unique_zones_at_most_strong_points(self) -> None:
+        # Dedup can only reduce the Strong Point count.
         df = _make_synthetic(n_bars=400)
         c = diagnose(df)
-        imb_rejection_sum = (
-            c.imb_zero_approaches + c.imb_too_few_approaches
-        )
-        assert imb_rejection_sum == c.strong_points - c.imbalance_qualified
-
-    def test_untapped_breakdown_sums_correctly(self) -> None:
-        # Of qualified: either (untapped) or (tapped). The single
-        # rejection bucket must equal (qualified − untapped).
-        df = _make_synthetic(n_bars=400)
-        c = diagnose(df)
-        assert c.imb_qualified_but_tapped == (
-            c.imbalance_qualified - c.untapped_at_detection
-        )
-
-    def test_unique_zones_at_most_untapped(self) -> None:
-        df = _make_synthetic(n_bars=400)
-        c = diagnose(df)
-        # Dedup can only reduce the count.
-        assert c.unique_zones <= c.untapped_at_detection
+        assert c.unique_zones <= c.strong_points
 
 
 # --------------------------------------------------------------------------- #
@@ -121,7 +103,6 @@ class TestReportFormat:
             "Pattern candidates",
             "Refined tradeable",
             "Strong Points",
-            "Imbalance-qualified",
             "Unique zones",
         ):
             assert marker in joined

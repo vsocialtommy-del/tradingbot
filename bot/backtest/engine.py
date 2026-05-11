@@ -83,9 +83,13 @@ from bot.backtest.simulator import (
     TPHit,
     generate_ticks_from_bar,
 )
-from bot.exits.sl_manager import SLCalculation, SLManager, SLManagerConfig
+from bot.exits.sl_manager import SLManagerConfig
 from bot.risk.daily_halt import current_trading_date
-from bot.strategy.imbalance import ImbalanceZone
+from bot.strategy.strong_point import (
+    StrongPointConfig,
+    ValidatedZone,
+    compute_sl_price,
+)
 from bot.strategy.pipeline import (
     StrategyPipelineConfig,
     run_strategy_pipeline,
@@ -132,8 +136,10 @@ class BacktestConfig:
 
     # SL / TP / layers (price units)
     sl_buffer_points: float = 17.5
-    recent_swing_lookback: int = 20
-    swing_strength: int = 3
+    swing_strength: int = 2
+    """Swing detection strength — used by structure analysis for the
+    Strong Point break / anchor swings. PR #31 default lowered to 2
+    to catch sharp V-tip pivots."""
     min_sl_distance_points: float = 5.0
     max_sl_distance_points: float = 200.0
     layer_2_offset_points: float = 2.5
@@ -397,20 +403,19 @@ class BacktestEngine:
 
     def _try_open_setup(
         self,
-        zone: ImbalanceZone,
+        zone: ValidatedZone,
         history: pd.DataFrame,
         bar_time: datetime,
         last_tick: Tick,
     ) -> bool:
-        # 1. SL.
-        try:
-            sl_calc = _calculate_sl(zone, history, self._sl_config())
-        except Exception:
-            self._record_skip("sl_calc_failed")
+        # 1. SL — pinned to the strategy-layer sl_anchor_swing.
+        if zone.sl_anchor_swing is None:
+            self._record_skip("no_sl_anchor")
             return False
+        sl_price = compute_sl_price(zone, self._strong_point_config())
 
         entry = zone.top if zone.direction == "BUY" else zone.bottom
-        sl_distance = abs(entry - sl_calc.sl_price)
+        sl_distance = abs(entry - sl_price)
         if sl_distance < self.config.min_sl_distance_points:
             self._record_skip("sl_too_close")
             return False
@@ -436,7 +441,7 @@ class BacktestEngine:
             direction=zone.direction,
             zone_top=zone.top,
             zone_bottom=zone.bottom,
-            sl_price=sl_calc.sl_price,
+            sl_price=sl_price,
             tp1_price=tp1,
             layer_prices=layer_prices,
             created_at=bar_time,
@@ -453,7 +458,7 @@ class BacktestEngine:
                 order_type=order_type,
                 price=price,
                 lot_size=self.config.fixed_lot_size,
-                sl=sl_calc.sl_price,
+                sl=sl_price,
                 tp=tp1,
                 setup_id=sid,
                 layer=layer,
@@ -465,7 +470,7 @@ class BacktestEngine:
         return True
 
     def _compute_layer_prices(
-        self, zone: ImbalanceZone,
+        self, zone: ValidatedZone,
     ) -> dict[int, float]:
         """Layer 1 at zone edge; 2 + 3 step into the zone by config offsets."""
         if zone.direction == "BUY":
@@ -482,13 +487,15 @@ class BacktestEngine:
             3: edge + self.config.layer_3_offset_points,
         }
 
-    def _calculate_tp1(self, zone: ImbalanceZone, entry: float) -> float:
+    def _calculate_tp1(self, zone: ValidatedZone, entry: float) -> float:
+        """TP1 = the broken structural swing (price level whose body-close
+        break confirmed the Strong Point). Falls back to a fixed distance
+        if the validator didn't carry a broken swing."""
         if (
             self.config.tp1_method == "BOS_LEVEL"
-            and zone.bos_event is not None
+            and zone.broken_swing is not None
         ):
-            return float(zone.bos_event.broken_level)
-        # Fixed fallback.
+            return float(zone.broken_swing.price)
         if zone.direction == "BUY":
             return entry + self.config.tp1_fixed_distance_points
         return entry - self.config.tp1_fixed_distance_points
@@ -496,12 +503,13 @@ class BacktestEngine:
     def _sl_config(self) -> SLManagerConfig:
         return SLManagerConfig(
             symbol="XAUUSD",
-            swing_strength=self.config.swing_strength,
-            recent_swing_lookback=self.config.recent_swing_lookback,
             sl_buffer_points=self.config.sl_buffer_points,
             min_sl_distance_points=self.config.min_sl_distance_points,
             max_sl_distance_points=self.config.max_sl_distance_points,
         )
+
+    def _strong_point_config(self) -> StrongPointConfig:
+        return StrongPointConfig(sl_buffer_points=self.config.sl_buffer_points)
 
     # ------------------------------------------------------------------ #
     # Daily halt
@@ -587,29 +595,7 @@ class BacktestEngine:
 # --------------------------------------------------------------------------- #
 
 
-class _UnusedDep:
-    """Loud-failure stub for SLManager constructor params it never reads.
-
-    See module docstring (Design decisions). If
-    ``SLManager.calculate_initial_sl`` ever starts touching its
-    ``mt5`` / ``supabase`` dependencies, the AttributeError raised here
-    will surface clearly in tests rather than producing a silent bug.
-    """
-
-    def __getattr__(self, name: str) -> object:
-        raise AttributeError(
-            f"backtest stub: SLManager.calculate_initial_sl tried to "
-            f"access dep attribute {name!r}; the live API may have "
-            f"changed and the backtest engine needs updating."
-        )
-
-
-def _calculate_sl(
-    zone: ImbalanceZone,
-    df: pd.DataFrame,
-    cfg: SLManagerConfig,
-) -> SLCalculation:
-    """Reuse the live SL algorithm via SLManager with stub deps."""
-    stub = _UnusedDep()
-    mgr = SLManager(mt5=stub, supabase=stub, config=cfg)  # type: ignore[arg-type]
-    return mgr.calculate_initial_sl(zone, df)
+# (PR #31 removed ``_UnusedDep`` and ``_calculate_sl``: SL anchor
+# selection moved into the strategy layer — Strong Point publishes
+# ``ValidatedZone.sl_anchor_swing`` and the engine uses
+# ``strong_point.compute_sl_price`` directly, no SLManager hop.)

@@ -1,8 +1,7 @@
 """Tests for ``bot.strategy.zone_marking``.
 
-Test data uses an ``make_ohlc`` helper that lets us specify ``low`` and
-``high`` columns separately from ``close`` — necessary because zone
-marking pulls the box bottom (top) from the wick column, not the close.
+Constructs Pattern objects directly (bypassing detection) so the
+geometry math can be tested in isolation from the detection cascade.
 """
 
 from __future__ import annotations
@@ -11,19 +10,12 @@ import pandas as pd
 import pytest
 
 from bot.strategy.pattern_detection import (
-    MPattern,
-    PatternConfig,
-    WPattern,
-    detect_latest_m,
-    detect_latest_w,
+    Base,
+    Impulse,
+    Pattern,
+    PatternType,
 )
-from bot.strategy.structure import Swing
-from bot.strategy.zone_marking import (
-    Zone,
-    mark_zone,
-    mark_zone_from_m,
-    mark_zone_from_w,
-)
+from bot.strategy.zone_marking import Zone, mark_zone
 
 
 # --------------------------------------------------------------------------- #
@@ -32,338 +24,265 @@ from bot.strategy.zone_marking import (
 
 
 def make_ohlc(
-    closes: list[float],
-    lows: list[float] | None = None,
+    opens: list[float],
+    closes: list[float] | None = None,
     highs: list[float] | None = None,
-    opens: list[float] | None = None,
+    lows: list[float] | None = None,
     start: str = "2026-01-01T00:00:00Z",
 ) -> pd.DataFrame:
-    """Build an OHLC DataFrame; missing columns default to ``closes``."""
-    n = len(closes)
-    if lows is None:
-        lows = list(closes)
-    if highs is None:
-        highs = list(closes)
-    if opens is None:
-        opens = list(closes)
-    times = pd.date_range(start=start, periods=n, freq="1h", tz="UTC")
+    n = len(opens)
+    closes = list(closes) if closes is not None else list(opens)
+    highs = list(highs) if highs is not None else [max(o, c) + 0.2 for o, c in zip(opens, closes)]
+    lows = list(lows) if lows is not None else [min(o, c) - 0.2 for o, c in zip(opens, closes)]
+    times = pd.date_range(start, periods=n, freq="5min", tz="UTC")
     return pd.DataFrame(
-        {
-            "open": opens,
-            "high": highs,
-            "low": lows,
-            "close": closes,
-            "volume": [100] * n,
-        },
+        {"open": opens, "high": highs, "low": lows, "close": closes,
+         "volume": [100] * n},
         index=times,
     )
 
 
-# Same close sequences as test_pattern_detection — they produce a
-# textbook W and a textbook M with strength=2 and the default config.
-W_CLOSES = [20, 18, 14, 16, 18, 20, 22, 20, 18, 14, 16, 18, 20]
-M_CLOSES = [10, 12, 16, 14, 12, 10, 8, 10, 12, 16, 14, 12, 10]
+def make_impulse(
+    direction: str, start_index: int, end_index: int,
+    df: pd.DataFrame, range_size: float = 5.0, largest_body: float = 5.0,
+) -> Impulse:
+    return Impulse(
+        direction=direction,  # type: ignore[arg-type]
+        start_index=start_index, end_index=end_index,
+        start_time=df.index[start_index],
+        end_time=df.index[end_index],
+        range_size=range_size,
+        largest_body=largest_body,
+        candle_count=end_index - start_index + 1,
+    )
+
+
+def make_base(start_index: int, end_index: int, df: pd.DataFrame) -> Base:
+    o = df["open"].iloc[start_index : end_index + 1].to_numpy()
+    c = df["close"].iloc[start_index : end_index + 1].to_numpy()
+    body_tops = [max(oi, ci) for oi, ci in zip(o, c)]
+    body_bottoms = [min(oi, ci) for oi, ci in zip(o, c)]
+    bodies = [abs(ci - oi) for oi, ci in zip(o, c)]
+    top = max(body_tops)
+    bottom = min(body_bottoms)
+    return Base(
+        start_index=start_index, end_index=end_index,
+        candle_count=end_index - start_index + 1,
+        top=float(top), bottom=float(bottom),
+        range_size=float(top - bottom),
+        largest_body=float(max(bodies)),
+    )
+
+
+def make_pattern(
+    pattern_type: PatternType,
+    df: pd.DataFrame,
+    *,
+    imp_before_indices: tuple[int, int],
+    base_indices: tuple[int, int],
+    imp_after_indices: tuple[int, int],
+) -> Pattern:
+    direction_map = {
+        PatternType.RBR: ("RALLY", "RALLY", "BUY"),
+        PatternType.DBD: ("DROP", "DROP", "SELL"),
+        PatternType.DBR: ("DROP", "RALLY", "BUY"),
+        PatternType.RBD: ("RALLY", "DROP", "SELL"),
+    }
+    d_before, d_after, zone_dir = direction_map[pattern_type]
+    return Pattern(
+        pattern_type=pattern_type,
+        impulse_before=make_impulse(d_before, *imp_before_indices, df),
+        base=make_base(*base_indices, df),
+        impulse_after=make_impulse(d_after, *imp_after_indices, df),
+        direction=zone_dir,  # type: ignore[arg-type]
+        formed_at=df.index[imp_after_indices[1]],
+    )
 
 
 # --------------------------------------------------------------------------- #
-# Clean W → demand zone
+# Geometry
 # --------------------------------------------------------------------------- #
 
 
-class TestWZone:
-    def test_textbook_w_with_separated_wicks(self) -> None:
-        # Closes give us the W; wicks at the swing-low bars dip below the
-        # closes (12 and 13 vs close=14 at bars 2 and 9 respectively).
-        # Box top should be the higher of the two close-based lows (14);
-        # box bottom should be the deepest wick in [bar2 .. bar9] = 12.
-        lows = [20, 18, 12, 16, 18, 20, 22, 20, 18, 13, 16, 18, 20]
-        df = make_ohlc(W_CLOSES, lows=lows)
-        pattern = detect_latest_w(df, PatternConfig(swing_strength=2))
-        assert pattern is not None
-
-        zone = mark_zone_from_w(pattern, df)
-        assert zone.direction == "BUY"
-        assert zone.top == 14.0
-        assert zone.bottom == 12.0
-        assert zone.formed_at == pattern.formed_at
-        assert zone.source_pattern is pattern
-
-    def test_box_height_is_positive_for_wicked_w(self) -> None:
-        lows = [20, 18, 12, 16, 18, 20, 22, 20, 18, 13, 16, 18, 20]
-        df = make_ohlc(W_CLOSES, lows=lows)
-        pattern = detect_latest_w(df, PatternConfig(swing_strength=2))
-        zone = mark_zone_from_w(pattern, df)
-        assert zone.top - zone.bottom == 2.0
-
-    def test_w_with_ohlc_equal_to_closes_yields_degenerate_zone(self) -> None:
-        # When wicks == closes (synthetic data), bottom == max(low1, low2)
-        # because the lowest "low" in the range IS one of the close-based
-        # lows. Result: top == bottom (zero height). That's expected and
-        # OK — refinement / size filter handle this downstream.
-        df = make_ohlc(W_CLOSES)  # lows default to closes
-        pattern = detect_latest_w(df, PatternConfig(swing_strength=2))
-        zone = mark_zone_from_w(pattern, df)
-        assert zone.top == 14.0
-        assert zone.bottom == 14.0
-        assert zone.top == zone.bottom  # degenerate but not inverted
-
-
-# --------------------------------------------------------------------------- #
-# Clean M → supply zone
-# --------------------------------------------------------------------------- #
-
-
-class TestMZone:
-    def test_textbook_m_with_separated_wicks(self) -> None:
-        # Wicks at the swing-high bars stick above the closes
-        # (18 and 17 vs close=16 at bars 2 and 9).
-        highs = [10, 12, 18, 14, 12, 10, 8, 10, 12, 17, 14, 12, 10]
-        df = make_ohlc(M_CLOSES, highs=highs)
-        pattern = detect_latest_m(df, PatternConfig(swing_strength=2))
-        assert pattern is not None
-
-        zone = mark_zone_from_m(pattern, df)
-        assert zone.direction == "SELL"
-        assert zone.bottom == 16.0  # min(16, 16) = 16
-        assert zone.top == 18.0  # max wick in range
-        assert zone.formed_at == pattern.formed_at
-        assert zone.source_pattern is pattern
-
-    def test_box_height_is_positive_for_wicked_m(self) -> None:
-        highs = [10, 12, 18, 14, 12, 10, 8, 10, 12, 17, 14, 12, 10]
-        df = make_ohlc(M_CLOSES, highs=highs)
-        pattern = detect_latest_m(df, PatternConfig(swing_strength=2))
-        zone = mark_zone_from_m(pattern, df)
-        assert zone.top - zone.bottom == 2.0
-
-
-# --------------------------------------------------------------------------- #
-# Direction semantics
-# --------------------------------------------------------------------------- #
-
-
-class TestDirection:
-    def test_w_produces_buy_zone(self) -> None:
-        lows = [20, 18, 12, 16, 18, 20, 22, 20, 18, 13, 16, 18, 20]
-        df = make_ohlc(W_CLOSES, lows=lows)
-        pattern = detect_latest_w(df, PatternConfig(swing_strength=2))
-        zone = mark_zone(pattern, df)  # dispatch path
-        assert zone.direction == "BUY"
-
-    def test_m_produces_sell_zone(self) -> None:
-        highs = [10, 12, 18, 14, 12, 10, 8, 10, 12, 17, 14, 12, 10]
-        df = make_ohlc(M_CLOSES, highs=highs)
-        pattern = detect_latest_m(df, PatternConfig(swing_strength=2))
-        zone = mark_zone(pattern, df)
-        assert zone.direction == "SELL"
-
-
-# --------------------------------------------------------------------------- #
-# Edge cases requested in the spec
-# --------------------------------------------------------------------------- #
-
-
-class TestEdgeCases:
-    def test_very_tight_lows_produces_small_but_valid_zone(self) -> None:
-        # Lows differ by 0.005 (within 0.1% tolerance: diff_pct ≈ 0.0357%).
-        # The bar at low1 has a slightly deeper wick (13.99) so the box
-        # has a tiny positive height.
-        closes = [20, 18, 14.000, 16, 18, 20, 22, 20, 18, 14.005, 16, 18, 20]
-        lows = [20, 18, 13.990, 16, 18, 20, 22, 20, 18, 14.005, 16, 18, 20]
-        df = make_ohlc(closes, lows=lows)
-        pattern = detect_latest_w(df, PatternConfig(swing_strength=2))
-        assert pattern is not None
-        zone = mark_zone_from_w(pattern, df)
-        # top = max(low1.close, low2.close) = max(14.000, 14.005) = 14.005
-        assert zone.top == pytest.approx(14.005)
-        # bottom = min(low column in [2..9]) = 13.990
-        assert zone.bottom == pytest.approx(13.990)
-        assert zone.top - zone.bottom == pytest.approx(0.015)
-
-    def test_deep_wick_makes_zone_wide(self) -> None:
-        # Big wick at low1 (close=14, low=8 — six points of wick).
-        # Demonstrates the "wide initial zone" behaviour the spec
-        # accepts: refinement will narrow it.
-        lows = [20, 18, 8, 16, 18, 20, 22, 20, 18, 14, 16, 18, 20]
-        df = make_ohlc(W_CLOSES, lows=lows)
-        pattern = detect_latest_w(df, PatternConfig(swing_strength=2))
-        zone = mark_zone_from_w(pattern, df)
-        assert zone.top == 14.0
-        assert zone.bottom == 8.0
-        assert zone.top - zone.bottom == 6.0  # the full wick
-
-    def test_deep_wick_above_for_m_makes_zone_wide(self) -> None:
-        # Symmetric case for M.
-        highs = [10, 12, 24, 14, 12, 10, 8, 10, 12, 16, 14, 12, 10]
-        df = make_ohlc(M_CLOSES, highs=highs)
-        pattern = detect_latest_m(df, PatternConfig(swing_strength=2))
-        zone = mark_zone_from_m(pattern, df)
-        assert zone.bottom == 16.0
-        assert zone.top == 24.0
-        assert zone.top - zone.bottom == 8.0
-
-
-# --------------------------------------------------------------------------- #
-# formed_at and source_pattern
-# --------------------------------------------------------------------------- #
-
-
-class TestZoneMetadata:
-    def test_formed_at_matches_low2_time_for_w(self) -> None:
-        df = make_ohlc(W_CLOSES)
-        pattern = detect_latest_w(df, PatternConfig(swing_strength=2))
-        zone = mark_zone_from_w(pattern, df)
-        assert zone.formed_at == pattern.low2.time
-
-    def test_formed_at_matches_high2_time_for_m(self) -> None:
-        df = make_ohlc(M_CLOSES)
-        pattern = detect_latest_m(df, PatternConfig(swing_strength=2))
-        zone = mark_zone_from_m(pattern, df)
-        assert zone.formed_at == pattern.high2.time
-
-    def test_source_pattern_is_the_input_pattern(self) -> None:
-        df = make_ohlc(W_CLOSES)
-        pattern = detect_latest_w(df, PatternConfig(swing_strength=2))
-        zone = mark_zone_from_w(pattern, df)
-        # Identity, not equality — preserve the actual reference.
-        assert zone.source_pattern is pattern
-
-
-# --------------------------------------------------------------------------- #
-# Dispatch + error handling
-# --------------------------------------------------------------------------- #
-
-
-class TestDispatchAndErrors:
-    def test_mark_zone_dispatches_w(self) -> None:
-        df = make_ohlc(W_CLOSES)
-        pattern = detect_latest_w(df, PatternConfig(swing_strength=2))
-        zone = mark_zone(pattern, df)
-        assert zone.direction == "BUY"
-
-    def test_mark_zone_dispatches_m(self) -> None:
-        df = make_ohlc(M_CLOSES)
-        pattern = detect_latest_m(df, PatternConfig(swing_strength=2))
-        zone = mark_zone(pattern, df)
-        assert zone.direction == "SELL"
-
-    def test_mark_zone_rejects_unknown_pattern_type(self) -> None:
-        with pytest.raises(TypeError, match="unsupported pattern type"):
-            mark_zone("not a pattern", make_ohlc(W_CLOSES))  # type: ignore[arg-type]
-
-    def test_w_marker_requires_low_column(self) -> None:
-        df = make_ohlc(W_CLOSES)
-        pattern = detect_latest_w(df, PatternConfig(swing_strength=2))
-        df_no_low = df.drop(columns=["low"])
-        with pytest.raises(ValueError, match="'low' column"):
-            mark_zone_from_w(pattern, df_no_low)
-
-    def test_m_marker_requires_high_column(self) -> None:
-        df = make_ohlc(M_CLOSES)
-        pattern = detect_latest_m(df, PatternConfig(swing_strength=2))
-        df_no_high = df.drop(columns=["high"])
-        with pytest.raises(ValueError, match="'high' column"):
-            mark_zone_from_m(pattern, df_no_high)
-
-    def test_indices_out_of_range_rejected(self) -> None:
-        df = make_ohlc(W_CLOSES)
-        # Build a fake pattern whose low2 sits past the end of the df.
-        ts = pd.Timestamp("2026-01-01T00:00:00Z")
-        bad_low1 = Swing(index=2, time=ts, price=14.0, kind="LOW")
-        bad_low2 = Swing(index=999, time=ts, price=14.0, kind="LOW")
-        bad_pattern = WPattern(
-            low1=bad_low1,
-            low2=bad_low2,
-            peak_index=6,
-            peak_time=ts,
-            peak_price=22.0,
-            formed_at=ts,
-            completed=True,
+class TestZoneMarkingGeometry:
+    def test_single_bullish_base_candle(self) -> None:
+        opens = [100.0, 100.0, 105.0]
+        closes = [100.0, 100.5, 105.0]
+        df = make_ohlc(opens, closes=closes)
+        pattern = make_pattern(
+            PatternType.RBR, df,
+            imp_before_indices=(0, 0),
+            base_indices=(1, 1),
+            imp_after_indices=(2, 2),
         )
-        with pytest.raises(ValueError, match="out of df range"):
-            mark_zone_from_w(bad_pattern, df)
-
-    def test_indices_in_wrong_order_rejected(self) -> None:
-        df = make_ohlc(W_CLOSES)
-        ts = pd.Timestamp("2026-01-01T00:00:00Z")
-        # low1 chronologically AFTER low2 — caller error.
-        bad_low1 = Swing(index=9, time=ts, price=14.0, kind="LOW")
-        bad_low2 = Swing(index=2, time=ts, price=14.0, kind="LOW")
-        bad_pattern = WPattern(
-            low1=bad_low1,
-            low2=bad_low2,
-            peak_index=6,
-            peak_time=ts,
-            peak_price=22.0,
-            formed_at=ts,
-            completed=True,
-        )
-        with pytest.raises(ValueError, match="wrong order"):
-            mark_zone_from_w(bad_pattern, df)
-
-
-# --------------------------------------------------------------------------- #
-# Invariants
-# --------------------------------------------------------------------------- #
-
-
-class TestInvariants:
-    def test_top_never_below_bottom_for_w(self) -> None:
-        # Try several wick configurations.
-        for lows in [
-            [20, 18, 14, 16, 18, 20, 22, 20, 18, 14, 16, 18, 20],   # equal
-            [20, 18, 12, 16, 18, 20, 22, 20, 18, 13, 16, 18, 20],   # wicked
-            [20, 18, 8, 16, 18, 20, 22, 20, 18, 9, 16, 18, 20],     # deeply wicked
-        ]:
-            df = make_ohlc(W_CLOSES, lows=lows)
-            pattern = detect_latest_w(df, PatternConfig(swing_strength=2))
-            zone = mark_zone_from_w(pattern, df)
-            assert zone.top >= zone.bottom, (
-                f"invariant violated: top={zone.top} bottom={zone.bottom} "
-                f"lows={lows}"
-            )
-
-    def test_top_never_below_bottom_for_m(self) -> None:
-        for highs in [
-            [10, 12, 16, 14, 12, 10, 8, 10, 12, 16, 14, 12, 10],
-            [10, 12, 18, 14, 12, 10, 8, 10, 12, 17, 14, 12, 10],
-            [10, 12, 22, 14, 12, 10, 8, 10, 12, 21, 14, 12, 10],
-        ]:
-            df = make_ohlc(M_CLOSES, highs=highs)
-            pattern = detect_latest_m(df, PatternConfig(swing_strength=2))
-            zone = mark_zone_from_m(pattern, df)
-            assert zone.top >= zone.bottom
-
-
-# --------------------------------------------------------------------------- #
-# End-to-end integration
-# --------------------------------------------------------------------------- #
-
-
-class TestEndToEnd:
-    def test_w_pattern_to_zone_pipeline(self) -> None:
-        # Realistic flow: OHLC → pattern detection → zone marking.
-        lows = [20, 18, 13.5, 16, 18, 20, 22, 20, 18, 13.7, 16, 18, 20]
-        df = make_ohlc(W_CLOSES, lows=lows)
-        pattern = detect_latest_w(df, PatternConfig(swing_strength=2))
         zone = mark_zone(pattern, df)
-
-        assert isinstance(zone, Zone)
+        assert zone.top == 100.5
+        assert zone.bottom == 100.0
         assert zone.direction == "BUY"
-        assert zone.top == 14.0  # higher of the two equal close-based lows
-        assert zone.bottom == 13.5  # deepest wick
-        assert zone.top > zone.bottom
-        assert zone.formed_at == df.index[pattern.low2.index]
 
-    def test_m_pattern_to_zone_pipeline(self) -> None:
-        highs = [10, 12, 16.5, 14, 12, 10, 8, 10, 12, 16.3, 14, 12, 10]
-        df = make_ohlc(M_CLOSES, highs=highs)
-        pattern = detect_latest_m(df, PatternConfig(swing_strength=2))
+    def test_single_bearish_base_candle(self) -> None:
+        opens = [100.0, 100.5, 95.0]
+        closes = [100.0, 100.0, 95.0]
+        df = make_ohlc(opens, closes=closes)
+        pattern = make_pattern(
+            PatternType.DBD, df,
+            imp_before_indices=(0, 0),
+            base_indices=(1, 1),
+            imp_after_indices=(2, 2),
+        )
         zone = mark_zone(pattern, df)
-
-        assert isinstance(zone, Zone)
+        # bearish bar: body_top = open = 100.5; body_bottom = close = 100.0
+        assert zone.top == 100.5
+        assert zone.bottom == 100.0
         assert zone.direction == "SELL"
-        assert zone.bottom == 16.0
-        assert zone.top == 16.5
-        assert zone.top > zone.bottom
-        assert zone.formed_at == df.index[pattern.high2.index]
+
+    def test_multi_base_mixed_bullish_bearish(self) -> None:
+        opens = [
+            100.0,                # imp_before
+            100.5, 100.0, 100.7,   # base
+            105.0,                # imp_after
+        ]
+        closes = [
+            100.0,
+            100.0, 100.7, 100.3,
+            105.0,
+        ]
+        df = make_ohlc(opens, closes=closes)
+        pattern = make_pattern(
+            PatternType.RBR, df,
+            imp_before_indices=(0, 0),
+            base_indices=(1, 3),
+            imp_after_indices=(4, 4),
+        )
+        zone = mark_zone(pattern, df)
+        # body_tops:   max(100.5, 100.7, 100.7) = 100.7
+        # body_bottoms: min(100.0, 100.0, 100.3) = 100.0
+        assert zone.top == 100.7
+        assert zone.bottom == 100.0
+
+    def test_all_doji_base_produces_zero_height(self) -> None:
+        opens = [100.0, 100.0, 100.0, 100.0, 105.0]
+        closes = [100.0, 100.0, 100.0, 100.0, 105.0]
+        df = make_ohlc(opens, closes=closes)
+        pattern = make_pattern(
+            PatternType.RBR, df,
+            imp_before_indices=(0, 0),
+            base_indices=(1, 3),
+            imp_after_indices=(4, 4),
+        )
+        zone = mark_zone(pattern, df)
+        assert zone.top == zone.bottom == 100.0
+
+    def test_wicks_excluded(self) -> None:
+        opens = [100.0, 100.0, 105.0]
+        closes = [100.0, 100.5, 105.0]
+        highs = [100.0, 110.0, 105.0]   # massive wick on base bar
+        lows = [100.0, 90.0, 105.0]
+        df = make_ohlc(opens, closes=closes, highs=highs, lows=lows)
+        pattern = make_pattern(
+            PatternType.RBR, df,
+            imp_before_indices=(0, 0),
+            base_indices=(1, 1),
+            imp_after_indices=(2, 2),
+        )
+        zone = mark_zone(pattern, df)
+        # Wick from 90 to 110 ignored; body envelope is 100-100.5.
+        assert zone.top == 100.5
+        assert zone.bottom == 100.0
+
+
+# --------------------------------------------------------------------------- #
+# Direction propagation across all 4 pattern types
+# --------------------------------------------------------------------------- #
+
+
+class TestDirectionPropagation:
+    def test_rbr_is_buy(self) -> None:
+        df = make_ohlc([100.0, 100.0, 105.0])
+        p = make_pattern(
+            PatternType.RBR, df,
+            imp_before_indices=(0, 0), base_indices=(1, 1),
+            imp_after_indices=(2, 2),
+        )
+        assert mark_zone(p, df).direction == "BUY"
+
+    def test_dbd_is_sell(self) -> None:
+        df = make_ohlc([100.0, 100.0, 95.0])
+        p = make_pattern(
+            PatternType.DBD, df,
+            imp_before_indices=(0, 0), base_indices=(1, 1),
+            imp_after_indices=(2, 2),
+        )
+        assert mark_zone(p, df).direction == "SELL"
+
+    def test_dbr_is_buy(self) -> None:
+        df = make_ohlc([100.0, 95.0, 100.0])
+        p = make_pattern(
+            PatternType.DBR, df,
+            imp_before_indices=(0, 0), base_indices=(1, 1),
+            imp_after_indices=(2, 2),
+        )
+        assert mark_zone(p, df).direction == "BUY"
+
+    def test_rbd_is_sell(self) -> None:
+        df = make_ohlc([100.0, 105.0, 100.0])
+        p = make_pattern(
+            PatternType.RBD, df,
+            imp_before_indices=(0, 0), base_indices=(1, 1),
+            imp_after_indices=(2, 2),
+        )
+        assert mark_zone(p, df).direction == "SELL"
+
+
+# --------------------------------------------------------------------------- #
+# Errors / metadata
+# --------------------------------------------------------------------------- #
+
+
+class TestErrors:
+    def test_missing_open_column_rejected(self) -> None:
+        df = pd.DataFrame({"close": [100.0]})
+        with pytest.raises(ValueError, match="open"):
+            mark_zone(_minimal_pattern(), df)
+
+
+def _minimal_pattern() -> Pattern:
+    ts = pd.Timestamp("2026-01-01", tz="UTC")
+    impulse = Impulse(
+        direction="RALLY",
+        start_index=0, end_index=0,
+        start_time=ts, end_time=ts,
+        range_size=5.0, largest_body=5.0, candle_count=1,
+    )
+    base = Base(
+        start_index=0, end_index=0, candle_count=1,
+        top=100.0, bottom=100.0, range_size=0.0, largest_body=0.0,
+    )
+    return Pattern(
+        pattern_type=PatternType.RBR,
+        impulse_before=impulse, base=base, impulse_after=impulse,
+        direction="BUY",
+        formed_at=ts,
+    )
+
+
+class TestMetadata:
+    def test_formed_at_from_pattern(self) -> None:
+        df = make_ohlc([100.0, 100.0, 105.0])
+        pattern = make_pattern(
+            PatternType.RBR, df,
+            imp_before_indices=(0, 0), base_indices=(1, 1),
+            imp_after_indices=(2, 2),
+        )
+        zone = mark_zone(pattern, df)
+        assert zone.formed_at == pattern.formed_at
+
+    def test_source_pattern_identity(self) -> None:
+        df = make_ohlc([100.0, 100.0, 105.0])
+        pattern = make_pattern(
+            PatternType.RBR, df,
+            imp_before_indices=(0, 0), base_indices=(1, 1),
+            imp_after_indices=(2, 2),
+        )
+        zone = mark_zone(pattern, df)
+        assert zone.source_pattern is pattern

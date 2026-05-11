@@ -72,11 +72,7 @@ from bot.execution.mt5_connector import MT5Connector
 from bot.logging.supabase_logger import Setup, SupabaseLogger, Trade
 from bot.strategy.imbalance import ImbalanceZone
 from bot.strategy.strong_point import ValidatedZone
-from bot.strategy.structure import (
-    Swing,
-    detect_swings,
-    get_swings_within_lookback,
-)
+from bot.strategy.structure import Swing
 
 
 # --------------------------------------------------------------------------- #
@@ -117,16 +113,9 @@ class SLValidation:
 @dataclass(frozen=True)
 class SLManagerConfig:
     symbol: str = "XAUUSD"
-    swing_strength: int = 3
-    """Bars on each side for ``detect_swings``. Mirrors
-    :attr:`StructureConfig.swing_strength`."""
-    recent_swing_lookback: int = 20
-    """Number of recent candles to scan for the structural reference
-    swing. Default per spec Section 5.1; ``bot_config`` value
-    overrides via the orchestrator."""
     sl_buffer_points: float = 17.5
-    """Anti-stop-hunt buffer in price units. Default $17.5 = midpoint
-    of spec's 15-20 point band."""
+    """Buffer applied to the anchor swing's price. Default $17.50 is
+    the midpoint of the spec's 15-20 point band."""
     min_sl_distance_points: float = 5.0
     """SL closer than this is rejected — slippage / spread would
     routinely stop us out before the trade breathes."""
@@ -160,60 +149,49 @@ class SLManager:
     def calculate_initial_sl(
         self,
         zone: ValidatedZone | ImbalanceZone,
-        ohlc_df: pd.DataFrame,
+        anchor_swing: Swing,
+        ohlc_df: pd.DataFrame | None = None,
     ) -> SLCalculation:
-        """Compute the initial SL for a setup on ``zone``.
+        """Compute the initial SL from an anchor swing + buffer.
 
-        BUY: ``min(swing_low.price for swing_low in last N candles) - buffer``
-        SELL: ``max(swing_high.price for swing_high in last N candles) + buffer``
+        Caller (Strong Point validator) picks the anchor swing — the
+        nearest structural high (SELL) or low (BUY) on the same side
+        as the zone. We just apply the configured buffer:
 
-        When no matching-kind swings exist in the lookback window the
-        reference falls back to ``min(low)`` (BUY) or ``max(high)``
-        (SELL) over the same window — see design decision #2 in the
-        module docstring. ``fallback_used=True`` flags this in the
-        result so the caller can log appropriately.
+        * BUY: ``SL = anchor_swing.price - sl_buffer_points``
+        * SELL: ``SL = anchor_swing.price + sl_buffer_points``
+
+        ``ohlc_df`` is accepted (and currently unused) so callers
+        passing it for legacy reasons don't break. Earlier versions of
+        this method computed a swing on the fly from a lookback
+        window — that responsibility moved to the strategy layer in
+        PR #31 (Strong Point publishes ``sl_anchor_swing`` on the
+        ValidatedZone). Removing the lookback computation means SL
+        anchor selection is now deterministic / testable in the
+        strategy layer rather than spread across two modules.
         """
-        for col in ("low", "high", "close"):
-            if col not in ohlc_df.columns:
-                raise ValueError(f"ohlc_df must have a '{col}' column")
+        if zone.direction == "BUY" and anchor_swing.kind != "LOW":
+            raise ValueError(
+                f"BUY zone needs a LOW anchor swing, got {anchor_swing.kind}"
+            )
+        if zone.direction == "SELL" and anchor_swing.kind != "HIGH":
+            raise ValueError(
+                f"SELL zone needs a HIGH anchor swing, got {anchor_swing.kind}"
+            )
 
         cfg = self._config
-        n = len(ohlc_df)
-        lookback = min(cfg.recent_swing_lookback, n)
-        if lookback < 1:
-            raise ValueError(
-                "ohlc_df is empty; cannot compute SL without bars"
-            )
-        window = ohlc_df.iloc[-lookback:]
-
-        # Swing-based primary path.
-        swings = detect_swings(ohlc_df, cfg.swing_strength)
-        last_index = n - 1
-        recent_swings = get_swings_within_lookback(
-            swings, from_bar=last_index, lookback=lookback,
-        )
-
         if zone.direction == "BUY":
-            ref_price, fallback = _resolve_buy_reference(recent_swings, window)
-            sl_price = ref_price - cfg.sl_buffer_points
+            sl_price = anchor_swing.price - cfg.sl_buffer_points
         else:
-            ref_price, fallback = _resolve_sell_reference(recent_swings, window)
-            sl_price = ref_price + cfg.sl_buffer_points
-
-        if fallback:
-            logger.warning(
-                f"sl_manager: no {zone.direction} swing in last "
-                f"{lookback} bars; falling back to bar extreme "
-                f"({ref_price})"
-            )
+            sl_price = anchor_swing.price + cfg.sl_buffer_points
 
         return SLCalculation(
             sl_price=sl_price,
-            reference_swing_price=ref_price,
+            reference_swing_price=float(anchor_swing.price),
             buffer_used=cfg.sl_buffer_points,
-            lookback_used=lookback,
+            lookback_used=0,  # no lookback any more — anchor is passed in
             direction=zone.direction,
-            fallback_used=fallback,
+            fallback_used=False,
         )
 
     # ----------------------------------------------------------------- #
@@ -401,38 +379,10 @@ class SLManager:
 
 
 # --------------------------------------------------------------------------- #
-# Module-level helpers (testable without an SLManager instance)
+# (Removed in PR #31: ``_resolve_buy_reference`` / ``_resolve_sell_reference``
+# helpers and the ``detect_swings`` lookback path. SL anchor selection is
+# now the strategy layer's responsibility — Strong Point publishes
+# ``ValidatedZone.sl_anchor_swing`` and ``calculate_initial_sl`` just
+# applies the buffer. Cleaner separation; deterministic; testable in
+# one place.)
 # --------------------------------------------------------------------------- #
-
-
-def _resolve_buy_reference(
-    recent_swings: list[Swing],
-    window: pd.DataFrame,
-) -> tuple[float, bool]:
-    """Pick the BUY-side structural reference price.
-
-    Returns ``(price, fallback_used)``. Primary path: the lowest
-    swing-low in the window (multiple swings → take the minimum;
-    equal-priced swings collapse trivially). Fallback: the lowest bar
-    low across the same window.
-    """
-    lows = [s.price for s in recent_swings if s.kind == "LOW"]
-    if lows:
-        return min(lows), False
-    return float(window["low"].min()), True
-
-
-def _resolve_sell_reference(
-    recent_swings: list[Swing],
-    window: pd.DataFrame,
-) -> tuple[float, bool]:
-    """Pick the SELL-side structural reference price.
-
-    Returns ``(price, fallback_used)``. Primary path: the highest
-    swing-high in the window. Fallback: the highest bar high in the
-    same window.
-    """
-    highs = [s.price for s in recent_swings if s.kind == "HIGH"]
-    if highs:
-        return max(highs), False
-    return float(window["high"].max()), True

@@ -95,7 +95,7 @@ from bot.logging.supabase_logger import (
     SupabaseLogger,
     TradeInput,
 )
-from bot.strategy.imbalance import ImbalanceZone
+from bot.strategy.strong_point import ValidatedZone
 
 PlacementStatus = Literal["PLACED", "FAILED", "SKIPPED"]
 TP1Method = Literal["BOS_LEVEL", "FIXED_DISTANCE"]
@@ -107,7 +107,7 @@ class OrderManagerConfig:
     tp1_method: TP1Method = "BOS_LEVEL"
     """How to compute ``planned_tp1_price``.
 
-    * ``BOS_LEVEL`` (default) — TP1 = ``zone.bos_event.broken_level``
+    * ``BOS_LEVEL`` (default) — TP1 = ``zone.broken_swing.price``
       (the structural level the impulse broke before the zone formed).
       No filter on the resulting distance: a small one is fine, a wide
       one is fine; the level is what traders watch regardless.
@@ -148,7 +148,7 @@ class OrderPlacementResult:
 
 
 def place_layered_orders(
-    zone: ImbalanceZone,
+    zone: ValidatedZone,
     zone_id: UUID,
     lot_size: float,
     sl_price: float,
@@ -178,10 +178,12 @@ def place_layered_orders(
         return _failed_result(sl_price, tp1_price, errors)
 
     # 3. Create setup record.
-    entry_mode = (
-        "IMBALANCE_FIRST_TOUCH" if zone.is_imbalance
-        else "STRONG_POINT_FIRST_TOUCH"
-    )
+    #
+    # v1 only handles Strong Point setups → entry_mode hardcoded.
+    # When Imbalance (setup #4) lands, we'll add a discriminator field
+    # on the validated zone (e.g. an ``is_imbalance`` flag emitted by
+    # a future ImbalanceZone validator) and dispatch here.
+    entry_mode = "STRONG_POINT_FIRST_TOUCH"
     try:
         setup_row = supabase.log_setup(SetupInput(
             zone_id=zone_id,
@@ -291,7 +293,7 @@ def place_layered_orders(
 
 
 def _compute_layer_prices(
-    zone: ImbalanceZone, cfg: OrderManagerConfig
+    zone: ValidatedZone, cfg: OrderManagerConfig
 ) -> tuple[float, float, float, float]:
     """Return (layer_1_price, layer_2_price, layer_3_price, tp1_price).
 
@@ -307,7 +309,7 @@ def _compute_layer_prices(
 
 
 def _compute_tp1_price(
-    zone: ImbalanceZone, cfg: OrderManagerConfig
+    zone: ValidatedZone, cfg: OrderManagerConfig
 ) -> float:
     """Resolve TP1 according to the configured method.
 
@@ -326,9 +328,9 @@ def _compute_tp1_price(
     here.
     """
     if cfg.tp1_method == "BOS_LEVEL":
-        if zone.bos_event is None:
+        if zone.broken_swing is None:
             return 0.0
-        return float(zone.bos_event.broken_level)
+        return float(zone.broken_swing.price)
     if cfg.tp1_method == "FIXED_DISTANCE":
         if zone.direction == "BUY":
             return zone.top + cfg.tp1_distance_dollars
@@ -337,13 +339,13 @@ def _compute_tp1_price(
 
 
 def _validate_inputs(
-    zone: ImbalanceZone, lot_size: float, sl_price: float,
+    zone: ValidatedZone, lot_size: float, sl_price: float,
     cfg: OrderManagerConfig,
 ) -> str | None:
-    if not zone.is_tradeable:
-        return f"zone not tradeable: {zone.rejection_reason}"
-    if not (zone.is_strong_point or zone.is_imbalance):
-        return "zone is neither a Strong Point nor an Imbalance"
+    if not zone.refined_zone.is_tradeable:
+        return f"zone not tradeable: {zone.refined_zone.rejection_reason}"
+    if not zone.is_strong_point:
+        return "zone is not a Strong Point"
     if lot_size <= 0:
         return f"invalid lot_size: {lot_size}"
     if zone.direction == "BUY" and sl_price >= zone.top:
@@ -354,9 +356,9 @@ def _validate_inputs(
         return (
             f"SL ({sl_price}) must be above zone.bottom ({zone.bottom}) for SELL"
         )
-    if cfg.tp1_method == "BOS_LEVEL" and zone.bos_event is None:
+    if cfg.tp1_method == "BOS_LEVEL" and zone.broken_swing is None:
         return (
-            "tp1_method=BOS_LEVEL requires zone.bos_event; got None. "
+            "tp1_method=BOS_LEVEL requires zone.broken_swing; got None. "
             "This indicates a zone bypassed Strong Point validation — "
             "fix upstream or set tp1_method='FIXED_DISTANCE'."
         )
@@ -380,7 +382,7 @@ def _resolve_filled_price(
 
 
 def _detect_gap_through(
-    zone: ImbalanceZone, filled_price: float, tolerance: float
+    zone: ValidatedZone, filled_price: float, tolerance: float
 ) -> str | None:
     """Error message if fill is past the far zone edge by > tolerance."""
     if zone.direction == "BUY":
@@ -404,7 +406,7 @@ def _write_trade_rows(
     *,
     supabase: SupabaseLogger,
     setup_id: UUID,
-    zone: ImbalanceZone,
+    zone: ValidatedZone,
     lot_size: float,
     sl_price: float,
     layer_1_ticket: int,
