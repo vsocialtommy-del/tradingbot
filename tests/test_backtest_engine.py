@@ -210,6 +210,37 @@ class TestSetupCreation:
         assert result.setups_detected == 20
         assert result.setups_taken == 1
 
+    def test_zone_without_sl_anchor_skipped_with_skip_reason(
+        self, mocker: MockerFixture,
+    ) -> None:
+        # Defensive: a zone reaching the engine without an
+        # ``sl_anchor_swing`` means Strong Point validation produced
+        # a malformed result (shouldn't happen in practice since the
+        # pipeline only emits is_strong_point=True zones which always
+        # have an anchor). The engine should skip with ``no_sl_anchor``
+        # rather than crash on the None-deref in compute_sl_price.
+        zone = make_imbalance_zone(top=1900.0, bottom=1895.0, direction="BUY")
+        broken_zone = ValidatedZone(
+            direction=zone.direction, top=zone.top, bottom=zone.bottom,
+            formed_at=zone.formed_at, source_pattern=zone.source_pattern,
+            refined_zone=zone.refined_zone,
+            is_strong_point=zone.is_strong_point,
+            validation_failures=zone.validation_failures,
+            broken_swing=zone.broken_swing,
+            broken_at=zone.broken_at,
+            sl_anchor_swing=None,        # <-- anchor missing
+        )
+        mocker.patch(
+            "bot.backtest.engine.run_strategy_pipeline",
+            return_value=[broken_zone],
+        )
+        df = make_flat_df(n=110, base_price=1920.0)
+        cfg = BacktestConfig(min_history_bars=100, progress_log_every_bars=0)
+        result = BacktestEngine(cfg).run(df)
+
+        assert result.setups_taken == 0
+        assert "no_sl_anchor" in result.skip_reasons
+
 
 # --------------------------------------------------------------------------- #
 # Exposure cap

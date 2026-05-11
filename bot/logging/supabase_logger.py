@@ -66,7 +66,12 @@ def _get_create_client() -> Any:
 
 Direction = Literal["BUY", "SELL"]
 ZoneType = Literal["STRONG_POINT", "IMBALANCE"]
-PatternType = Literal["W", "M", "N"]
+PatternType = Literal[
+    # Legacy W/M era (preserved for back-compat on existing rows).
+    "W", "M", "N",
+    # S&D codes (PR #31 onward; see migrations/006_pattern_type_snd_codes.sql).
+    "RBR", "DBD", "DBR", "RBD",
+]
 EntryMode = Literal["STRONG_POINT_FIRST_TOUCH", "IMBALANCE_FIRST_TOUCH"]
 SetupStatus = Literal[
     "PENDING", "ACTIVE", "TP1_HIT", "CLOSED", "SKIPPED", "STOPPED_OUT"

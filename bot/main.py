@@ -695,18 +695,16 @@ def _zone_to_input(zone: ValidatedZone) -> ZoneInput:
     """Project an in-memory zone into the ``zones`` table insert payload.
 
     v1 only handles Strong Point setups → ``zone_type=STRONG_POINT``.
-    ``pattern_type`` is mapped to the legacy ``W``/``M`` for storage
-    compat with the existing Supabase CHECK constraint
-    (``W``/``M``/``N``). A follow-up migration will let us persist the
-    real S&D pattern code (RBR/DBD/DBR/RBD) directly; until then BUY
-    zones store as "W" and SELL as "M" — direction is the only thing
-    we read off this column today.
+    ``pattern_type`` persists the real S&D code (RBR / DBD / DBR /
+    RBD) so demo-trading analytics can compare continuation vs
+    reversal patterns. The CHECK constraint accepts these codes
+    as of migration 006.
     """
     return ZoneInput(
         symbol="XAUUSD",
         direction=zone.direction,
         zone_type="STRONG_POINT",
-        pattern_type="W" if zone.direction == "BUY" else "M",
+        pattern_type=zone.source_pattern.pattern_type.value,
         top=Decimal(str(zone.top)),
         bottom=Decimal(str(zone.bottom)),
         approach_count=0,            # Imbalance-only field; 0 in v1

@@ -38,8 +38,19 @@ from bot.main import (
     BotLoopConfig,
     _elapsed,
     _parse_pause_until,
+    _zone_to_input,
 )
 from bot.risk.daily_halt import DailyHaltResult
+from bot.strategy.pattern_detection import (
+    Base as _Base,
+    Impulse as _Impulse,
+    Pattern as _Pattern,
+    PatternType as _PT,
+)
+from bot.strategy.strong_point import ValidatedZone as _ValidatedZone
+from bot.strategy.structure import Swing
+from bot.strategy.zone_marking import Zone as _Zone
+from bot.strategy.zone_refinement import RefinedZone as _RefinedZone
 
 
 # --------------------------------------------------------------------------- #
@@ -487,15 +498,22 @@ class TestStrategyPipeline:
         b.state.last_config_refresh = NOW
         b.state.last_m5_bar_time = None
 
-        zone = mocker.MagicMock()
-        zone.direction = "BUY"
-        zone.top = 1900.0
-        zone.bottom = 1895.0
-        zone.is_imbalance = False
-        zone.is_strong_point = True
-        zone.approach_count = 0
-        zone.qualified_at = None
-        zone.formed_at = pd.Timestamp("2026-05-08T12:00:00Z")
+        # Build a real ValidatedZone (PR #31 zone shape). MagicMock
+        # zones used to work but post-fix-up _zone_to_input reads
+        # zone.source_pattern.pattern_type.value which the supabase
+        # logger's pydantic literal validates.
+        zone = _make_validated_for_persistence(_PT.RBR)
+        # Anchor swing so the engine doesn't bail with no_sl_anchor.
+        ts = pd.Timestamp("2026-05-08T12:00:00Z")
+        anchor = Swing(index=0, time=ts, price=1880.0, kind="LOW")
+        zone = _ValidatedZone(
+            direction=zone.direction, top=zone.top, bottom=zone.bottom,
+            formed_at=zone.formed_at, source_pattern=zone.source_pattern,
+            refined_zone=zone.refined_zone,
+            is_strong_point=True, validation_failures=[],
+            broken_swing=None, broken_at=None,
+            sl_anchor_swing=anchor,
+        )
 
         mocker.patch(
             "bot.main.run_strategy_pipeline", return_value=[zone],
@@ -746,3 +764,59 @@ class TestDefaults:
         assert c.daily_loss_limit_pct == 10.0
         assert c.ohlc_count == 200
         assert c.ohlc_timeframe == "M5"
+
+
+# --------------------------------------------------------------------------- #
+# Persistence — pattern_type retains the real S&D code (PR #31, fix-up after
+# Tommy's Q1 verification: dropped the legacy W/M mapping at the storage
+# boundary so analytics can distinguish continuation vs reversal patterns).
+# Requires migration 006 (relaxes the CHECK constraint to accept RBR/DBD/DBR/RBD).
+# --------------------------------------------------------------------------- #
+
+
+def _make_validated_for_persistence(pattern_type: _PT) -> _ValidatedZone:
+    ts = pd.Timestamp("2026-05-08T12:00:00Z")
+    direction = "BUY" if pattern_type in (_PT.RBR, _PT.DBR) else "SELL"
+    impulse = _Impulse(
+        direction="RALLY" if direction == "BUY" else "DROP",
+        start_index=0, end_index=0,
+        start_time=ts, end_time=ts,
+        range_size=5.0, largest_body=5.0, candle_count=1,
+    )
+    base = _Base(
+        start_index=1, end_index=1, candle_count=1,
+        top=1900.5, bottom=1900.0, range_size=0.5, largest_body=0.5,
+    )
+    pattern = _Pattern(
+        pattern_type=pattern_type,
+        impulse_before=impulse, base=base, impulse_after=impulse,
+        direction=direction,  # type: ignore[arg-type]
+        formed_at=ts,
+    )
+    zone = _Zone(
+        direction=direction,  # type: ignore[arg-type]
+        top=1900.5, bottom=1900.0, formed_at=ts, source_pattern=pattern,
+    )
+    refined = _RefinedZone(
+        direction=direction,  # type: ignore[arg-type]
+        top=1900.5, bottom=1900.0, formed_at=ts, source_pattern=pattern,
+        is_tradeable=True, rejection_reason=None, original_zone=zone,
+    )
+    return _ValidatedZone(
+        direction=direction,  # type: ignore[arg-type]
+        top=1900.5, bottom=1900.0, formed_at=ts, source_pattern=pattern,
+        refined_zone=refined,
+        is_strong_point=True, validation_failures=[],
+        broken_swing=None, broken_at=None, sl_anchor_swing=None,
+    )
+
+
+class TestZoneToInputPersistsRealPatternCode:
+    @pytest.mark.parametrize("pt", [_PT.RBR, _PT.DBD, _PT.DBR, _PT.RBD])
+    def test_pattern_type_round_trips(self, pt: _PT) -> None:
+        # The legacy W/M mapping is gone; we persist the actual S&D
+        # pattern code so post-demo analytics can compare continuation
+        # (RBR/DBD) vs reversal (DBR/RBD) performance.
+        zi = _zone_to_input(_make_validated_for_persistence(pt))
+        assert zi.pattern_type == pt.value
+        assert zi.zone_type == "STRONG_POINT"
