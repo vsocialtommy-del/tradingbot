@@ -1,22 +1,15 @@
 """Setup-detection funnel — diagnose where setups are dying.
 
-Walks the same bar-by-bar loop the engine does, but at each stage of
-the strategy pipeline records a count: how many candidates entered,
-how many survived. The output funnel reveals exactly which filter is
-the bottleneck:
-
-::
+Walks the same bar-by-bar loop the engine does, but at each stage
+records a count. The output funnel reveals exactly which filter is
+the bottleneck::
 
     Funnel over 800 bars (700 detection bars):
-      Swings detected (cumulative):     1,247
-      Pattern candidates:               423      (W: 215, M: 208)
-      Passed pattern filters:           147      (35% — tolerance + peak)
-      Tradeable refined zones:          112      (76% — size filter)
-      Strong Points:                     38      (34% — BoS + base + impulse)
-      Imbalance-qualified zones:         11      (29% — ≥2 approaches)
-      Untapped at detection:              8      (73% — already tapped if 0)
-      Setups created (post dedup):        3
-      Trigger fills:                      0      ← here's where they all die
+      Pattern candidates:               423      (RBR: 102, DBD: 98,
+                                                  DBR: 119, RBD: 104)
+      Tradeable refined zones:          312      (74% — size filter)
+      Strong Points:                     48      (15% — break + close)
+      Unique zones (post-dedup):         12
 
 Usage::
 
@@ -24,9 +17,8 @@ Usage::
     python -m bot.backtest.diagnose path/to/xauusd_m5.csv --bars 1000
     python -m bot.backtest.diagnose path/to/xauusd_m5.csv --json
 
-The diagnostic is independent of ``BacktestEngine`` so it can be run
-standalone — useful for quick "why are no trades firing?" checks
-without launching the whole backtest.
+PR #31 rewrite: replaces the W/M + Imbalance funnel with the S&D
+methodology (pattern_detection → refine → Strong Point).
 """
 
 from __future__ import annotations
@@ -34,19 +26,16 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import pandas as pd
 
 from bot.backtest.data_loader import load_dukascopy_csv
-from bot.strategy.imbalance import ImbalanceConfig, track_imbalance
 from bot.strategy.pattern_detection import (
-    MPattern,
     PatternConfig,
-    WPattern,
-    detect_m_patterns,
-    detect_w_patterns,
+    PatternType,
+    detect_patterns,
 )
 from bot.strategy.strong_point import StrongPointConfig, validate_strong_point
 from bot.strategy.structure import StructureConfig, analyze_structure
@@ -60,86 +49,75 @@ class FunnelCounts:
 
     bars_processed: int = 0
     detection_bars: int = 0
+
     pattern_candidates: int = 0
-    """Patterns returned by detect_w/m_patterns BEFORE downstream
-    filtering. Already past tolerance + peak threshold (those are
-    inside the detectors)."""
-    w_candidates: int = 0
-    m_candidates: int = 0
+    """Patterns returned by ``detect_patterns`` — already past impulse +
+    base tightness gates inside detection."""
+    rbr_candidates: int = 0
+    dbd_candidates: int = 0
+    dbr_candidates: int = 0
+    rbd_candidates: int = 0
+
     refined_tradeable: int = 0
-    """Survived the size-filter (5-80 points by default)."""
     refined_too_narrow: int = 0
     refined_too_wide: int = 0
-    strong_points: int = 0
-    """Passed BoS + base-compactness + impulse-strength validation."""
-    # Failures are categorised by the FIRST listed failure reason —
-    # mutually exclusive so the bucket counts sum to (refined_tradeable
-    # − strong_points).
-    sp_failed_no_bos: int = 0
-    sp_failed_base: int = 0
-    sp_failed_impulse: int = 0
-    sp_failed_other: int = 0
-    # Imbalance breakdown — why Strong Points failed to become tradeable.
-    imbalance_qualified: int = 0
-    """Tracked ≥ approach_threshold approaches before tap."""
-    imb_zero_approaches: int = 0
-    imb_too_few_approaches: int = 0
-    untapped_at_detection: int = 0
-    """Imbalance-qualified AND not tapped at the time we detect it.
-    A tapped zone is one price has already entered → first-touch
-    consumed → not a fresh setup."""
-    imb_qualified_but_tapped: int = 0
-    unique_zones: int = 0
-    """Setups the engine would create after deduplication."""
 
-    # Per-tick-driven (not stage-by-stage) — populated only when
-    # ``include_triggers=True``.
-    triggers_fired: int | None = None
+    strong_points: int = 0
+    """Passed break-and-close validation."""
+    # Failures are mutually exclusive (primary failure only). Sum
+    # exactly equals (refined_tradeable − strong_points).
+    sp_failed_no_swing: int = 0
+    """No structural swing exists on the opposite side of the zone."""
+    sp_failed_no_sl_anchor: int = 0
+    """No same-side swing exists for the SL to pin to."""
+    sp_failed_no_break_yet: int = 0
+    """Pending — break + close hasn't happened yet."""
+    sp_failed_invalidated: int = 0
+    """Opposite-side body close happened before any valid break."""
+
+    unique_zones: int = 0
+    """Setups the engine would create after deduplication
+    by ``(direction, round(top, 2), round(bottom, 2))``."""
 
     def funnel_lines(self) -> list[str]:
-        """Return human-readable funnel rows."""
+        """Human-readable funnel rows."""
         rows = [
             ("Bars processed", str(self.bars_processed)),
             ("Detection bars", str(self.detection_bars)),
             ("", ""),
-            ("Pattern candidates",
-             f"{self.pattern_candidates:,}  "
-             f"(W: {self.w_candidates:,}, M: {self.m_candidates:,})"),
-            ("Refined tradeable",
-             f"{self.refined_tradeable:,}"
-             f"  ({_pct(self.refined_tradeable, self.pattern_candidates)})"),
+            (
+                "Pattern candidates",
+                f"{self.pattern_candidates:,}  "
+                f"(RBR: {self.rbr_candidates:,}, "
+                f"DBD: {self.dbd_candidates:,}, "
+                f"DBR: {self.dbr_candidates:,}, "
+                f"RBD: {self.rbd_candidates:,})",
+            ),
+            (
+                "Refined tradeable",
+                f"{self.refined_tradeable:,}  "
+                f"({_pct(self.refined_tradeable, self.pattern_candidates)})",
+            ),
             ("  ↳ rejected too narrow", str(self.refined_too_narrow)),
             ("  ↳ rejected too wide", str(self.refined_too_wide)),
-            ("Strong Points",
-             f"{self.strong_points:,}"
-             f"  ({_pct(self.strong_points, self.refined_tradeable)})"),
-            ("  ↳ failed: no BoS", str(self.sp_failed_no_bos)),
-            ("  ↳ failed: base not compact", str(self.sp_failed_base)),
-            ("  ↳ failed: impulse too weak", str(self.sp_failed_impulse)),
-            ("  ↳ failed: other", str(self.sp_failed_other)),
-            ("Imbalance-qualified",
-             f"{self.imbalance_qualified:,}"
-             f"  ({_pct(self.imbalance_qualified, self.strong_points)})"),
-            ("  ↳ rejected: 0 approaches", str(self.imb_zero_approaches)),
-            ("  ↳ rejected: <threshold approaches",
-             str(self.imb_too_few_approaches)),
-            ("Untapped at detection",
-             f"{self.untapped_at_detection:,}"
-             f"  ({_pct(self.untapped_at_detection, self.imbalance_qualified)})"),
-            ("  ↳ rejected: tapped already",
-             str(self.imb_qualified_but_tapped)),
-            ("Unique zones (post-dedup)",
-             f"{self.unique_zones:,}"
-             f"  ({_pct(self.unique_zones, self.untapped_at_detection)})"),
+            (
+                "Strong Points",
+                f"{self.strong_points:,}  "
+                f"({_pct(self.strong_points, self.refined_tradeable)})",
+            ),
+            ("  ↳ failed: no opposite swing", str(self.sp_failed_no_swing)),
+            ("  ↳ failed: no SL anchor", str(self.sp_failed_no_sl_anchor)),
+            ("  ↳ failed: no break yet (pending)",
+             str(self.sp_failed_no_break_yet)),
+            ("  ↳ failed: invalidated", str(self.sp_failed_invalidated)),
+            (
+                "Unique zones (post-dedup)",
+                f"{self.unique_zones:,}  "
+                f"({_pct(self.unique_zones, self.strong_points)})",
+            ),
         ]
-        if self.triggers_fired is not None:
-            rows.append(("", ""))
-            rows.append(("Trigger fills",
-                         f"{self.triggers_fired:,}"
-                         f"  ({_pct(self.triggers_fired, self.unique_zones)} of zones)"))
         return [
-            f"{label:.<35s} {value}" if label and value
-            else ""
+            f"{label:.<40s} {value}" if label and value else ""
             for label, value in rows
         ]
 
@@ -156,21 +134,16 @@ def diagnose(
     pattern_config: PatternConfig | None = None,
     refinement_config: RefinementConfig | None = None,
     strong_point_config: StrongPointConfig | None = None,
-    imbalance_config: ImbalanceConfig | None = None,
     min_history_bars: int = 100,
     pipeline_window_bars: int = 250,
 ) -> FunnelCounts:
     """Walk ``df`` bar-by-bar; return per-stage cumulative counts.
 
     Mirrors the engine's pipeline gate but instruments every stage.
-    Does NOT track triggers (no broker simulation here) — see the
-    ``BacktestResult.metrics`` for live trigger / fill counts when you
-    want the full picture.
     """
     pcfg = pattern_config or PatternConfig()
     rcfg = refinement_config or RefinementConfig()
     scfg = strong_point_config or StrongPointConfig()
-    icfg = imbalance_config or ImbalanceConfig()
 
     counts = FunnelCounts(bars_processed=len(df))
     seen_zones: set[tuple[str, float, float]] = set()
@@ -184,18 +157,28 @@ def diagnose(
         history = df.iloc[window_start : i + 1]
 
         structure = analyze_structure(
-            history, StructureConfig(swing_strength=pcfg.swing_strength),
+            history,
+            StructureConfig(
+                swing_strength=2,  # match pipeline default
+            ),
         )
         swings = list(structure.swings)
-        ws = detect_w_patterns(history, pcfg, swings=swings)
-        ms = detect_m_patterns(history, pcfg, swings=swings)
-        counts.w_candidates += len(ws)
-        counts.m_candidates += len(ms)
-        counts.pattern_candidates += len(ws) + len(ms)
+        patterns = detect_patterns(history, pcfg)
 
-        for pattern in (*ws, *ms):
-            initial = mark_zone(pattern, history)
-            refined = refine_zone(initial, history, rcfg)
+        for p in patterns:
+            counts.pattern_candidates += 1
+            if p.pattern_type == PatternType.RBR:
+                counts.rbr_candidates += 1
+            elif p.pattern_type == PatternType.DBD:
+                counts.dbd_candidates += 1
+            elif p.pattern_type == PatternType.DBR:
+                counts.dbr_candidates += 1
+            elif p.pattern_type == PatternType.RBD:
+                counts.rbd_candidates += 1
+
+        for pattern in patterns:
+            zone = mark_zone(pattern, history)
+            refined = refine_zone(zone, history, rcfg)
             if not refined.is_tradeable:
                 if refined.rejection_reason == "ZONE_TOO_NARROW":
                     counts.refined_too_narrow += 1
@@ -204,45 +187,32 @@ def diagnose(
                 continue
             counts.refined_tradeable += 1
 
-            validated = validate_strong_point(
-                refined, history, structure.bos_events, scfg,
-            )
+            validated = validate_strong_point(refined, history, swings, scfg)
             if not validated.is_strong_point:
-                # Categorise by the FIRST listed failure (priority order:
-                # NO_BOS_EVENT > BASE_NOT_COMPACT > IMPULSE_TOO_WEAK >
-                # other). Mutually exclusive so the four buckets sum
-                # exactly to (refined_tradeable − strong_points).
-                fails = list(validated.validation_failures)
-                primary = fails[0] if fails else "OTHER"
-                if primary == "NO_BOS_EVENT":
-                    counts.sp_failed_no_bos += 1
-                elif primary == "BASE_NOT_COMPACT":
-                    counts.sp_failed_base += 1
-                elif primary == "IMPULSE_TOO_WEAK":
-                    counts.sp_failed_impulse += 1
-                else:
-                    counts.sp_failed_other += 1
+                # Primary (first listed) failure — mutually exclusive
+                # buckets so they sum exactly to
+                # (refined_tradeable − strong_points).
+                primary = (
+                    validated.validation_failures[0]
+                    if validated.validation_failures else "OTHER"
+                )
+                if primary in ("NO_SWING_ABOVE", "NO_SWING_BELOW"):
+                    counts.sp_failed_no_swing += 1
+                elif primary == "NO_SL_ANCHOR":
+                    counts.sp_failed_no_sl_anchor += 1
+                elif primary == "NO_BREAK_YET":
+                    counts.sp_failed_no_break_yet += 1
+                elif primary == "INVALIDATED":
+                    counts.sp_failed_invalidated += 1
+                # NOT_TRADEABLE never reaches here (refined.is_tradeable
+                # already filtered above).
                 continue
             counts.strong_points += 1
 
-            imbalance = track_imbalance(validated, history, icfg)
-            if not imbalance.is_imbalance:
-                if imbalance.approach_count == 0:
-                    counts.imb_zero_approaches += 1
-                else:
-                    counts.imb_too_few_approaches += 1
-                continue
-            counts.imbalance_qualified += 1
-
-            if imbalance.is_tapped:
-                counts.imb_qualified_but_tapped += 1
-                continue
-            counts.untapped_at_detection += 1
-
             zone_key = (
-                imbalance.direction,
-                round(imbalance.top, 2),
-                round(imbalance.bottom, 2),
+                validated.direction,
+                round(validated.top, 2),
+                round(validated.bottom, 2),
             )
             if zone_key in seen_zones:
                 continue

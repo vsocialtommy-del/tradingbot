@@ -1,45 +1,41 @@
-"""Strategy detection pipeline (Phase B composition).
+"""Strategy detection pipeline — Supply & Demand methodology.
 
-Stitches the per-stage Phase B modules into a single
-:func:`run_strategy_pipeline` entry point used by ``bot.main``. Each
-stage is already tested in isolation; this module composes them in
-the spec's order:
+Stitches the per-stage modules into a single ``run_strategy_pipeline``
+the bot loop calls. v1 only implements the **Strong Point** setup;
+CHoCH / Imbalance / SnD Flip are layered on the same RBR/DBD/DBR/RBD
+foundation in later phases.
 
 ::
 
     OHLC df ─► analyze_structure (swings + BoS events)
-            ─► detect_w_patterns + detect_m_patterns
-            ─► mark_zone (initial box)         per pattern
-            ─► refine_zone (body + size filter) per pattern
-            ─► validate_strong_point             per pattern
-            ─► track_imbalance                   per pattern
-            ─► [ImbalanceZone, …]  (only Strong Points / Imbalances,
-                                    not yet tapped)
+            ─► detect_patterns (impulse → base → RBR/DBD/DBR/RBD)
+            ─► mark_zone (body envelope of base)        per pattern
+            ─► refine_zone (size filter)                per pattern
+            ─► validate_strong_point (break-and-close + SL anchor)
+            ─► [ValidatedZone, …]  (only is_strong_point=True returned)
 
-Design decisions called out in the PR
--------------------------------------
+Design decisions
+----------------
 
-1. **Stateless function, M5-close gating in the caller.** The pipeline
-   has no internal cache: every call runs every stage. Caching is the
-   main loop's job (re-run only when the latest M5 candle changes).
-   Stateless = trivially testable, no surprise interactions.
+1. **Stateless function, M5-close gating in the caller.** No internal
+   cache; every call processes the slice the engine passes in. The
+   engine ensures that slice is ``pipeline_window_bars`` long
+   (default 250) so per-call cost is bounded.
 
-2. **Per-pattern try/except.** A single bad pattern shouldn't stop the
-   pipeline producing any zones. We log + skip and continue with the
-   remaining patterns. The per-stage modules already raise on actually
-   broken inputs; this is just defence against unexpected combinations
-   (e.g. a refined pattern whose pivots are out of df bounds).
+2. **Per-pattern try/except.** A single malformed pattern shouldn't
+   nuke the batch; we log + skip.
 
-3. **Tapped zones are filtered out at exit.** ``imbalance.is_tapped``
-   means price has already entered the zone since formation — the
-   first-touch entry has been used. Re-trading a tapped zone violates
-   the strategy. Caller still sees only fresh setups.
+3. **Imbalance not called.** The deprecated ``bot.strategy.imbalance``
+   was W/M-based and doesn't match the user's actual Imbalance
+   setup spec (setup #4 — fresh Strong Point + 2 failed approaches).
+   It'll be rebuilt when we tackle setup #4; until then it sits as
+   dead code and the pipeline routes around it.
 
-4. **Returns ``ImbalanceZone``s — even Strong-Point-only zones.** The
-   ImbalanceZone wrapper around a non-imbalance Strong Point still has
-   ``is_strong_point=True`` and ``is_imbalance=False``; ``order_manager``
-   already routes ``IMBALANCE_FIRST_TOUCH`` vs ``STRONG_POINT_FIRST_TOUCH``
-   off these flags, so a single uniform return type works.
+4. **Only confirmed Strong Points returned.** Patterns that haven't
+   yet had their break-and-close are filtered out at this layer
+   (their ``ValidatedZone.is_strong_point`` is False). The caller
+   doesn't need to know about pending candidates — they'll show up
+   in subsequent pipeline calls once the break confirms.
 """
 
 from __future__ import annotations
@@ -49,20 +45,13 @@ from dataclasses import dataclass
 import pandas as pd
 from loguru import logger
 
-from bot.strategy.imbalance import (
-    ImbalanceConfig,
-    ImbalanceZone,
-    track_imbalance,
-)
 from bot.strategy.pattern_detection import (
-    MPattern,
     PatternConfig,
-    WPattern,
-    detect_m_patterns,
-    detect_w_patterns,
+    detect_patterns,
 )
 from bot.strategy.strong_point import (
     StrongPointConfig,
+    ValidatedZone,
     validate_strong_point,
 )
 from bot.strategy.structure import (
@@ -76,112 +65,80 @@ from bot.strategy.zone_refinement import (
 )
 
 
-# --------------------------------------------------------------------------- #
-# Config + result
-# --------------------------------------------------------------------------- #
-
-
 @dataclass(frozen=True)
 class StrategyPipelineConfig:
-    """Aggregate of all per-stage tunables.
+    """Aggregate of all per-stage tunables. Defaults mirror per-module defaults."""
 
-    Mirrors the keys orchestrators pull from ``bot_config``. Defaults
-    mirror the per-module defaults so a no-arg call works for tests
-    and dry-runs.
-    """
+    # Structure (still used for SL anchor + break target swings)
+    swing_strength: int = 2
 
-    # Structure / patterns
-    swing_strength: int = 3
-    pattern_tolerance_pct: float = 0.001
+    # Pattern detection (S&D)
+    impulse_body_to_range_ratio_min: float = 0.6
+    impulse_atr_multiple_min: float = 1.0
+    atr_period: int = 14
+    max_impulse_run_candles: int = 5
+    min_base_candles: int = 1
+    max_base_candles: int = 5
+    base_range_to_impulse_ratio_max: float = 0.6
+    base_max_body_to_impulse_body_ratio: float = 0.4
     pattern_lookback_bars: int = 50
-    peak_threshold_pct: float = 0.002
 
-    # Zone refinement
+    # Zone size filter
     zone_min_size_points: float = 5.0
     zone_max_size_points: float = 80.0
 
-    # Strong Point validation
-    impulse_min_body_ratio: float = 0.6
-    base_max_range_ratio: float = 0.5
-
-    # Imbalance tracking
-    imbalance_approach_distance: float = 7.5
-    imbalance_retreat_distance: float = 5.0
-    imbalance_approach_threshold: int = 2
-
-
-# --------------------------------------------------------------------------- #
-# Public API
-# --------------------------------------------------------------------------- #
+    # Strong Point
+    sl_buffer_points: float = 17.5
 
 
 def run_strategy_pipeline(
     df: pd.DataFrame,
     config: StrategyPipelineConfig | None = None,
-) -> list[ImbalanceZone]:
-    """Run all Phase B stages, return tradeable, untapped zones."""
+) -> list[ValidatedZone]:
+    """Run all strategy stages; return confirmed Strong Point zones."""
     cfg = config or StrategyPipelineConfig()
 
     structure = analyze_structure(
         df,
         StructureConfig(swing_strength=cfg.swing_strength),
     )
+    swings = list(structure.swings)
 
     pattern_cfg = PatternConfig(
-        swing_strength=cfg.swing_strength,
-        pattern_tolerance_pct=cfg.pattern_tolerance_pct,
-        peak_threshold_pct=cfg.peak_threshold_pct,
+        impulse_body_to_range_ratio_min=cfg.impulse_body_to_range_ratio_min,
+        impulse_atr_multiple_min=cfg.impulse_atr_multiple_min,
+        atr_period=cfg.atr_period,
+        max_impulse_run_candles=cfg.max_impulse_run_candles,
+        min_base_candles=cfg.min_base_candles,
+        max_base_candles=cfg.max_base_candles,
+        base_range_to_impulse_ratio_max=cfg.base_range_to_impulse_ratio_max,
+        base_max_body_to_impulse_body_ratio=cfg.base_max_body_to_impulse_body_ratio,
         lookback_bars=cfg.pattern_lookback_bars,
     )
-    # Reuse the swings already computed by ``analyze_structure``. Without
-    # this the pattern detectors would each call ``detect_swings`` again
-    # — three full O(n) scans per pipeline iteration. On a 1000-bar
-    # backtest this was the dominant cost (~78% of runtime per profile).
-    shared_swings = list(structure.swings)
-    patterns: list[WPattern | MPattern] = []
-    patterns.extend(detect_w_patterns(df, pattern_cfg, swings=shared_swings))
-    patterns.extend(detect_m_patterns(df, pattern_cfg, swings=shared_swings))
+    patterns = detect_patterns(df, pattern_cfg)
 
     refinement_cfg = RefinementConfig(
         zone_min_size_points=cfg.zone_min_size_points,
         zone_max_size_points=cfg.zone_max_size_points,
     )
-    strong_cfg = StrongPointConfig(
-        impulse_min_body_ratio=cfg.impulse_min_body_ratio,
-        base_max_range_ratio=cfg.base_max_range_ratio,
-    )
-    imbal_cfg = ImbalanceConfig(
-        imbalance_approach_distance=cfg.imbalance_approach_distance,
-        imbalance_retreat_distance=cfg.imbalance_retreat_distance,
-        imbalance_approach_threshold=cfg.imbalance_approach_threshold,
-    )
+    sp_cfg = StrongPointConfig(sl_buffer_points=cfg.sl_buffer_points)
 
-    zones: list[ImbalanceZone] = []
+    validated: list[ValidatedZone] = []
     for pattern in patterns:
         try:
-            initial = mark_zone(pattern, df)
-            refined = refine_zone(initial, df, refinement_cfg)
-            if not refined.is_tradeable:
-                continue
-            validated = validate_strong_point(
-                refined, df, structure.bos_events, strong_cfg,
-            )
-            if not validated.is_strong_point:
-                continue
-            imbalance = track_imbalance(validated, df, imbal_cfg)
-            if imbalance.is_tapped:
-                # First-touch already consumed; not a fresh setup.
-                continue
-            zones.append(imbalance)
+            zone = mark_zone(pattern, df)
+            refined = refine_zone(zone, df, refinement_cfg)
+            vz = validate_strong_point(refined, df, swings, sp_cfg)
+            if vz.is_strong_point:
+                validated.append(vz)
         except Exception:
             logger.exception(
                 "strategy pipeline: per-pattern error; skipping and continuing"
             )
             continue
 
-    # Lazy format — loguru skips str-build when DEBUG is filtered.
     logger.debug(
-        "strategy pipeline: {} patterns → {} tradeable zones",
-        len(patterns), len(zones),
+        "strategy pipeline: {} patterns → {} Strong Points",
+        len(patterns), len(validated),
     )
-    return zones
+    return validated

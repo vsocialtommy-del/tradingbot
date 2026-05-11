@@ -99,7 +99,11 @@ from bot.risk.position_sizing import (
     SizingMode,
     calculate_lot_size,
 )
-from bot.strategy.imbalance import ImbalanceZone
+from bot.strategy.strong_point import (
+    StrongPointConfig,
+    ValidatedZone,
+    compute_sl_price,
+)
 from bot.strategy.pipeline import (
     StrategyPipelineConfig,
     run_strategy_pipeline,
@@ -527,24 +531,29 @@ class Bot:
                 self.state.placed_setup_count += 1
 
     def _try_place_setup(
-        self, zone: ImbalanceZone, ohlc_df: pd.DataFrame,
+        self, zone: ValidatedZone, ohlc_df: pd.DataFrame,
     ) -> bool:
         """Compute SL + lot size, validate, log zone, place orders.
 
         Returns True iff ``order_manager.place_layered_orders`` reported
         ``PLACED`` (not FAILED, not SKIPPED-via-gap).
         """
-        # 1. SL.
-        try:
-            sl_calc = self.sl_manager.calculate_initial_sl(zone, ohlc_df)
-        except Exception:
-            logger.exception("new setup: SL calc failed; skipping zone")
+        # 1. SL — pinned to the strategy-layer sl_anchor_swing.
+        if zone.sl_anchor_swing is None:
+            logger.warning(
+                "new setup skipped: zone has no sl_anchor_swing — "
+                "Strong Point validation should have set this"
+            )
             return False
+        sp_cfg = StrongPointConfig(
+            sl_buffer_points=self.sl_manager_config.sl_buffer_points,
+        )
+        sl_price = compute_sl_price(zone, sp_cfg)
 
         entry_price = zone.top if zone.direction == "BUY" else zone.bottom
         sl_validation = self.sl_manager.validate_sl_distance(
             entry_price=entry_price,
-            sl_price=sl_calc.sl_price,
+            sl_price=sl_price,
             direction=zone.direction,
         )
         if not sl_validation.is_valid:
@@ -563,7 +572,7 @@ class Bot:
         lot_result = calculate_lot_size(
             balance=balance,
             entry_price=entry_price,
-            sl_price=sl_calc.sl_price,
+            sl_price=sl_price,
             config=self.sizing_config,
         )
         if lot_result.lot_size <= 0:
@@ -585,7 +594,7 @@ class Bot:
             result = place_layered_orders(
                 zone, zone_id,
                 lot_size=lot_result.lot_size,
-                sl_price=sl_calc.sl_price,
+                sl_price=sl_price,
                 mt5=self.mt5, supabase=self.supabase,
                 config=self.order_manager_config,
             )
@@ -682,20 +691,26 @@ def _parse_pause_until(raw: object) -> datetime | None:
     return None
 
 
-def _zone_to_input(zone: ImbalanceZone) -> ZoneInput:
-    """Project an in-memory zone into the ``zones`` table insert payload."""
+def _zone_to_input(zone: ValidatedZone) -> ZoneInput:
+    """Project an in-memory zone into the ``zones`` table insert payload.
+
+    v1 only handles Strong Point setups → ``zone_type=STRONG_POINT``.
+    ``pattern_type`` is mapped to the legacy ``W``/``M`` for storage
+    compat with the existing Supabase CHECK constraint
+    (``W``/``M``/``N``). A follow-up migration will let us persist the
+    real S&D pattern code (RBR/DBD/DBR/RBD) directly; until then BUY
+    zones store as "W" and SELL as "M" — direction is the only thing
+    we read off this column today.
+    """
     return ZoneInput(
         symbol="XAUUSD",
         direction=zone.direction,
-        zone_type="IMBALANCE" if zone.is_imbalance else "STRONG_POINT",
+        zone_type="STRONG_POINT",
         pattern_type="W" if zone.direction == "BUY" else "M",
         top=Decimal(str(zone.top)),
         bottom=Decimal(str(zone.bottom)),
-        approach_count=zone.approach_count,
-        qualified_imbalance_at=(
-            zone.qualified_at.to_pydatetime()
-            if zone.qualified_at is not None else None
-        ),
+        approach_count=0,            # Imbalance-only field; 0 in v1
+        qualified_imbalance_at=None,  # Imbalance-only field; None in v1
         formed_at=zone.formed_at.to_pydatetime(),
     )
 

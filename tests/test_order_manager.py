@@ -30,16 +30,20 @@ from bot.execution.order_manager import (
     place_layered_orders,
 )
 from bot.logging.supabase_logger import SupabaseLogger
-from bot.strategy.imbalance import ImbalanceZone
-from bot.strategy.pattern_detection import MPattern, WPattern
-from bot.strategy.structure import BosEvent, Swing
+from bot.strategy.pattern_detection import (
+    Base,
+    Impulse,
+    Pattern,
+    PatternType,
+)
 from bot.strategy.strong_point import ValidatedZone
+from bot.strategy.structure import Swing
 from bot.strategy.zone_marking import Zone
 from bot.strategy.zone_refinement import RefinedZone
 
 
 # --------------------------------------------------------------------------- #
-# Helpers — synthetic ImbalanceZone construction
+# Helpers — synthetic ValidatedZone construction (PR #31)
 # --------------------------------------------------------------------------- #
 
 
@@ -49,50 +53,41 @@ def make_imbalance_zone(
     top: float = 1900.0,
     bottom: float = 1895.0,
     is_strong_point: bool = True,
-    is_imbalance: bool = True,
     is_tradeable: bool = True,
     rejection_reason: str | None = None,
     bos_broken_level: float | None = None,
-) -> ImbalanceZone:
-    """Build an ImbalanceZone for tests.
+    is_imbalance: bool | None = None,  # accepted for back-compat; ignored
+) -> ValidatedZone:
+    """Build a ValidatedZone for tests.
 
-    ``bos_broken_level`` controls whether the zone carries a ``BosEvent``.
-    A real ``BosEvent`` is the v1 default for any Strong Point; tests
-    that exercise the BOS_LEVEL TP1 path should pass an explicit value
-    (e.g. ``top + 10`` for a BUY zone, ``bottom - 10`` for a SELL).
-    Default behaviour uses ``top + 5`` (BUY) or ``bottom - 5`` (SELL) so
-    BOS_LEVEL pre-checks pass; TP1-method-specific tests override.
+    Name retained from the pre-PR-31 helper so the call sites in this
+    file don't churn — returns a ``ValidatedZone`` (the post-PR-31 type)
+    rather than the old ``ImbalanceZone``. The ``is_imbalance`` kwarg
+    is accepted (and ignored) for backward signature compat.
+
+    ``bos_broken_level`` controls the broken_swing price (the
+    structural high/low the Strong Point body-closed past). Default:
+    ``top + 5`` for BUY / ``bottom - 5`` for SELL. Tests that need
+    a specific BOS level pass an explicit value.
     """
     ts = pd.Timestamp("2026-05-08T12:00:00Z")
-    if direction == "BUY":
-        pattern: Any = WPattern(
-            low1=Swing(index=2, time=ts, price=top, kind="LOW"),
-            low2=Swing(index=9, time=ts, price=top, kind="LOW"),
-            peak_index=6, peak_time=ts, peak_price=top + 10,
-            formed_at=ts, completed=True,
-        )
-    else:
-        pattern = MPattern(
-            high1=Swing(index=2, time=ts, price=bottom, kind="HIGH"),
-            high2=Swing(index=9, time=ts, price=bottom, kind="HIGH"),
-            trough_index=6, trough_time=ts, trough_price=bottom - 10,
-            formed_at=ts, completed=True,
-        )
-
-    if bos_broken_level is None:
-        # Default to a sensible BoS level that survives pre-checks.
-        bos_broken_level = top + 5.0 if direction == "BUY" else bottom - 5.0
-    bos_event = BosEvent(
-        bar_index=12,
-        time=ts,
-        direction="UP" if direction == "BUY" else "DOWN",
-        broken_swing_index=4,
-        broken_level=bos_broken_level,
-        break_close=bos_broken_level + 0.5 if direction == "BUY"
-                    else bos_broken_level - 0.5,
+    impulse = Impulse(
+        direction="RALLY" if direction == "BUY" else "DROP",
+        start_index=0, end_index=0,
+        start_time=ts, end_time=ts,
+        range_size=5.0, largest_body=5.0, candle_count=1,
     )
-
-    initial = Zone(
+    base = Base(
+        start_index=1, end_index=1, candle_count=1,
+        top=top, bottom=bottom, range_size=top - bottom, largest_body=0.5,
+    )
+    pattern = Pattern(
+        pattern_type=PatternType.RBR if direction == "BUY" else PatternType.DBD,
+        impulse_before=impulse, base=base, impulse_after=impulse,
+        direction=direction,  # type: ignore[arg-type]
+        formed_at=ts,
+    )
+    zone = Zone(
         direction=direction,  # type: ignore[arg-type]
         top=top, bottom=bottom, formed_at=ts, source_pattern=pattern,
     )
@@ -101,61 +96,50 @@ def make_imbalance_zone(
         top=top, bottom=bottom, formed_at=ts, source_pattern=pattern,
         is_tradeable=is_tradeable,
         rejection_reason=rejection_reason,  # type: ignore[arg-type]
-        original_zone=initial,
+        original_zone=zone,
     )
-    validated = ValidatedZone(
+    if bos_broken_level is None:
+        bos_broken_level = top + 5.0 if direction == "BUY" else bottom - 5.0
+    broken = Swing(
+        index=12, time=ts, price=bos_broken_level,
+        kind="HIGH" if direction == "BUY" else "LOW",
+    )
+    anchor = Swing(
+        index=11, time=ts,
+        price=bottom - 5.0 if direction == "BUY" else top + 5.0,
+        kind="LOW" if direction == "BUY" else "HIGH",
+    )
+    return ValidatedZone(
         direction=direction,  # type: ignore[arg-type]
         top=top, bottom=bottom, formed_at=ts, source_pattern=pattern,
-        is_tradeable=is_tradeable,
-        rejection_reason=rejection_reason,  # type: ignore[arg-type]
-        original_zone=initial, refined_zone=refined,
-        is_strong_point=is_strong_point, validation_failures=[],
-        bos_event=bos_event,
-    )
-    return ImbalanceZone(
-        direction=direction,  # type: ignore[arg-type]
-        top=top, bottom=bottom, formed_at=ts, source_pattern=pattern,
-        is_tradeable=is_tradeable,
-        rejection_reason=rejection_reason,  # type: ignore[arg-type]
-        original_zone=initial, refined_zone=refined,
-        is_strong_point=is_strong_point, validation_failures=[],
-        bos_event=bos_event,
-        validated_zone=validated,
-        approach_count=2 if is_imbalance else 0, is_imbalance=is_imbalance,
-        approach_events=[], qualified_at=ts if is_imbalance else None,
-        is_tapped=False, tapped_at=None,
+        refined_zone=refined,
+        is_strong_point=is_strong_point,
+        validation_failures=[],
+        broken_swing=broken if is_strong_point else None,
+        broken_at=ts if is_strong_point else None,
+        sl_anchor_swing=anchor,
     )
 
 
-def make_imbalance_zone_no_bos(**kwargs: Any) -> ImbalanceZone:
-    """Build an ImbalanceZone with ``bos_event=None``.
+def make_imbalance_zone_no_bos(**kwargs: Any) -> ValidatedZone:
+    """ValidatedZone with broken_swing=None.
 
-    Used only for the defensive test that the BOS_LEVEL pre-check fails
-    cleanly when validation has been bypassed. (In production every zone
-    reaching ``order_manager`` has a ``bos_event`` because ``strong_point``
-    guarantees it; this exists purely to verify the guard.)
+    Used only for the defensive test that the BOS_LEVEL pre-check
+    fails cleanly when validation has been bypassed. In production
+    every zone reaching ``order_manager`` has a broken_swing because
+    ``strong_point`` guarantees it; this exists purely to verify the
+    guard.
     """
     z = make_imbalance_zone(**kwargs)
-    # Rebuild with bos_event=None on both layers.
-    no_bos_validated = ValidatedZone(
+    return ValidatedZone(
         direction=z.direction, top=z.top, bottom=z.bottom,
         formed_at=z.formed_at, source_pattern=z.source_pattern,
-        is_tradeable=z.is_tradeable, rejection_reason=z.rejection_reason,
-        original_zone=z.original_zone, refined_zone=z.refined_zone,
+        refined_zone=z.refined_zone,
         is_strong_point=z.is_strong_point,
-        validation_failures=z.validation_failures, bos_event=None,
-    )
-    return ImbalanceZone(
-        direction=z.direction, top=z.top, bottom=z.bottom,
-        formed_at=z.formed_at, source_pattern=z.source_pattern,
-        is_tradeable=z.is_tradeable, rejection_reason=z.rejection_reason,
-        original_zone=z.original_zone, refined_zone=z.refined_zone,
-        is_strong_point=z.is_strong_point,
-        validation_failures=z.validation_failures, bos_event=None,
-        validated_zone=no_bos_validated,
-        approach_count=z.approach_count, is_imbalance=z.is_imbalance,
-        approach_events=z.approach_events, qualified_at=z.qualified_at,
-        is_tapped=z.is_tapped, tapped_at=z.tapped_at,
+        validation_failures=z.validation_failures,
+        broken_swing=None,
+        broken_at=None,
+        sl_anchor_swing=z.sl_anchor_swing,
     )
 
 
@@ -553,16 +537,13 @@ class TestNoTpOnBroker:
 
 
 class TestSetupRecord:
-    def test_imbalance_uses_imbalance_entry_mode(
-        self, mock_mt5, mock_supabase, zone_id,
-    ) -> None:
-        zone = make_imbalance_zone(is_imbalance=True, is_strong_point=True)
-        place_layered_orders(
-            zone, zone_id, 0.01, 1880.0,
-            mt5=mock_mt5, supabase=mock_supabase,
-        )
-        setup_input = mock_supabase.log_setup.call_args.args[0]
-        assert setup_input.entry_mode == "IMBALANCE_FIRST_TOUCH"
+    # NOTE: pre-PR-31 this file had a
+    # ``test_imbalance_uses_imbalance_entry_mode`` test verifying that
+    # an Imbalance-flagged zone produced ``IMBALANCE_FIRST_TOUCH`` as
+    # the entry_mode on the setup record. PR #31 removed the Imbalance
+    # setup from v1 — entry_mode is now always ``STRONG_POINT_FIRST_TOUCH``.
+    # When Setup 4 (Imbalance) is rebuilt later we'll add a discriminator
+    # field on the validated zone and re-introduce the dispatch test.
 
     def test_strong_point_only_uses_strong_point_entry_mode(
         self, mock_mt5, mock_supabase, zone_id,
@@ -770,7 +751,7 @@ class TestTP1MethodBosLevel:
         mock_supabase.log_setup.assert_not_called()
         mock_mt5.place_market_order.assert_not_called()
         # Error message is actionable.
-        assert any("bos_event" in m for m in result.error_messages)
+        assert any("broken_swing" in m for m in result.error_messages)
         assert any("BOS_LEVEL" in m for m in result.error_messages)
 
     def test_missing_bos_event_fixed_distance_still_works(

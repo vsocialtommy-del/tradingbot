@@ -133,52 +133,36 @@ class TestPerfBudget:
 # --------------------------------------------------------------------------- #
 
 
-class TestSwingReuse:
-    def test_pipeline_calls_detect_swings_once_per_iteration(self) -> None:
-        """Pipeline must compute swings ONCE per call.
+class TestAnalyzeStructureCalledOncePerIteration:
+    """analyze_structure should fire exactly once per pipeline call.
 
-        Previously detect_w_patterns and detect_m_patterns each made
-        their own detect_swings call, on top of the one already done
-        by analyze_structure — three full O(n) scans per pipeline
-        iteration. The fix: pipeline pre-computes swings via
-        analyze_structure and passes them to both detectors.
-        """
+    Replaces PR #26's ``TestSwingReuse`` which locked in a property
+    of the old W/M pattern detector (where detect_swings was called
+    3× per iteration). The S&D pipeline (PR #31) doesn't call
+    detect_swings from pattern_detection at all — structure analysis
+    is the single source of swings — so the equivalent property is:
+    analyze_structure is invoked exactly once per detection bar.
+    """
+
+    def test_analyze_structure_called_once_per_detection_bar(self) -> None:
         df = _make_synthetic(150)
         cfg = BacktestConfig(
             min_history_bars=100, progress_log_every_bars=0,
         )
-
-        # Patch detect_swings at every import site so we count total
-        # call invocations across the whole strategy stack.
-        from bot.strategy import structure as structure_mod
-        from bot.strategy import pattern_detection as pattern_mod
+        # Patch the pipeline's bound reference (the pipeline imports
+        # analyze_structure into its namespace at module load).
+        import bot.strategy.pipeline as pipeline_mod
 
         with patch.object(
-            structure_mod, "detect_swings",
-            wraps=structure_mod.detect_swings,
-        ) as struct_spy, patch.object(
-            pattern_mod, "detect_swings",
-            wraps=pattern_mod.detect_swings,
-        ) as pattern_spy:
+            pipeline_mod, "analyze_structure",
+            wraps=pipeline_mod.analyze_structure,
+        ) as spy:
             BacktestEngine(cfg).run(df)
-
-            # 50 detection bars (150 - 100 min_history). Each pipeline
-            # iteration must call detect_swings AT MOST ONCE — through
-            # analyze_structure (in the structure module). The pattern
-            # module's detect_swings reference must NEVER fire because
-            # pipeline pre-computes and passes swings.
-            #
-            # ``struct_spy`` covers the call from analyze_structure;
-            # ``pattern_spy`` covers any (now-eliminated) call from
-            # detect_w_patterns / detect_m_patterns.
-            n_bars_processed = 50
-            assert struct_spy.call_count == n_bars_processed, (
-                f"expected {n_bars_processed} detect_swings calls via "
-                f"analyze_structure, got {struct_spy.call_count}"
-            )
-            assert pattern_spy.call_count == 0, (
-                f"detect_w_patterns / detect_m_patterns called "
-                f"detect_swings {pattern_spy.call_count} times; "
-                f"pipeline should pass swings instead. The "
-                f"swing-reuse optimisation has regressed."
+            # 50 detection bars (150 - 100 min_history). Pipeline runs
+            # once per detection bar; each call invokes analyze_structure
+            # exactly once.
+            assert spy.call_count == 50, (
+                f"expected 50 analyze_structure calls (one per detection "
+                f"bar); got {spy.call_count}. If higher, the pipeline is "
+                f"doing redundant structure analysis."
             )
