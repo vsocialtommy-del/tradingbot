@@ -39,6 +39,7 @@ from bot.main import (
     _elapsed,
     _parse_pause_until,
     _zone_to_input,
+    main,
 )
 from bot.risk.daily_halt import DailyHaltResult
 from bot.strategy.pattern_detection import (
@@ -744,6 +745,77 @@ class TestRunLoop:
             b.run()
         # finally branch runs shutdown even when initialize blew up.
         mock_mt5.disconnect.assert_called_once()
+
+
+# --------------------------------------------------------------------------- #
+# main() entry point — .env loading
+# --------------------------------------------------------------------------- #
+
+
+class TestMainEntryPoint:
+    """Regression guard for the ``.env`` loading fix.
+
+    Pre-fix, ``python -m bot.main`` crashed with ``KeyError: 'MT5_LOGIN'``
+    on a fresh install because main() called ``from_env()`` without
+    first calling ``dotenv.load_dotenv()``. The shell-env path
+    (Docker / VPS) worked; the dev workflow (local ``.env`` file)
+    did not. The fix is two lines: ``from dotenv import load_dotenv``
+    + ``load_dotenv()`` at the top of main(). These tests lock the
+    invariants:
+
+      1. load_dotenv() is called before either ``from_env`` call.
+      2. main() doesn't crash when env vars are present (positive
+         path).
+    """
+
+    def test_main_calls_load_dotenv_before_from_env(
+        self, mocker: MockerFixture,
+    ) -> None:
+        # Order matters: load_dotenv MUST run BEFORE either from_env
+        # call, otherwise the env vars from .env aren't visible.
+        # Use a shared MagicMock to record relative call order.
+        call_order: list[str] = []
+        mocker.patch(
+            "bot.main.load_dotenv",
+            side_effect=lambda *a, **kw: call_order.append("load_dotenv"),
+        )
+        mocker.patch(
+            "bot.main.MT5Connector.from_env",
+            side_effect=lambda: (call_order.append("mt5_from_env") or
+                                 mocker.MagicMock()),
+        )
+        mocker.patch(
+            "bot.main.SupabaseLogger.from_env",
+            side_effect=lambda: (call_order.append("supabase_from_env") or
+                                 mocker.MagicMock()),
+        )
+        # Don't actually run the loop.
+        mocker.patch("bot.main.Bot.run")
+        mocker.patch("bot.main.signal.signal")
+
+        main()
+
+        assert call_order[0] == "load_dotenv", (
+            f"load_dotenv must run before from_env calls; got order {call_order}"
+        )
+        assert "mt5_from_env" in call_order
+        assert "supabase_from_env" in call_order
+
+    def test_main_no_crash_with_env_present(
+        self, mocker: MockerFixture,
+    ) -> None:
+        # Positive path: env vars are set (either from .env or shell),
+        # main() constructs Bot and exits cleanly. Asserts Bot.run was
+        # invoked once.
+        mocker.patch("bot.main.load_dotenv")
+        mocker.patch("bot.main.MT5Connector.from_env",
+                     return_value=mocker.MagicMock())
+        mocker.patch("bot.main.SupabaseLogger.from_env",
+                     return_value=mocker.MagicMock())
+        run_spy = mocker.patch("bot.main.Bot.run")
+        mocker.patch("bot.main.signal.signal")
+        main()
+        run_spy.assert_called_once()
 
 
 # --------------------------------------------------------------------------- #
