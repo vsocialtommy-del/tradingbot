@@ -232,9 +232,13 @@ class TestUpdateZoneStatus:
         with pytest.raises(ValueError, match="flipped_direction is required"):
             logger.update_zone_status(uuid4(), "FLIPPED")
 
-    def test_to_active_stamps_no_timestamp(self) -> None:
-        # CONFIRMED → ACTIVE doesn't have a dedicated timestamp (the
-        # zone's ``updated_at`` trigger captures the moment).
+    def test_to_active_clears_flip_timestamps(self) -> None:
+        # PR #38: FLIPPED → ACTIVE must explicitly clear violated_at +
+        # flipped_at to satisfy the consistency CHECK (ACTIVE requires
+        # those NULL). CONFIRMED → ACTIVE sends the same explicit-NULL
+        # payload — harmless no-op since they were already NULL.
+        # ``flipped_direction`` is NOT cleared (preserved across
+        # transitions per migration 008).
         logger, client = _make_logger_with_mock_client()
         zone_id = uuid4()
         returned = {
@@ -251,7 +255,12 @@ class TestUpdateZoneStatus:
         logger.update_zone_status(zone_id, "ACTIVE")
 
         payload = update.call_args.args[0]
-        assert payload == {"status": "ACTIVE"}
+        assert payload["status"] == "ACTIVE"
+        assert payload["violated_at"] is None
+        assert payload["flipped_at"] is None
+        # flipped_direction MUST be absent from the payload — we don't
+        # touch it, so a previously-set value survives the update.
+        assert "flipped_direction" not in payload
 
     def test_zone_not_found_raises(self) -> None:
         logger, client = _make_logger_with_mock_client()

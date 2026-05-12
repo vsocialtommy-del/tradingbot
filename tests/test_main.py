@@ -1621,3 +1621,343 @@ class TestZonePersistence:
         ]
         assert len(consumed_calls) == 1
         assert consumed_calls[0].args[0] == new_zone_id
+
+
+# --------------------------------------------------------------------------- #
+# SnD Flip trading (PR #38) — end-to-end side path that trades FLIPPED
+# zones in their flipped_direction.
+# --------------------------------------------------------------------------- #
+
+
+def _make_flipped_zone_row(
+    *,
+    original_direction: str = "BUY",
+    flipped_direction: str = "SELL",
+    top: float = 1905.0,
+    bottom: float = 1900.0,
+    flipped_at: datetime | None = None,
+):
+    """Build a Zone read model in status=FLIPPED with all the
+    PR #35 lifecycle columns populated."""
+    from bot.logging.supabase_logger import Zone
+    if flipped_at is None:
+        flipped_at = NOW
+    return Zone(
+        id=uuid4(),
+        symbol="XAUUSD",
+        direction=original_direction,  # type: ignore[arg-type]
+        zone_type="STRONG_POINT",
+        pattern_type="RBR" if original_direction == "BUY" else "DBD",
+        top=Decimal(str(top)),
+        bottom=Decimal(str(bottom)),
+        approach_count=0,
+        formed_at=NOW - timedelta(hours=2),
+        status="FLIPPED",
+        consumed_at=None,
+        violated_at=NOW - timedelta(minutes=30),
+        flipped_at=flipped_at,
+        flipped_direction=flipped_direction,  # type: ignore[arg-type]
+        created_at=NOW - timedelta(hours=2),
+        updated_at=NOW,
+    )
+
+
+class TestFlippedZoneTrading:
+    """The bot loads FLIPPED zones from DB on each pipeline run and
+    treats them as tradeable opportunities in flipped_direction.
+    First retest fires a setup; the FLIPPED zone is FK-ed to the
+    setup so position_tracker's promotion hook drives FLIPPED →
+    ACTIVE."""
+
+    def test_flipped_zone_fires_trade_in_flipped_direction(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        # A demand zone (BUY) that's been flipped to SELL — now a
+        # supply candidate.
+        fz = _make_flipped_zone_row(
+            original_direction="BUY", flipped_direction="SELL",
+            top=1905.0, bottom=1900.0,
+            flipped_at=NOW - timedelta(hours=1),
+        )
+        mock_supabase.get_zones_by_status.side_effect = (
+            lambda statuses: [fz] if "FLIPPED" in statuses else []
+        )
+
+        # Pipeline returns no fresh zones — the only candidate is the
+        # flipped one.
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        # TP1 in the flipped direction (SELL) — below zone.bottom.
+        peak = mocker.patch(
+            "bot.main.find_nearest_local_peak", return_value=1890.0,
+        )
+        place = mocker.patch("bot.main.place_layered_orders")
+        place.return_value = mocker.MagicMock(
+            status="PLACED", setup_id=uuid4(),
+            layer_1_ticket=11111, sl_price=1922.5, tp1_price=1890.0,
+            error_messages=[],
+        )
+
+        b.run_iteration(NOW)
+
+        # Setup placed with the flipped direction's geometry.
+        place.assert_called_once()
+        call = place.call_args
+        # zone arg is the synthesised view: direction=SELL, top=1905, bottom=1900
+        synth = call.args[0]
+        assert synth.direction == "SELL"
+        assert synth.top == 1905.0
+        assert synth.bottom == 1900.0
+        # zone_id arg is the FLIPPED zone's own UUID — we don't re-persist.
+        assert call.args[1] == fz.id
+        # SL = zone.top + 17.5 for SELL = 1922.5
+        assert call.kwargs["sl_price"] == pytest.approx(1922.5)
+        # TP1 search ran in the flipped direction with the SELL entry
+        # reference (= zone.bottom).
+        assert peak.call_args.kwargs["direction"] == "SELL"
+        assert peak.call_args.kwargs["entry_price"] == pytest.approx(1900.0)
+
+    def test_body_break_since_flip_rejects_dead_zone(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Zone flipped at T-1h. A bar between then and now body-closed
+        # past zone.top (wrong side for the flipped SELL). The
+        # candidate should be filtered out before any placement
+        # attempt.
+        b, mgrs = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        flipped_at_ts = pd.Timestamp("2026-05-08T11:00:00Z")
+        # OHLC: 30 bars ending at NOW (2026-05-08T12:00:00Z), one bar
+        # after flipped_at body-closes above zone.top for our SELL
+        # candidate (top=1905, body close at 1910).
+        times = pd.date_range(
+            end="2026-05-08T12:00:00Z", periods=30, freq="5min", tz="UTC",
+        )
+        opens = [1900.0] * 30
+        highs = [1901.0] * 30
+        lows = [1899.0] * 30
+        closes = [1900.0] * 30
+        # Pick a bar strictly AFTER flipped_at to embed the break.
+        for i, t in enumerate(times):
+            if t > flipped_at_ts:
+                closes[i] = 1910.0  # close above zone.top
+                highs[i] = 1911.0
+                break
+        df = pd.DataFrame(
+            {"open": opens, "high": highs, "low": lows, "close": closes,
+             "volume": [100] * 30},
+            index=times,
+        )
+        mgrs["ohlc_provider"].get.return_value = df
+
+        fz = _make_flipped_zone_row(
+            original_direction="BUY", flipped_direction="SELL",
+            top=1905.0, bottom=1900.0,
+            flipped_at=flipped_at_ts.to_pydatetime(),
+        )
+        mock_supabase.get_zones_by_status.side_effect = (
+            lambda statuses: [fz] if "FLIPPED" in statuses else []
+        )
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        b.run_iteration(NOW)
+
+        # Body-broken since flip → no placement attempt.
+        place.assert_not_called()
+
+    def test_break_before_flip_does_not_disqualify(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Symmetric to the above: the break happened BEFORE flipped_at
+        # — it's pre-flip history. Should NOT disqualify the trade.
+        b, mgrs = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        flipped_at_ts = pd.Timestamp("2026-05-08T11:30:00Z")
+        times = pd.date_range(
+            end="2026-05-08T12:00:00Z", periods=30, freq="5min", tz="UTC",
+        )
+        opens = [1900.0] * 30
+        highs = [1901.0] * 30
+        lows = [1899.0] * 30
+        closes = [1900.0] * 30
+        # Pre-flip break: pick a bar before flipped_at and put a close above top.
+        for i, t in enumerate(times):
+            if t < flipped_at_ts:
+                closes[i] = 1910.0
+                highs[i] = 1911.0
+                break
+        df = pd.DataFrame(
+            {"open": opens, "high": highs, "low": lows, "close": closes,
+             "volume": [100] * 30},
+            index=times,
+        )
+        mgrs["ohlc_provider"].get.return_value = df
+
+        fz = _make_flipped_zone_row(
+            original_direction="BUY", flipped_direction="SELL",
+            top=1905.0, bottom=1900.0,
+            flipped_at=flipped_at_ts.to_pydatetime(),
+        )
+        mock_supabase.get_zones_by_status.side_effect = (
+            lambda statuses: [fz] if "FLIPPED" in statuses else []
+        )
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1890.0)
+        place = mocker.patch("bot.main.place_layered_orders")
+        place.return_value = mocker.MagicMock(
+            status="PLACED", setup_id=uuid4(),
+            layer_1_ticket=11111, sl_price=1922.5, tp1_price=1890.0,
+            error_messages=[],
+        )
+
+        b.run_iteration(NOW)
+
+        # Pre-flip break ignored → placement proceeds.
+        place.assert_called_once()
+
+    def test_no_tp1_peak_skips_flipped_trade(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # The TP1 skip path in _try_place_setup also applies to flipped
+        # trades — no local peak in the lookback → no placement.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        fz = _make_flipped_zone_row(flipped_at=NOW - timedelta(hours=1))
+        mock_supabase.get_zones_by_status.side_effect = (
+            lambda statuses: [fz] if "FLIPPED" in statuses else []
+        )
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=None)
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        b.run_iteration(NOW)
+
+        place.assert_not_called()
+
+    def test_exposure_cap_blocks_flipped_trades_too(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Both pipeline + flipped candidates compete for the same
+        # max_simultaneous_setups budget. With 3 already active, no
+        # new placements — including flipped.
+        b, mgrs = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mgrs["position_tracker"].get_active_setups.return_value = [
+            make_setup(), make_setup(), make_setup(),
+        ]
+
+        fz = _make_flipped_zone_row(flipped_at=NOW - timedelta(hours=1))
+        mock_supabase.get_zones_by_status.side_effect = (
+            lambda statuses: [fz] if "FLIPPED" in statuses else []
+        )
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1890.0)
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        b.run_iteration(NOW)
+
+        place.assert_not_called()
+
+    def test_no_flipped_zones_in_db_means_no_extra_work(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # If get_zones_by_status(['FLIPPED']) returns [], we don't
+        # attempt to construct any candidates.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        mock_supabase.get_zones_by_status.return_value = []
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        b.run_iteration(NOW)
+
+        place.assert_not_called()
+
+    def test_synthesised_view_uses_flipped_at_as_formed_at(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Q3 lock-in: formed_at on the synthesised stub is flipped_at.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        flipped_at_ts = NOW - timedelta(hours=2)
+        # Use a zone where the default fixture OHLC (closes=1900) sits
+        # inside the bounds — body-break check should NOT disqualify
+        # the candidate. (flipped BUY rejects on close < bottom.)
+        fz = _make_flipped_zone_row(
+            flipped_at=flipped_at_ts,
+            original_direction="SELL", flipped_direction="BUY",
+            top=1901.0, bottom=1895.0,
+        )
+        mock_supabase.get_zones_by_status.side_effect = (
+            lambda statuses: [fz] if "FLIPPED" in statuses else []
+        )
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1925.0)
+        place = mocker.patch("bot.main.place_layered_orders")
+        place.return_value = mocker.MagicMock(
+            status="PLACED", setup_id=uuid4(),
+            layer_1_ticket=11111, sl_price=1887.5, tp1_price=1925.0,
+            error_messages=[],
+        )
+
+        b.run_iteration(NOW)
+
+        synth = place.call_args.args[0]
+        # pd.Timestamp(flipped_at_ts) — compare directly.
+        assert synth.formed_at == pd.Timestamp(flipped_at_ts)
+        # Direction is the flipped direction.
+        assert synth.direction == "BUY"
+
+
+# --------------------------------------------------------------------------- #
+# _flipped_zone_as_validated — module-level helper unit tests
+# --------------------------------------------------------------------------- #
+
+
+class TestFlippedZoneAsValidated:
+    def test_builds_view_with_flipped_direction(self) -> None:
+        from bot.main import _flipped_zone_as_validated
+        fz = _make_flipped_zone_row(
+            original_direction="BUY", flipped_direction="SELL",
+            top=1905.0, bottom=1900.0,
+        )
+        view = _flipped_zone_as_validated(fz)
+        assert view.direction == "SELL"
+        assert view.top == 1905.0
+        assert view.bottom == 1900.0
+        assert view.is_strong_point is True
+        assert view.refined_zone.is_tradeable is True
+        # Break-and-close fields are stubbed None (loosened-rules shape).
+        assert view.broken_swing is None
+        assert view.broken_at is None
+        assert view.sl_anchor_swing is None
+
+    def test_raises_when_zone_not_properly_flipped(self) -> None:
+        from bot.main import _flipped_zone_as_validated
+        fz = _make_flipped_zone_row().model_copy(update={
+            "flipped_direction": None,
+        })
+        with pytest.raises(ValueError, match="not properly FLIPPED"):
+            _flipped_zone_as_validated(fz)

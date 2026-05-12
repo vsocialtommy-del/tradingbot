@@ -102,6 +102,12 @@ from bot.risk.position_sizing import (
     SizingMode,
     calculate_lot_size,
 )
+from bot.strategy.pattern_detection import (
+    Base as _Base,
+    Impulse as _Impulse,
+    Pattern as _Pattern,
+    PatternType as _PT,
+)
 from bot.strategy.strong_point import (
     StrongPointConfig,
     ValidatedZone,
@@ -112,12 +118,15 @@ from bot.strategy.pipeline import (
     run_strategy_pipeline,
 )
 from bot.strategy.tp1_target import find_nearest_local_peak
+from bot.strategy.zone_marking import Zone as _ZoneShape
+from bot.strategy.zone_refinement import RefinedZone as _RefinedZone
 from bot.strategy.zone_lifecycle import (
     SKIP_NEW_SETUP_STATUSES,
     ZoneRef,
     check_consumption,
     check_flip,
     check_violation,
+    flipped_zone_body_broken_since_flip,
     log_transition,
     zone_bounds_overlap,
 )
@@ -578,8 +587,10 @@ class Bot:
             logger.exception("main loop: strategy pipeline raised")
             return
 
-        if not zones:
-            return
+        # Note: we don't early-return on empty ``zones`` any more.
+        # The FLIPPED-zone trade side path (PR #38) runs even when the
+        # pipeline returns no fresh patterns — a freshly-flipped zone
+        # in the DB is itself a tradeable opportunity.
 
         # Persist every tradeable zone to Supabase BEFORE deciding whether
         # to place a setup. Each zone gets exactly one row, regardless of
@@ -596,6 +607,12 @@ class Bot:
             if zid is not None:
                 zone_ids[id(zone)] = zid
 
+        # SnD Flip side path (PR #38): load FLIPPED zones from DB and
+        # synthesise tradeable views in their ``flipped_direction``.
+        # Sits parallel to the pipeline-output zones; both go through
+        # the same exposure-capped placement loop below.
+        flipped_candidates = self._load_flipped_candidates(df)
+
         # Exposure cap.
         try:
             active_setups = self.position_tracker.get_active_setups()
@@ -604,12 +621,13 @@ class Bot:
             return
         active_count = count_active_setups(active_setups)
 
+        # Build the combined placement queue. Tuples of (zone_view,
+        # zone_id, source_label) — source_label is for logging only.
+        placement_queue: list[tuple[ValidatedZone, UUID, str]] = []
         for zone in zones:
-            # Placement requires the loosened-rules Strong Point gate too
-            # (size-passed AND not body-broken since formation). Persisted
-            # but non-Strong-Point zones (body-broken) live in the cache
-            # for future lifecycle transitions.
             if not zone.is_strong_point:
+                # Body-broken zones persisted but not traded; lifecycle
+                # transitions will catch up on subsequent bars.
                 continue
             zid = zone_ids.get(id(zone))
             if zid is None:
@@ -618,6 +636,11 @@ class Bot:
                     f"({zone.direction} {zone.bottom:.2f}-{zone.top:.2f})"
                 )
                 continue
+            placement_queue.append((zone, zid, "pipeline"))
+        for fz_view, fz_id in flipped_candidates:
+            placement_queue.append((fz_view, fz_id, "flipped"))
+
+        for zone, zid, source in placement_queue:
             exp = check_exposure(
                 active_count=active_count,
                 max_simultaneous=self.config.max_simultaneous_setups,
@@ -632,6 +655,9 @@ class Bot:
             if self._try_place_setup(zone, df, zid):
                 active_count += 1
                 self.state.placed_setup_count += 1
+                logger.info(
+                    f"setup placed from source={source} zone_id={zid}"
+                )
 
     def _persist_zone_if_new(self, zone: ValidatedZone) -> UUID | None:
         """Insert the zone row (status=CONFIRMED) if not already cached.
@@ -659,6 +685,60 @@ class Bot:
             f"{zone.bottom:.2f}-{zone.top:.2f} formed_at={zone.formed_at}"
         )
         return zone_id
+
+    # ------------------------------------------------------------------ #
+    # SnD Flip trade side path (PR #38)
+    # ------------------------------------------------------------------ #
+
+    def _load_flipped_candidates(
+        self, df: pd.DataFrame,
+    ) -> list[tuple[ValidatedZone, UUID]]:
+        """Load FLIPPED zones from DB and project each into a tradeable view.
+
+        Each returned tuple is ``(synthesised_validated_zone, zone_id)``
+        — the zone is already persisted (status=FLIPPED), so we don't
+        re-insert; we just need its UUID to FK the setup to.
+
+        Zones that have body-closed past the wrong side of the flipped
+        direction since their ``flipped_at`` are filtered out — the
+        flip premise has been broken, no trade.
+        """
+        try:
+            flipped_zones = self.supabase.get_zones_by_status(["FLIPPED"])
+        except Exception:
+            logger.exception(
+                "flipped trade detection: get_zones_by_status(['FLIPPED']) failed"
+            )
+            return []
+
+        candidates: list[tuple[ValidatedZone, UUID]] = []
+        for fz in flipped_zones:
+            if fz.flipped_direction is None or fz.flipped_at is None:
+                logger.warning(
+                    f"flipped zone {fz.id} missing flipped_direction/flipped_at; "
+                    f"DB CHECK should prevent this — skipping"
+                )
+                continue
+            if flipped_zone_body_broken_since_flip(
+                zone_top=float(fz.top),
+                zone_bottom=float(fz.bottom),
+                flipped_direction=fz.flipped_direction,
+                flipped_at=pd.Timestamp(fz.flipped_at),
+                df=df,
+            ):
+                logger.info(
+                    f"flipped zone {fz.id} skipped: body-broken since flip"
+                )
+                continue
+            view = _flipped_zone_as_validated(fz)
+            candidates.append((view, fz.id))
+
+        if candidates:
+            logger.debug(
+                f"flipped trade detection: {len(candidates)} candidate(s) "
+                f"after body-break filter"
+            )
+        return candidates
 
     def _run_zone_lifecycle(self, df: pd.DataFrame) -> None:
         """Apply consumption / violation / flip detection to the last bar.
@@ -1048,6 +1128,83 @@ def _zone_to_input(zone: ValidatedZone) -> ZoneInput:
         approach_count=0,            # Imbalance-only field; 0 in v1
         qualified_imbalance_at=None,  # Imbalance-only field; None in v1
         formed_at=zone.formed_at.to_pydatetime(),
+    )
+
+
+def _flipped_zone_as_validated(zone_row: Any) -> ValidatedZone:
+    """Synthesise a tradeable ``ValidatedZone`` view of a FLIPPED zone row.
+
+    The SnD Flip side path (PR #38) trades flipped zones in their
+    ``flipped_direction`` without a fresh pattern detection. We need a
+    ValidatedZone-shaped object to feed ``_try_place_setup`` —
+    everything in the placement path reads only ``direction``, ``top``,
+    ``bottom``, ``refined_zone.is_tradeable``, and ``is_strong_point``.
+    Other fields are stubbed.
+
+    Pattern fields aren't read by the placement code (``_zone_to_input``
+    would read ``source_pattern.pattern_type.value``, but that's only
+    called from ``_persist_zone_if_new`` — which we skip for already-
+    persisted flipped zones). The stub Pattern is built to be
+    internally consistent anyway.
+
+    ``formed_at`` is set to ``flipped_at`` (per Q3 lock-in) — the
+    moment the new direction came into existence.
+    """
+    direction = zone_row.flipped_direction
+    flipped_at = zone_row.flipped_at
+    if direction is None or flipped_at is None:
+        raise ValueError(
+            f"zone {zone_row.id} is not properly FLIPPED "
+            f"(missing flipped_direction or flipped_at)"
+        )
+
+    ts = pd.Timestamp(flipped_at)
+    top = float(zone_row.top)
+    bottom = float(zone_row.bottom)
+    # Keep the original pattern_type from the DB row — historical
+    # truth ("this position formed as an RBR demand"), even though the
+    # flipped trade goes in the opposite direction. Not read by the
+    # placement path; kept for traceability.
+    pt = _PT(zone_row.pattern_type)
+    impulse_dir = "RALLY" if direction == "BUY" else "DROP"
+    impulse = _Impulse(
+        direction=impulse_dir,
+        start_index=0, end_index=0,
+        start_time=ts, end_time=ts,
+        range_size=0.0, largest_body=0.0, candle_count=1,
+    )
+    base = _Base(
+        start_index=0, end_index=0, candle_count=1,
+        top=top, bottom=bottom,
+        range_size=top - bottom, largest_body=0.0,
+    )
+    pattern = _Pattern(
+        pattern_type=pt,
+        impulse_before=impulse, base=base, impulse_after=impulse,
+        direction=direction,
+        formed_at=ts,
+    )
+    zone_shape = _ZoneShape(
+        direction=direction,
+        top=top, bottom=bottom,
+        formed_at=ts, source_pattern=pattern,
+    )
+    refined = _RefinedZone(
+        direction=direction,
+        top=top, bottom=bottom,
+        formed_at=ts, source_pattern=pattern,
+        is_tradeable=True,
+        rejection_reason=None,
+        original_zone=zone_shape,
+    )
+    return ValidatedZone(
+        direction=direction,
+        top=top, bottom=bottom,
+        formed_at=ts, source_pattern=pattern,
+        refined_zone=refined,
+        is_strong_point=True,
+        validation_failures=[],
+        broken_swing=None, broken_at=None, sl_anchor_swing=None,
     )
 
 

@@ -360,17 +360,37 @@ class SupabaseLogger:
         *,
         flipped_direction: Direction | None = None,
     ) -> Zone:
-        """Patch a zone to ``status`` and stamp the matching timestamp.
+        """Patch a zone to ``status`` and stamp the matching timestamps.
 
-        The DB-level ``zones_status_timestamps_consistent`` CHECK
-        (migration 007) enforces that each status carries exactly the
-        right timestamp set — so we always set them here together.
-        ``flipped_direction`` must be supplied iff ``status='FLIPPED'``;
-        the DB CHECK will reject it otherwise.
+        The DB CHECK (migration 007 + relaxation in migration 008)
+        enforces:
+          * status='CONSUMED' / 'VIOLATED' / 'FLIPPED' carry their
+            timestamps NOT NULL.
+          * status='CONFIRMED' / 'ACTIVE' have all lifecycle
+            timestamps NULL.
+          * status='FLIPPED' requires ``flipped_direction`` NOT NULL.
+            Migration 008 lets ``flipped_direction`` stay populated on
+            any later status — preserves the "this zone was once
+            flipped" indicator across FLIPPED → ACTIVE → CONSUMED.
+
+        FLIPPED → ACTIVE specifically needs to clear ``violated_at``
+        and ``flipped_at`` to satisfy the consistency CHECK, while
+        leaving ``flipped_direction`` intact. We do that here by
+        emitting explicit NULLs (bypassing the None-stripping in
+        :func:`_serialize_update_payload`).
         """
         now = datetime.now(tz=timezone.utc)
         fields: dict[str, Any] = {"status": status}
-        if status == "CONSUMED":
+        explicit_nulls: list[str] = []
+        if status == "ACTIVE":
+            # Source may be CONFIRMED (clean) or FLIPPED (history to
+            # clear). For CONFIRMED these are already NULL, so the
+            # explicit NULL is a no-op. For FLIPPED → ACTIVE, this
+            # is the path that lets the transition pass the CHECK.
+            # ``flipped_direction`` is NOT cleared (preserved per
+            # migration 008).
+            explicit_nulls.extend(["violated_at", "flipped_at"])
+        elif status == "CONSUMED":
             fields["consumed_at"] = now
         elif status == "VIOLATED":
             fields["violated_at"] = now
@@ -383,6 +403,8 @@ class SupabaseLogger:
             fields["flipped_at"] = now
             fields["flipped_direction"] = flipped_direction
         payload = _serialize_update_payload(fields)
+        for col in explicit_nulls:
+            payload[col] = None
         result = (
             self._client.table("zones")
             .update(payload)

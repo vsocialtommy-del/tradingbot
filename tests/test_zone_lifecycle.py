@@ -21,6 +21,7 @@ from bot.strategy.zone_lifecycle import (
     check_consumption,
     check_flip,
     check_violation,
+    flipped_zone_body_broken_since_flip,
     validate_zone_transition,
     zone_bounds_overlap,
 )
@@ -72,6 +73,8 @@ class TestValidateZoneTransition:
             ("ACTIVE", "VIOLATED"),
             ("CONSUMED", "VIOLATED"),
             ("VIOLATED", "FLIPPED"),
+            # PR #38: FLIPPED zones become tradeable in flipped_direction.
+            ("FLIPPED", "ACTIVE"),
         ],
     )
     def test_valid_transitions(self, current: str, new: str) -> None:
@@ -88,8 +91,12 @@ class TestValidateZoneTransition:
             ("CONSUMED", "FLIPPED"),     # must go via VIOLATED
             ("VIOLATED", "CONSUMED"),    # backwards
             ("VIOLATED", "CONFIRMED"),
-            ("FLIPPED", "VIOLATED"),     # terminal
-            ("FLIPPED", "CONFIRMED"),    # terminal
+            # FLIPPED can only go to ACTIVE (PR #38). Other targets
+            # are illegal.
+            ("FLIPPED", "VIOLATED"),
+            ("FLIPPED", "CONFIRMED"),
+            ("FLIPPED", "CONSUMED"),
+            ("FLIPPED", "FLIPPED"),      # self-loop
             ("CONFIRMED", "CONFIRMED"),  # self-loop
         ],
     )
@@ -97,9 +104,13 @@ class TestValidateZoneTransition:
         with pytest.raises(IllegalZoneTransitionError):
             validate_zone_transition(current, new)  # type: ignore[arg-type]
 
-    def test_flipped_has_no_outgoing_transitions(self) -> None:
-        assert _VALID_ZONE_TRANSITIONS["FLIPPED"] == frozenset()
-        assert "FLIPPED" in TERMINAL_ZONE_STATUSES
+    def test_flipped_promotes_to_active(self) -> None:
+        # PR #38: FLIPPED zones become tradeable in flipped_direction.
+        # Placing a setup transitions FLIPPED → ACTIVE.
+        assert _VALID_ZONE_TRANSITIONS["FLIPPED"] == frozenset({"ACTIVE"})
+        # No state is truly terminal any more — every status has at
+        # least one outgoing edge.
+        assert TERMINAL_ZONE_STATUSES == frozenset()
 
     def test_skip_new_setup_statuses_covers_terminal_in_direction(self) -> None:
         assert SKIP_NEW_SETUP_STATUSES == frozenset(
@@ -403,3 +414,129 @@ class TestZoneBoundsOverlap:
         assert zone_bounds_overlap(a, b) is False
         # Tighten to 5.0: 2.0 gap absorbed → overlap.
         assert zone_bounds_overlap(a, b, tolerance=5.0) is True
+
+
+# --------------------------------------------------------------------------- #
+# flipped_zone_body_broken_since_flip — PR #38 pre-trade safety helper
+# --------------------------------------------------------------------------- #
+
+
+class TestFlippedZoneBodyBrokenSinceFlip:
+    """The pre-trade safety check rejects flipped zones whose flip
+    premise has been broken by a body close past the wrong side
+    AFTER the flip moment. Bars before ``flipped_at`` are ignored
+    even if they show breaks — that history predates the flip and
+    isn't relevant."""
+
+    @staticmethod
+    def _df(rows: list[tuple[float, float, float, float]]) -> pd.DataFrame:
+        """rows: (open, high, low, close). Sequential 5-min bars from 2026-01-01."""
+        times = pd.date_range(
+            "2026-01-01T00:00:00Z", periods=len(rows), freq="5min", tz="UTC",
+        )
+        return pd.DataFrame(
+            {
+                "open":  [r[0] for r in rows],
+                "high":  [r[1] for r in rows],
+                "low":   [r[2] for r in rows],
+                "close": [r[3] for r in rows],
+                "volume": [100] * len(rows),
+            },
+            index=times,
+        )
+
+    def test_no_bars_after_flip_means_no_break(self) -> None:
+        # flipped_at equals the last bar's timestamp → no bar strictly
+        # after flip → False.
+        df = self._df([(100, 101, 99, 100)] * 5)
+        flipped_at = df.index[-1]
+        assert flipped_zone_body_broken_since_flip(
+            zone_top=110.0, zone_bottom=105.0,
+            flipped_direction="BUY",
+            flipped_at=flipped_at, df=df,
+        ) is False
+
+    def test_buy_break_below_bottom_after_flip_qualifies(self) -> None:
+        # Zone [105, 110], flipped BUY. A body close at 100 after the
+        # flip is a body break below bottom → True.
+        df = self._df([
+            (100, 101, 99, 100),    # 0 — pre-flip noise (close 100 < 105 but BEFORE flip; ignored)
+            (100, 101, 99, 100),    # 1 — flip happens here
+            (100, 101, 99, 100),    # 2 — post-flip noise (close 100, but 100 < 105 → break)
+        ])
+        flipped_at = df.index[1]
+        # Note: bar 2's close=100 IS < zone.bottom=105, so it qualifies.
+        assert flipped_zone_body_broken_since_flip(
+            zone_top=110.0, zone_bottom=105.0,
+            flipped_direction="BUY",
+            flipped_at=flipped_at, df=df,
+        ) is True
+
+    def test_sell_break_above_top_after_flip_qualifies(self) -> None:
+        df = self._df([
+            (100, 101, 99, 100),    # 0 — pre-flip
+            (100, 101, 99, 100),    # 1 — flip
+            (100, 121, 99, 120),    # 2 — close 120 > top 110
+        ])
+        flipped_at = df.index[1]
+        assert flipped_zone_body_broken_since_flip(
+            zone_top=110.0, zone_bottom=105.0,
+            flipped_direction="SELL",
+            flipped_at=flipped_at, df=df,
+        ) is True
+
+    def test_break_before_flip_is_ignored(self) -> None:
+        # A close below zone.bottom on bar 0 doesn't disqualify if flip
+        # only happened on bar 2. Bar 0 < flipped_at → not scanned.
+        df = self._df([
+            (100, 101, 99, 90),     # 0 — close 90 < 105, but BEFORE flip
+            (100, 101, 99, 107),    # 1
+            (100, 101, 99, 107),    # 2 — flip happens here
+            (100, 101, 99, 107),    # 3 — post-flip, all closes inside [105, 110]
+        ])
+        flipped_at = df.index[2]
+        assert flipped_zone_body_broken_since_flip(
+            zone_top=110.0, zone_bottom=105.0,
+            flipped_direction="BUY",
+            flipped_at=flipped_at, df=df,
+        ) is False
+
+    def test_wick_only_does_not_qualify(self) -> None:
+        # A bar with low=90 (well below zone.bottom=105) but close=107
+        # (inside zone) is NOT a body break. The helper reads close,
+        # not low/high — same convention as check_violation.
+        df = self._df([
+            (107, 108, 90, 107),    # 0 — flip happens here
+            (107, 108, 90, 107),    # 1 — deep wick down but close inside
+        ])
+        flipped_at = df.index[0]
+        assert flipped_zone_body_broken_since_flip(
+            zone_top=110.0, zone_bottom=105.0,
+            flipped_direction="BUY",
+            flipped_at=flipped_at, df=df,
+        ) is False
+
+    def test_close_at_bottom_does_not_qualify_buy(self) -> None:
+        # Strict inequality: close == zone.bottom is NOT a body break.
+        df = self._df([
+            (105, 105, 105, 105),   # 0 — flip
+            (105, 105, 105, 105),   # 1 — close exactly at bottom
+        ])
+        flipped_at = df.index[0]
+        assert flipped_zone_body_broken_since_flip(
+            zone_top=110.0, zone_bottom=105.0,
+            flipped_direction="BUY",
+            flipped_at=flipped_at, df=df,
+        ) is False
+
+    def test_close_at_top_does_not_qualify_sell(self) -> None:
+        df = self._df([
+            (110, 110, 110, 110),
+            (110, 110, 110, 110),
+        ])
+        flipped_at = df.index[0]
+        assert flipped_zone_body_broken_since_flip(
+            zone_top=110.0, zone_bottom=105.0,
+            flipped_direction="SELL",
+            flipped_at=flipped_at, df=df,
+        ) is False
