@@ -1964,3 +1964,206 @@ class TestFlippedZoneAsValidated:
         })
         with pytest.raises(ValueError, match="not properly FLIPPED"):
             _flipped_zone_as_validated(fz)
+
+
+# --------------------------------------------------------------------------- #
+# Price-vs-zone gate (Bug 2 fix) — defer placement when current price
+# hasn't reached the planned Layer 1 entry yet. Applies uniformly to
+# pipeline-detected and flipped zones. The "overshoot past far edge"
+# case stays with order_manager._detect_gap_through.
+# --------------------------------------------------------------------------- #
+
+
+class TestPriceVsZoneGate:
+    def test_buy_pipeline_defers_when_price_above_zone(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Default mock returns bid=1900.0. For a BUY zone [1895, 1900.5],
+        # bid (1900.0) ≤ zone.top (1900.5) → would normally fire. Move
+        # the tick well above the zone → gate defers.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1925.0, "ask": 1925.1, "time": NOW, "time_msc": 0,
+        }
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        b.run_iteration(NOW)
+
+        place.assert_not_called()
+
+    def test_sell_pipeline_defers_when_price_below_zone(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # SELL zone [1900, 1900.5]. ask = 1850 → below zone.bottom →
+        # gate defers (price hasn't risen to the supply zone yet).
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1849.9, "ask": 1850.0, "time": NOW, "time_msc": 0,
+        }
+
+        zone = _make_validated_for_persistence(_PT.DBD)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1840.0)
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        b.run_iteration(NOW)
+
+        place.assert_not_called()
+
+    def test_buy_pipeline_fires_when_price_at_zone(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        # Default fixture has bid=1900.0; BUY zone top=1900.5 → bid ≤
+        # zone.top → gate passes. The default flow runs.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        place = mocker.patch("bot.main.place_layered_orders")
+        place.return_value = mocker.MagicMock(
+            status="PLACED", setup_id=uuid4(),
+            layer_1_ticket=11111, sl_price=1882.5, tp1_price=1907.5,
+            error_messages=[],
+        )
+
+        b.run_iteration(NOW)
+
+        place.assert_called_once()
+
+    def test_sell_pipeline_fires_when_price_at_zone_bottom(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # SELL Layer 1 = zone.bottom = 1900.0. ask = 1900.0 → ask ≥
+        # zone.bottom → gate passes.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1899.9, "ask": 1900.0, "time": NOW, "time_msc": 0,
+        }
+
+        zone = _make_validated_for_persistence(_PT.DBD)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1890.0)
+        place = mocker.patch("bot.main.place_layered_orders")
+        place.return_value = mocker.MagicMock(
+            status="PLACED", setup_id=uuid4(),
+            layer_1_ticket=11111, sl_price=1918.0, tp1_price=1890.0,
+            error_messages=[],
+        )
+
+        b.run_iteration(NOW)
+
+        place.assert_called_once()
+
+    def test_flipped_buy_respects_gate(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Originally-SELL zone flipped to BUY. Layer 1 = zone.top.
+        # Price far above zone → defer (would have been catastrophic
+        # before this fix: BUY at current price way above the zone).
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1925.0, "ask": 1925.1, "time": NOW, "time_msc": 0,
+        }
+
+        fz = _make_flipped_zone_row(
+            original_direction="SELL", flipped_direction="BUY",
+            top=1901.0, bottom=1895.0,
+            flipped_at=NOW - timedelta(hours=1),
+        )
+        mock_supabase.get_zones_by_status.side_effect = (
+            lambda statuses: [fz] if "FLIPPED" in statuses else []
+        )
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        b.run_iteration(NOW)
+
+        place.assert_not_called()
+
+    def test_flipped_sell_respects_gate(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Originally-BUY zone flipped to SELL. Layer 1 = zone.bottom.
+        # Price far below zone → defer. This is the exact scenario from
+        # the production incident: zone at 4733-4739, price at 4713 →
+        # would have fired SELL at 4713 (20 pts of negative slippage).
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1849.9, "ask": 1850.0, "time": NOW, "time_msc": 0,
+        }
+
+        fz = _make_flipped_zone_row(
+            original_direction="BUY", flipped_direction="SELL",
+            top=1905.0, bottom=1900.0,
+            flipped_at=NOW - timedelta(hours=1),
+        )
+        mock_supabase.get_zones_by_status.side_effect = (
+            lambda statuses: [fz] if "FLIPPED" in statuses else []
+        )
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1890.0)
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        b.run_iteration(NOW)
+
+        place.assert_not_called()
+
+    def test_flipped_sell_fires_when_price_reaches_zone(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Same flipped-SELL setup as above, but price has risen to
+        # zone.bottom. Gate now passes; setup fires.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1899.9, "ask": 1900.0, "time": NOW, "time_msc": 0,
+        }
+
+        fz = _make_flipped_zone_row(
+            original_direction="BUY", flipped_direction="SELL",
+            top=1905.0, bottom=1900.0,
+            flipped_at=NOW - timedelta(hours=1),
+        )
+        mock_supabase.get_zones_by_status.side_effect = (
+            lambda statuses: [fz] if "FLIPPED" in statuses else []
+        )
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1890.0)
+        place = mocker.patch("bot.main.place_layered_orders")
+        place.return_value = mocker.MagicMock(
+            status="PLACED", setup_id=uuid4(),
+            layer_1_ticket=11111, sl_price=1922.5, tp1_price=1890.0,
+            error_messages=[],
+        )
+
+        b.run_iteration(NOW)
+
+        place.assert_called_once()
+        # Sanity: the SELL direction propagates through.
+        assert place.call_args.args[0].direction == "SELL"
