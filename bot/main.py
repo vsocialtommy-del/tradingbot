@@ -70,7 +70,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 import httpx
@@ -227,6 +227,18 @@ class Bot:
         self.state = BotState()
         self._stopped = False
 
+        # Idempotency cache for log_zone. Key is
+        # ``ZoneKey = (direction, top_2dp, bottom_2dp, formed_at_iso)``.
+        # Value is the persisted zone row's UUID, so callers can FK to
+        # it without re-querying. Populated on first detection and
+        # rehydrated from DB on Bot.initialize() so a restart doesn't
+        # cause duplicate rows. 2-decimal-place rounding matches the
+        # ``NUMERIC(10,2)`` precision of ``zones.top`` / ``zones.bottom``
+        # — avoids cache misses from float jitter.
+        self._persisted_zone_keys: dict[
+            tuple[str, float, float, str], UUID
+        ] = {}
+
     # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #
@@ -254,9 +266,40 @@ class Bot:
         except Exception:
             logger.exception("bot startup: reconcile failed; continuing")
 
+        # Rehydrate the persisted-zone idempotency cache from DB so a
+        # restart doesn't insert duplicate rows for zones that already
+        # exist. Includes terminal states (FLIPPED) — they still have
+        # a row, so a re-detection of the same physical zone (very
+        # unlikely but possible) wouldn't re-insert.
+        try:
+            self._hydrate_persisted_zone_cache()
+        except Exception:
+            logger.exception(
+                "bot startup: zone-cache hydration failed; will run with "
+                "an empty cache (may re-insert duplicates until lifecycle "
+                "scanner reconciles)"
+            )
+
         now = datetime.now(timezone.utc)
         self.state.last_reconcile = now
         self._refresh_runtime_config(now)
+
+    def _hydrate_persisted_zone_cache(self) -> None:
+        """Load every existing zone row → key cache.
+
+        One query, all statuses. Allows the bot to crash + restart
+        without re-inserting zones it already persisted.
+        """
+        existing = self.supabase.get_zones_by_status(
+            ["CONFIRMED", "ACTIVE", "CONSUMED", "VIOLATED", "FLIPPED"],
+        )
+        for z in existing:
+            key = _zone_key_from_row(z.direction, z.top, z.bottom, z.formed_at)
+            self._persisted_zone_keys[key] = z.id
+        logger.info(
+            f"bot startup: hydrated zone cache from DB "
+            f"({len(self._persisted_zone_keys)} existing zones)"
+        )
 
     def shutdown(self) -> None:
         """Best-effort disconnect. Idempotent. Never raises."""
@@ -538,6 +581,21 @@ class Bot:
         if not zones:
             return
 
+        # Persist every tradeable zone to Supabase BEFORE deciding whether
+        # to place a setup. Each zone gets exactly one row, regardless of
+        # how many times it's re-detected in subsequent pipeline runs
+        # (idempotency via ``_persisted_zone_keys`` cache). This populates
+        # the data trail the lifecycle scanner and dedup pre-flight rely
+        # on, even for zones we never end up trading (no TP1 / SL invalid
+        # / lot=0 / exposure cap / news block).
+        zone_ids: dict[int, UUID] = {}
+        for zone in zones:
+            if not zone.refined_zone.is_tradeable:
+                continue
+            zid = self._persist_zone_if_new(zone)
+            if zid is not None:
+                zone_ids[id(zone)] = zid
+
         # Exposure cap.
         try:
             active_setups = self.position_tracker.get_active_setups()
@@ -547,6 +605,19 @@ class Bot:
         active_count = count_active_setups(active_setups)
 
         for zone in zones:
+            # Placement requires the loosened-rules Strong Point gate too
+            # (size-passed AND not body-broken since formation). Persisted
+            # but non-Strong-Point zones (body-broken) live in the cache
+            # for future lifecycle transitions.
+            if not zone.is_strong_point:
+                continue
+            zid = zone_ids.get(id(zone))
+            if zid is None:
+                logger.warning(
+                    "skipping placement: zone wasn't persisted "
+                    f"({zone.direction} {zone.bottom:.2f}-{zone.top:.2f})"
+                )
+                continue
             exp = check_exposure(
                 active_count=active_count,
                 max_simultaneous=self.config.max_simultaneous_setups,
@@ -558,9 +629,36 @@ class Bot:
                     f"({exp.current_count}/{exp.max_allowed})"
                 )
                 break
-            if self._try_place_setup(zone, df):
+            if self._try_place_setup(zone, df, zid):
                 active_count += 1
                 self.state.placed_setup_count += 1
+
+    def _persist_zone_if_new(self, zone: ValidatedZone) -> UUID | None:
+        """Insert the zone row (status=CONFIRMED) if not already cached.
+
+        Returns the row UUID on success or cache hit; ``None`` on
+        Supabase failure (the zone is skipped for this iteration; a
+        later detection will retry).
+        """
+        key = _zone_key_from_validated(zone)
+        cached = self._persisted_zone_keys.get(key)
+        if cached is not None:
+            return cached
+        try:
+            zone_row = self.supabase.log_zone(_zone_to_input(zone))
+            zone_id = UUID(str(zone_row["id"]))
+        except Exception:
+            logger.exception(
+                f"log_zone failed for {zone.direction} "
+                f"{zone.bottom:.2f}-{zone.top:.2f}; will retry next iteration"
+            )
+            return None
+        self._persisted_zone_keys[key] = zone_id
+        logger.info(
+            f"zone persisted: id={zone_id} {zone.direction} "
+            f"{zone.bottom:.2f}-{zone.top:.2f} formed_at={zone.formed_at}"
+        )
+        return zone_id
 
     def _run_zone_lifecycle(self, df: pd.DataFrame) -> None:
         """Apply consumption / violation / flip detection to the last bar.
@@ -655,9 +753,13 @@ class Bot:
             )
 
     def _try_place_setup(
-        self, zone: ValidatedZone, ohlc_df: pd.DataFrame,
+        self, zone: ValidatedZone, ohlc_df: pd.DataFrame, zone_id: UUID,
     ) -> bool:
-        """Compute SL + lot size, validate, log zone, place orders.
+        """Compute SL + TP1 + lot size, validate, place orders.
+
+        ``zone_id`` is supplied by the caller — the zone row was already
+        inserted (or looked up from cache) by ``_persist_zone_if_new``
+        before we got here. Setup row FKs to it.
 
         Returns True iff ``order_manager.place_layered_orders`` reported
         ``PLACED`` (not FAILED, not SKIPPED-via-gap).
@@ -729,15 +831,8 @@ class Bot:
             )
             return False
 
-        # 4. Persist the zone (so the setup can FK to it).
-        try:
-            zone_row = self.supabase.log_zone(_zone_to_input(zone))
-            zone_id = UUID(str(zone_row["id"]))
-        except Exception:
-            logger.exception("new setup: log_zone failed; skipping zone")
-            return False
-
-        # 5. Place orders.
+        # 4. Place orders. (Zone row already persisted by
+        # ``_persist_zone_if_new``; ``zone_id`` was passed in.)
         try:
             result = place_layered_orders(
                 zone, zone_id,
@@ -894,6 +989,44 @@ def _parse_pause_until(raw: object) -> datetime | None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
     return None
+
+
+def _zone_key_from_validated(
+    zone: ValidatedZone,
+) -> tuple[str, float, float, str]:
+    """Idempotency key for an in-memory ``ValidatedZone``.
+
+    Matches the natural composite key on the ``zones`` table:
+    ``(direction, top, bottom, formed_at)``. Top / bottom are rounded
+    to 2 decimal places to match the ``NUMERIC(10,2)`` DB precision
+    — pipeline re-runs may produce float-equal-but-not-identical
+    values for the same physical zone, so unrounded comparisons would
+    miss cache hits.
+    """
+    return (
+        zone.direction,
+        round(float(zone.top), 2),
+        round(float(zone.bottom), 2),
+        zone.formed_at.isoformat(),
+    )
+
+
+def _zone_key_from_row(
+    direction: str, top: Any, bottom: Any, formed_at: datetime,
+) -> tuple[str, float, float, str]:
+    """Idempotency key for a DB row (from :class:`Zone` read model).
+
+    Symmetric with :func:`_zone_key_from_validated`. ``top`` and
+    ``bottom`` arrive as ``Decimal`` from Supabase; ``formed_at`` as
+    a ``datetime``. Both get normalised the same way as the in-memory
+    side so cache hits work across the boundary.
+    """
+    return (
+        direction,
+        round(float(top), 2),
+        round(float(bottom), 2),
+        formed_at.isoformat(),
+    )
 
 
 def _zone_to_input(zone: ValidatedZone) -> ZoneInput:

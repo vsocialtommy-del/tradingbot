@@ -202,13 +202,18 @@ class TestPipelineComposition:
 # --------------------------------------------------------------------------- #
 
 
-class TestFilters:
-    def test_non_tradeable_refined_zone_short_circuits_at_validate(
+class TestPipelineReturnSurface:
+    """The pipeline returns *every* validated zone (tradeable or not) so
+    the caller can persist them for the data trail. Filtering for
+    placement happens downstream in ``main._maybe_run_strategy``."""
+
+    def test_non_tradeable_refined_zone_still_returned(
         self, mocker: MockerFixture,
     ) -> None:
-        # validate is called even for non-tradeable refined zones — it
-        # short-circuits internally with "NOT_TRADEABLE" failure.
-        # Pipeline keeps the call but filters non-strong-point results.
+        # A zone that failed the size filter returns
+        # ``is_strong_point=False`` from the validator (short-circuits
+        # with NOT_TRADEABLE). The pipeline still emits it — the
+        # caller decides what to do (persist? skip?).
         stubs = patch_stages(
             mocker,
             patterns=[make_pattern()],
@@ -218,10 +223,11 @@ class TestFilters:
             validated_results=[make_validated(is_strong_point=False)],
         )
         result = run_strategy_pipeline(make_df())
-        assert result == []
+        assert len(result) == 1
+        assert result[0].is_strong_point is False
         stubs["validate"].assert_called_once()
 
-    def test_non_strong_point_validated_filtered_out(
+    def test_non_strong_point_validated_still_returned(
         self, mocker: MockerFixture,
     ) -> None:
         patch_stages(
@@ -230,7 +236,27 @@ class TestFilters:
             validated_results=[make_validated(is_strong_point=False)],
         )
         result = run_strategy_pipeline(make_df())
-        assert result == []
+        assert len(result) == 1
+        assert result[0].is_strong_point is False
+
+    def test_mixed_strong_and_weak_zones_all_returned(
+        self, mocker: MockerFixture,
+    ) -> None:
+        # Three patterns: one is a Strong Point, one isn't tradeable,
+        # one is tradeable but body-broken (is_strong_point=False).
+        # All three come through.
+        patch_stages(
+            mocker,
+            patterns=[make_pattern(), make_pattern(), make_pattern()],
+            validated_results=[
+                make_validated(is_strong_point=True),
+                make_validated(is_strong_point=False),
+                make_validated(is_strong_point=False),
+            ],
+        )
+        result = run_strategy_pipeline(make_df())
+        assert len(result) == 3
+        assert sum(1 for v in result if v.is_strong_point) == 1
 
 
 # --------------------------------------------------------------------------- #
