@@ -1,60 +1,51 @@
-"""Strong Point setup — break-and-close validation.
+"""Strong Point gate — loosened entry rules (May 2026 refinement).
 
-The v1 trade setup (spec ``docs/strategy_reference/README.md``,
-Setup 1). Operates on RBR/DBR demand zones (BUY) and DBD/RBD supply
-zones (SELL). For each pattern, the validator asks one question:
+Background
+----------
+Earlier versions required a **break-and-close** confirmation before a
+zone became tradeable: a body close past the nearest opposite-side
+structural swing. That waited for a "Strong Point" structural signal
+before letting a setup fire. It also pinned SL to a structural swing
+(``sl_anchor_swing``).
 
-    Has price broken the nearest opposite-side structural swing with
-    a body close, after the pattern formed?
+The user has loosened both rules: trade on the **first retest** of any
+fresh size-filter-passing zone, with SL pinned to the zone bound
+itself plus a fixed buffer. The TP1 target moves out of this module
+into :mod:`bot.strategy.tp1_target` (nearest local peak/low).
 
-* For a **BUY** zone (demand): "nearest opposite" = the nearest swing
-  HIGH above the zone, after pattern formation. A bar's body must
-  close above that swing's price.
-* For a **SELL** zone (supply): mirror — nearest swing LOW below the
-  zone, body close below.
+What this module now does
+-------------------------
 
-If yes, the zone is a confirmed Strong Point and tradeable on every
-subsequent retest until either TP1 hits or the zone is invalidated by
-an opposite-side body close.
+1. :func:`validate_strong_point` is a **passthrough** that returns
+   ``is_strong_point=True`` for every zone whose size filter passed
+   (:attr:`RefinedZone.is_tradeable`), **except** when the zone has
+   already been body-closed past in the wrong direction since
+   pattern formation. That last check is a minimal safety net:
+   ``zones`` rows that have transitioned to VIOLATED are caught by
+   the dedup pre-flight (PR #35), but a freshly-detected pattern
+   may have been broken between formation and detection without
+   ever being persisted — the lifecycle system can't catch that.
 
-Output: :class:`ValidatedZone`. Carries the broken swing (for TP1)
-and the SL anchor swing (the swing on the OPPOSITE side of the zone —
-nearest high for SELL, nearest low for BUY). The engine reads
-``sl_anchor_swing`` to position the stop; the spec says SL = 15-20
-pips above/below this swing, **not** above/below the zone itself.
+2. :func:`compute_sl_price` derives SL straight from the zone bound:
+   ``zone.bottom - sl_buffer_points`` for BUY, mirror for SELL.
 
-Reasons for failure (mutually exclusive, in priority order)
------------------------------------------------------------
+What this module does NOT do
+----------------------------
+- It does not consume :class:`~bot.strategy.structure.Swing` lists
+  any more — the BoS target / SL anchor logic is gone.
+- It does not compute TP1 — that lives in
+  :mod:`bot.strategy.tp1_target` so the orchestrator can decide
+  whether a fresh zone has a tradeable TP1 before committing to
+  order placement.
 
-* ``NOT_TRADEABLE``           — upstream zone refinement rejected it
-                                (size filter); short-circuit, don't
-                                bother with the break check.
-* ``NO_SWING_ABOVE`` /
-  ``NO_SWING_BELOW``           — no structural swing exists on the
-                                opposite side, so there's nothing to
-                                break.
-* ``NO_SL_ANCHOR``             — no structural swing on the same side
-                                as the zone (need one for SL).
-* ``NO_BREAK_YET``             — swing exists, no bar has body-closed
-                                past it yet. The zone is still a
-                                "pending" candidate — pipeline will
-                                re-evaluate on subsequent bars.
-* ``INVALIDATED``              — an opposite-side body close past the
-                                zone happened before any valid break.
-                                Zone is dead.
-
-Re-entry semantics
-------------------
-
-Once ``is_strong_point=True``, the zone stays tradeable until either:
-
-* A bar's body closes on the opposite side of the zone (BUY:
-  body close below zone.bottom; SELL mirror) — invalidates.
-* The engine reports TP1 hit — cycle complete.
-
-This module doesn't track invalidation-after-validation; that's the
-engine's job (it sees each bar's close). The validator just reports
-"yes Strong Point as of bar X" or "not yet".
+``ValidatedZone`` shape
+-----------------------
+Kept stable for downstream type-stability — ``broken_swing``,
+``broken_at``, and ``sl_anchor_swing`` are all permanently ``None``
+in the loosened flow but the fields stay on the dataclass so a
+future tightening doesn't churn the schema. ``validation_failures``
+now carries at most one of ``NOT_TRADEABLE`` or
+``ZONE_VIOLATED_BEFORE_RETEST``.
 """
 
 from __future__ import annotations
@@ -73,33 +64,31 @@ from bot.strategy.zone_refinement import RefinedZone
 
 ValidationFailure = Literal[
     "NOT_TRADEABLE",
-    "NO_SWING_ABOVE",
-    "NO_SWING_BELOW",
-    "NO_SL_ANCHOR",
-    "NO_BREAK_YET",
-    "INVALIDATED",
+    "ZONE_VIOLATED_BEFORE_RETEST",
 ]
 
 
 @dataclass(frozen=True)
 class StrongPointConfig:
-    """Tunables for Strong Point validation.
-
-    Most thresholds moved to ``PatternConfig`` (impulse / base
-    criteria — that's pattern detection's job). What remains here:
-    the SL buffer, applied to the anchor swing's price.
-    """
+    """Tunables for the (now minimal) Strong Point gate."""
 
     sl_buffer_points: float = 17.5
-    """Buffer in price units (= $17.50 for XAUUSD) added to the anchor
-    swing's price. Spec wording: '15-20 pips above the nearest high'
-    for SELL; mirror for BUY. 17.5 is the midpoint of that band.
+    """Buffer in price units below the zone bottom (BUY) or above the
+    zone top (SELL). Applied directly to the zone bound — no swing
+    anchor. Spec wording: '$17.50 below the zone for BUY' (mirror SELL).
     """
 
 
 @dataclass(frozen=True)
 class ValidatedZone:
-    """Output of :func:`validate_strong_point`."""
+    """Output of :func:`validate_strong_point`.
+
+    Field surface kept stable across the methodology change so
+    downstream consumers (``order_manager``, ``main.py``, dashboard)
+    don't need to fork their typing. In the loosened flow,
+    ``broken_swing`` / ``broken_at`` / ``sl_anchor_swing`` are always
+    ``None``.
+    """
 
     direction: Direction
     top: float
@@ -112,21 +101,14 @@ class ValidatedZone:
     validation_failures: list[ValidationFailure]
 
     broken_swing: Swing | None
-    """The swing whose break confirmed the Strong Point.
-    BUY: nearest high above zone; SELL: nearest low below zone.
-    None when not yet validated."""
+    """Always ``None`` in the loosened flow. Kept for shape stability."""
 
     broken_at: pd.Timestamp | None
-    """Bar time at which the body-close break was confirmed.
-    None when not yet validated."""
+    """Always ``None`` in the loosened flow."""
 
     sl_anchor_swing: Swing | None
-    """The OPPOSITE-side swing the SL pins to.
-    BUY zone → nearest swing LOW below the zone (SL = anchor.price -
-    sl_buffer_points).
-    SELL zone → nearest swing HIGH above the zone (SL = anchor.price +
-    sl_buffer_points).
-    None when no such swing exists in the lookback window."""
+    """Always ``None`` in the loosened flow. SL is zone-bound based;
+    see :func:`compute_sl_price`."""
 
 
 # --------------------------------------------------------------------------- #
@@ -137,67 +119,37 @@ class ValidatedZone:
 def validate_strong_point(
     refined: RefinedZone,
     df: pd.DataFrame,
-    swings: list[Swing],
     config: StrongPointConfig | None = None,
 ) -> ValidatedZone:
-    """Return a Strong Point verdict for ``refined``.
+    """Decide whether ``refined`` is currently tradeable.
 
-    Parameters
-    ----------
-    refined
-        Output of :func:`zone_refinement.refine_zone`.
-    df
-        The same DataFrame the pattern was detected in. We read bar
-        close prices (post-pattern bars) to find the break candidate.
-    swings
-        All confirmed swings in the df (typically from
-        :func:`structure.analyze_structure`). We filter to swings
-        relevant to this zone.
+    Two gates only:
+
+    1. Size filter (delegated to :func:`refine_zone` upstream).
+    2. Body-break safety: if any bar **after** pattern formation has
+       already body-closed past the wrong-side zone bound, the zone
+       is dead and we won't enter on retest. This is the minimal
+       protection against trading "obviously broken" zones whose
+       persisted state hasn't been written yet (so the lifecycle
+       dedup can't catch them).
+
+    No break-and-close confirmation. No SL anchor lookup. No swing
+    list. Pure pass / fail.
     """
-    cfg = config or StrongPointConfig()
+    del config  # unused — kept in signature for symmetry / future use
     failures: list[ValidationFailure] = []
 
-    # 1. Short-circuit: zone failed the size filter upstream.
     if not refined.is_tradeable:
         failures.append("NOT_TRADEABLE")
         return _build_unvalidated(refined, failures)
 
-    # 2. Find the SL anchor swing (same side as the zone — opposite
-    #    direction from the trade). Without it we can't position SL.
-    sl_anchor = _find_sl_anchor(refined, swings)
-    if sl_anchor is None:
-        failures.append("NO_SL_ANCHOR")
+    if _zone_body_broken_since_formation(refined, df):
+        failures.append("ZONE_VIOLATED_BEFORE_RETEST")
         return _build_unvalidated(refined, failures)
 
-    # 3. Find the structural swing the break candidate must clear.
-    break_target = _find_break_target(refined, swings)
-    if break_target is None:
-        failures.append(
-            "NO_SWING_ABOVE" if refined.direction == "BUY"
-            else "NO_SWING_BELOW"
-        )
-        return _build_unvalidated(refined, failures, sl_anchor=sl_anchor)
-
-    # 4. Scan bars AFTER pattern formation for either:
-    #    - a body close past break_target → Strong Point validated
-    #    - an opposite-side body close past the zone → INVALIDATED first
-    pattern_end_idx = refined.source_pattern.impulse_after.end_index
-    break_outcome = _scan_for_break(
-        refined, df, pattern_end_idx, break_target,
-    )
-    if break_outcome.invalidated_before_break:
-        failures.append("INVALIDATED")
-        return _build_unvalidated(refined, failures, sl_anchor=sl_anchor)
-    if break_outcome.broken_at is None:
-        failures.append("NO_BREAK_YET")
-        return _build_unvalidated(refined, failures, sl_anchor=sl_anchor)
-
-    # All gates passed — Strong Point confirmed.
     logger.debug(
-        "Strong Point confirmed: {} zone {:.2f}-{:.2f} "
-        "broke {} at {:.2f} (sl anchor {:.2f})",
+        "Strong Point (passthrough): {} zone {:.2f}-{:.2f} tradeable",
         refined.direction, refined.bottom, refined.top,
-        break_target.kind, break_target.price, sl_anchor.price,
     )
     return ValidatedZone(
         direction=refined.direction,
@@ -208,31 +160,27 @@ def validate_strong_point(
         refined_zone=refined,
         is_strong_point=True,
         validation_failures=[],
-        broken_swing=break_target,
-        broken_at=break_outcome.broken_at,
-        sl_anchor_swing=sl_anchor,
+        broken_swing=None,
+        broken_at=None,
+        sl_anchor_swing=None,
     )
 
 
 def compute_sl_price(
     validated: ValidatedZone, config: StrongPointConfig | None = None,
 ) -> float:
-    """SL = anchor_swing.price ± buffer.
+    """SL = zone bound ± buffer.
 
-    Strategy-side helper for the engine. BUY zone: SL = anchor.price -
-    buffer (anchor is a swing LOW below the zone). SELL zone: SL =
-    anchor.price + buffer (anchor is a swing HIGH above the zone).
+    * BUY:  ``zone.bottom - sl_buffer_points``
+    * SELL: ``zone.top    + sl_buffer_points``
+
+    The previous swing-anchor variant is gone — under the loosened
+    rules the zone bound is the structural reference.
     """
-    if validated.sl_anchor_swing is None:
-        raise ValueError(
-            "cannot compute SL for a zone without sl_anchor_swing "
-            "(validation must have failed upstream)"
-        )
     cfg = config or StrongPointConfig()
-    anchor = validated.sl_anchor_swing
     if validated.direction == "BUY":
-        return float(anchor.price - cfg.sl_buffer_points)
-    return float(anchor.price + cfg.sl_buffer_points)
+        return float(validated.bottom - cfg.sl_buffer_points)
+    return float(validated.top + cfg.sl_buffer_points)
 
 
 # --------------------------------------------------------------------------- #
@@ -240,124 +188,38 @@ def compute_sl_price(
 # --------------------------------------------------------------------------- #
 
 
-@dataclass(frozen=True)
-class _BreakOutcome:
-    broken_at: pd.Timestamp | None
-    invalidated_before_break: bool
+def _zone_body_broken_since_formation(
+    refined: RefinedZone, df: pd.DataFrame,
+) -> bool:
+    """True iff any bar after the pattern body-closed past the wrong side.
 
+    For BUY: bar's close < zone.bottom (any bar).
+    For SELL: bar's close > zone.top.
 
-def _find_break_target(
-    refined: RefinedZone, swings: list[Swing],
-) -> Swing | None:
-    """The OPPOSITE-side swing the break candidate must body-close past.
-
-    BUY zone (demand): need to break a swing HIGH that exists ABOVE
-    the zone. Of all qualifying swings, take the NEAREST — i.e. the
-    LOWEST-priced high above (closest to zone top).
-
-    SELL zone (supply): mirror — HIGHEST-priced low below zone.
-
-    Only swings at-or-before pattern formation are considered (a
-    swing formed AFTER the pattern can't be a structural target
-    that existed when the pattern emerged).
+    Body-close only — a wick poking through doesn't count, matching
+    the lifecycle module's :func:`zone_lifecycle.check_violation`
+    convention. The scan begins one bar after
+    ``pattern.impulse_after.end_index`` (the zone's formation bar);
+    the formation bar itself can't be a "broken since formation"
+    candidate by definition.
     """
     pattern_end_idx = refined.source_pattern.impulse_after.end_index
-    eligible = [s for s in swings if s.index <= pattern_end_idx]
-    if refined.direction == "BUY":
-        candidates = [
-            s for s in eligible
-            if s.kind == "HIGH" and s.price > refined.top
-        ]
-        if not candidates:
-            return None
-        return min(candidates, key=lambda s: s.price)
-    # SELL
-    candidates = [
-        s for s in eligible
-        if s.kind == "LOW" and s.price < refined.bottom
-    ]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda s: s.price)
-
-
-def _find_sl_anchor(
-    refined: RefinedZone, swings: list[Swing],
-) -> Swing | None:
-    """The SAME-side swing the SL pins to.
-
-    BUY zone: nearest swing LOW below zone — closest to zone bottom,
-    i.e. HIGHEST-priced low below.
-
-    SELL zone: nearest swing HIGH above zone — closest to zone top,
-    i.e. LOWEST-priced high above.
-    """
-    pattern_end_idx = refined.source_pattern.impulse_after.end_index
-    eligible = [s for s in swings if s.index <= pattern_end_idx]
-    if refined.direction == "BUY":
-        candidates = [
-            s for s in eligible
-            if s.kind == "LOW" and s.price < refined.bottom
-        ]
-        if not candidates:
-            return None
-        return max(candidates, key=lambda s: s.price)
-    # SELL
-    candidates = [
-        s for s in eligible
-        if s.kind == "HIGH" and s.price > refined.top
-    ]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda s: s.price)
-
-
-def _scan_for_break(
-    refined: RefinedZone,
-    df: pd.DataFrame,
-    pattern_end_idx: int,
-    break_target: Swing,
-) -> _BreakOutcome:
-    """Walk forward from pattern_end_idx + 1; report the first conclusive bar.
-
-    On each bar, check in priority order:
-      1. Invalidation (opposite-side body close past zone) → INVALIDATED
-      2. Validation (body close past break_target) → Strong Point confirmed
-    Stops on the first conclusive event. If we hit the end of df
-    without either, returns pending state.
-    """
+    n = len(df)
+    if pattern_end_idx + 1 >= n:
+        return False
     closes = df["close"].to_numpy()
-    times = df.index
-    n = len(closes)
-
     for i in range(pattern_end_idx + 1, n):
         bar_close = float(closes[i])
-        if refined.direction == "BUY":
-            if bar_close < refined.bottom:
-                return _BreakOutcome(
-                    broken_at=None, invalidated_before_break=True,
-                )
-            if bar_close > break_target.price:
-                return _BreakOutcome(
-                    broken_at=times[i], invalidated_before_break=False,
-                )
-        else:  # SELL
-            if bar_close > refined.top:
-                return _BreakOutcome(
-                    broken_at=None, invalidated_before_break=True,
-                )
-            if bar_close < break_target.price:
-                return _BreakOutcome(
-                    broken_at=times[i], invalidated_before_break=False,
-                )
-
-    return _BreakOutcome(broken_at=None, invalidated_before_break=False)
+        if refined.direction == "BUY" and bar_close < refined.bottom:
+            return True
+        if refined.direction == "SELL" and bar_close > refined.top:
+            return True
+    return False
 
 
 def _build_unvalidated(
     refined: RefinedZone,
     failures: list[ValidationFailure],
-    *, sl_anchor: Swing | None = None,
 ) -> ValidatedZone:
     """ValidatedZone for any non-success path."""
     return ValidatedZone(
@@ -371,5 +233,5 @@ def _build_unvalidated(
         validation_failures=failures,
         broken_swing=None,
         broken_at=None,
-        sl_anchor_swing=sl_anchor,
+        sl_anchor_swing=None,
     )

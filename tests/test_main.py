@@ -554,25 +554,20 @@ class TestStrategyPipeline:
         b.state.last_config_refresh = NOW
         b.state.last_m5_bar_time = None
 
-        # Build a real ValidatedZone (PR #31 zone shape). MagicMock
-        # zones used to work but post-fix-up _zone_to_input reads
-        # zone.source_pattern.pattern_type.value which the supabase
-        # logger's pydantic literal validates.
+        # Real ValidatedZone (the loosened-rules shape — all break-and-
+        # close fields are None; SL/TP1 are computed in main from the
+        # zone bounds + ohlc).
         zone = _make_validated_for_persistence(_PT.RBR)
-        # Anchor swing so the engine doesn't bail with no_sl_anchor.
-        ts = pd.Timestamp("2026-05-08T12:00:00Z")
-        anchor = Swing(index=0, time=ts, price=1880.0, kind="LOW")
-        zone = _ValidatedZone(
-            direction=zone.direction, top=zone.top, bottom=zone.bottom,
-            formed_at=zone.formed_at, source_pattern=zone.source_pattern,
-            refined_zone=zone.refined_zone,
-            is_strong_point=True, validation_failures=[],
-            broken_swing=None, broken_at=None,
-            sl_anchor_swing=anchor,
-        )
 
         mocker.patch(
             "bot.main.run_strategy_pipeline", return_value=[zone],
+        )
+        # The local-peak finder needs at least one peak above Layer 1's
+        # entry (= zone.top = 1900.5). Patch it directly to keep the
+        # OHLC fixture flat and the test focused on the place-orders
+        # branch.
+        mocker.patch(
+            "bot.main.find_nearest_local_peak", return_value=1907.5,
         )
         place = mocker.patch(
             "bot.main.place_layered_orders",
@@ -585,6 +580,8 @@ class TestStrategyPipeline:
 
         b.run_iteration(NOW)
         place.assert_called_once()
+        # tp1_price flows through as a kwarg.
+        assert place.call_args.kwargs["tp1_price"] == 1907.5
         assert b.state.placed_setup_count == 1
 
     def test_exposure_cap_blocks_further_placements(
@@ -1192,16 +1189,6 @@ class TestDedupSkip:
         b.state.last_m5_bar_time = None
 
         zone = _make_validated_for_persistence(_PT.RBR)
-        ts = pd.Timestamp("2026-05-08T12:00:00Z")
-        anchor = Swing(index=0, time=ts, price=1880.0, kind="LOW")
-        zone = _ValidatedZone(
-            direction=zone.direction, top=zone.top, bottom=zone.bottom,
-            formed_at=zone.formed_at, source_pattern=zone.source_pattern,
-            refined_zone=zone.refined_zone,
-            is_strong_point=True, validation_failures=[],
-            broken_swing=None, broken_at=None,
-            sl_anchor_swing=anchor,
-        )
 
         # Existing CONSUMED zone far away — no overlap.
         existing = _make_zone_row(
@@ -1210,6 +1197,7 @@ class TestDedupSkip:
         )
         mock_supabase.get_zones_by_status.return_value = [existing]
         mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
         place = mocker.patch("bot.main.place_layered_orders")
         place.return_value = mocker.MagicMock(
             status="PLACED", setup_id=uuid4(),
@@ -1256,3 +1244,146 @@ class TestDedupSkip:
         b.run_iteration(NOW)
 
         place.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Loosened-rules entry flow (May 2026)
+# Test the new TP1 path + zone-bound SL flow that lives in _try_place_setup.
+# --------------------------------------------------------------------------- #
+
+
+class TestLoosenedRulesEntry:
+    def test_no_local_peak_skips_zone(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        # When find_nearest_local_peak returns None, we skip the zone
+        # — no log_zone, no place_layered_orders.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=None)
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        b.run_iteration(NOW)
+
+        place.assert_not_called()
+        assert b.state.placed_setup_count == 0
+
+    def test_sl_formula_uses_zone_bound(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        # Loosened-rules SL = zone.bottom - sl_buffer_points (BUY).
+        # Default buffer 17.5 → SL = 1900.0 - 17.5 = 1882.5
+        # (zone built by _make_validated_for_persistence: 1900.0 - 1900.5).
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        place = mocker.patch("bot.main.place_layered_orders")
+        place.return_value = mocker.MagicMock(
+            status="PLACED", setup_id=uuid4(),
+            layer_1_ticket=11111, sl_price=1882.5, tp1_price=1907.5,
+            error_messages=[],
+        )
+
+        b.run_iteration(NOW)
+
+        place.assert_called_once()
+        assert place.call_args.kwargs["sl_price"] == pytest.approx(1882.5)
+
+    def test_tp1_lookup_uses_layer_1_entry_for_buy(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        # BUY → reference = zone.top.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        zone = _make_validated_for_persistence(_PT.RBR)  # BUY, top=1900.5
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        peak = mocker.patch(
+            "bot.main.find_nearest_local_peak", return_value=1907.5,
+        )
+        mocker.patch("bot.main.place_layered_orders").return_value = (
+            mocker.MagicMock(
+                status="PLACED", setup_id=uuid4(),
+                layer_1_ticket=11111, sl_price=1882.5, tp1_price=1907.5,
+                error_messages=[],
+            )
+        )
+
+        b.run_iteration(NOW)
+
+        # Verify the entry_price passed into the peak finder is the
+        # zone's Layer 1 entry (= zone.top for BUY).
+        call_kwargs = peak.call_args.kwargs
+        assert call_kwargs["entry_price"] == pytest.approx(1900.5)
+        assert call_kwargs["direction"] == "BUY"
+
+    def test_tp1_lookup_uses_layer_1_entry_for_sell(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        # SELL → reference = zone.bottom.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        zone = _make_validated_for_persistence(_PT.DBD)  # SELL, bottom=1900.0
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        peak = mocker.patch(
+            "bot.main.find_nearest_local_peak", return_value=1890.0,
+        )
+        mocker.patch("bot.main.place_layered_orders").return_value = (
+            mocker.MagicMock(
+                status="PLACED", setup_id=uuid4(),
+                layer_1_ticket=11111, sl_price=1918.0, tp1_price=1890.0,
+                error_messages=[],
+            )
+        )
+
+        b.run_iteration(NOW)
+
+        call_kwargs = peak.call_args.kwargs
+        assert call_kwargs["entry_price"] == pytest.approx(1900.0)
+        assert call_kwargs["direction"] == "SELL"
+
+    def test_tp1_lookback_threaded_from_config(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        # Operator can tune the lookback via StrategyPipelineConfig and
+        # the value flows through to the peak finder.
+        from bot.strategy.pipeline import StrategyPipelineConfig
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        b.strategy_pipeline_config = StrategyPipelineConfig(
+            tp1_local_peak_lookback_bars=123,
+        )
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        peak = mocker.patch(
+            "bot.main.find_nearest_local_peak", return_value=1907.5,
+        )
+        mocker.patch("bot.main.place_layered_orders").return_value = (
+            mocker.MagicMock(
+                status="PLACED", setup_id=uuid4(),
+                layer_1_ticket=11111, sl_price=1882.5, tp1_price=1907.5,
+                error_messages=[],
+            )
+        )
+
+        b.run_iteration(NOW)
+
+        assert peak.call_args.kwargs["lookback_bars"] == 123

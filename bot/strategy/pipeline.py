@@ -1,41 +1,40 @@
-"""Strategy detection pipeline — Supply & Demand methodology.
+"""Strategy detection pipeline — loosened entry rules (May 2026).
 
 Stitches the per-stage modules into a single ``run_strategy_pipeline``
-the bot loop calls. v1 only implements the **Strong Point** setup;
-CHoCH / Imbalance / SnD Flip are layered on the same RBR/DBD/DBR/RBD
-foundation in later phases.
+the bot loop calls.
+
+The previous break-and-close Strong Point gate is gone; zones are
+tradeable on the first retest once they pass the size filter and
+haven't been body-broken since formation. TP1 is computed by the
+orchestrator (``main._try_place_setup``) via
+:mod:`bot.strategy.tp1_target` so it can skip zones without a
+qualifying peak before committing to order placement.
 
 ::
 
-    OHLC df ─► analyze_structure (swings + BoS events)
-            ─► detect_patterns (impulse → base → RBR/DBD/DBR/RBD)
-            ─► mark_zone (body envelope of base)        per pattern
-            ─► refine_zone (size filter)                per pattern
-            ─► validate_strong_point (break-and-close + SL anchor)
+    OHLC df ─► detect_patterns (impulse → base → RBR/DBD/DBR/RBD)
+            ─► mark_zone (wick envelope of base)            per pattern
+            ─► refine_zone (size filter)                    per pattern
+            ─► validate_strong_point (passthrough + body-break safety)
             ─► [ValidatedZone, …]  (only is_strong_point=True returned)
 
 Design decisions
 ----------------
 
-1. **Stateless function, M5-close gating in the caller.** No internal
-   cache; every call processes the slice the engine passes in. The
-   engine ensures that slice is ``pipeline_window_bars`` long
-   (default 250) so per-call cost is bounded.
+1. **No structure analysis here.** The old break-target swing lookup
+   is removed. Structure is still computed elsewhere (the lifecycle
+   FLIP detector in ``main._run_zone_lifecycle``), but not as part of
+   the per-pattern strategy pipeline. That drops one
+   :func:`analyze_structure` call per M5 close.
 
 2. **Per-pattern try/except.** A single malformed pattern shouldn't
-   nuke the batch; we log + skip.
+   nuke the batch.
 
-3. **Imbalance not called.** The deprecated ``bot.strategy.imbalance``
-   was W/M-based and doesn't match the user's actual Imbalance
-   setup spec (setup #4 — fresh Strong Point + 2 failed approaches).
-   It'll be rebuilt when we tackle setup #4; until then it sits as
-   dead code and the pipeline routes around it.
+3. **Imbalance not called.** Same as before — deferred to setup #4.
 
-4. **Only confirmed Strong Points returned.** Patterns that haven't
-   yet had their break-and-close are filtered out at this layer
-   (their ``ValidatedZone.is_strong_point`` is False). The caller
-   doesn't need to know about pending candidates — they'll show up
-   in subsequent pipeline calls once the break confirms.
+4. **Only tradeable zones returned.** Patterns whose validator
+   returned ``is_strong_point=False`` (size-filter reject or
+   body-broken pre-retest) are filtered out at this layer.
 """
 
 from __future__ import annotations
@@ -54,10 +53,6 @@ from bot.strategy.strong_point import (
     ValidatedZone,
     validate_strong_point,
 )
-from bot.strategy.structure import (
-    StructureConfig,
-    analyze_structure,
-)
 from bot.strategy.zone_marking import mark_zone
 from bot.strategy.zone_refinement import (
     RefinementConfig,
@@ -68,9 +63,6 @@ from bot.strategy.zone_refinement import (
 @dataclass(frozen=True)
 class StrategyPipelineConfig:
     """Aggregate of all per-stage tunables. Defaults mirror per-module defaults."""
-
-    # Structure (still used for SL anchor + break target swings)
-    swing_strength: int = 2
 
     # Pattern detection (S&D)
     impulse_body_to_range_ratio_min: float = 0.6
@@ -87,22 +79,22 @@ class StrategyPipelineConfig:
     zone_min_size_points: float = 5.0
     zone_max_size_points: float = 80.0
 
-    # Strong Point
+    # Strong Point (loosened — only the SL buffer matters now)
     sl_buffer_points: float = 17.5
+
+    # TP1 target — read by ``main`` when computing TP1 for each zone.
+    # Kept on the pipeline config so the operator only tunes one config
+    # object even though :func:`run_strategy_pipeline` doesn't consume
+    # this field directly.
+    tp1_local_peak_lookback_bars: int = 50
 
 
 def run_strategy_pipeline(
     df: pd.DataFrame,
     config: StrategyPipelineConfig | None = None,
 ) -> list[ValidatedZone]:
-    """Run all strategy stages; return confirmed Strong Point zones."""
+    """Run all strategy stages; return tradeable zones."""
     cfg = config or StrategyPipelineConfig()
-
-    structure = analyze_structure(
-        df,
-        StructureConfig(swing_strength=cfg.swing_strength),
-    )
-    swings = list(structure.swings)
 
     pattern_cfg = PatternConfig(
         impulse_body_to_range_ratio_min=cfg.impulse_body_to_range_ratio_min,
@@ -128,7 +120,7 @@ def run_strategy_pipeline(
         try:
             zone = mark_zone(pattern, df)
             refined = refine_zone(zone, df, refinement_cfg)
-            vz = validate_strong_point(refined, df, swings, sp_cfg)
+            vz = validate_strong_point(refined, df, sp_cfg)
             if vz.is_strong_point:
                 validated.append(vz)
         except Exception:
@@ -138,7 +130,7 @@ def run_strategy_pipeline(
             continue
 
     logger.debug(
-        "strategy pipeline: {} patterns → {} Strong Points",
+        "strategy pipeline: {} patterns → {} tradeable zones",
         len(patterns), len(validated),
     )
     return validated

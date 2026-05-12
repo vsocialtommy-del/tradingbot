@@ -10,7 +10,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pandas as pd
-import pytest
 from pytest_mock import MockerFixture
 
 from bot.strategy.pattern_detection import (
@@ -24,11 +23,6 @@ from bot.strategy.pipeline import (
     run_strategy_pipeline,
 )
 from bot.strategy.strong_point import ValidatedZone
-from bot.strategy.structure import (
-    StructureSnapshot,
-    StructureState,
-    Swing,
-)
 from bot.strategy.zone_marking import Zone
 from bot.strategy.zone_refinement import RefinedZone
 
@@ -98,21 +92,10 @@ def make_validated(
         formed_at=refined.formed_at, source_pattern=refined.source_pattern,
         refined_zone=refined,
         is_strong_point=is_strong_point,
-        validation_failures=[] if is_strong_point else ["NO_BREAK_YET"],
-        broken_swing=Swing(
-            index=2, time=_ts(), price=105.0, kind="HIGH",
-        ) if is_strong_point else None,
-        broken_at=_ts() if is_strong_point else None,
-        sl_anchor_swing=Swing(
-            index=2, time=_ts(), price=99.0, kind="LOW",
-        ) if is_strong_point else None,
-    )
-
-
-def make_structure_snapshot() -> StructureSnapshot:
-    return StructureSnapshot(
-        swings=[], bos_events=[], state=StructureState.RANGE,
-        last_swing_high=None, last_swing_low=None, last_bos=None,
+        validation_failures=[] if is_strong_point else ["NOT_TRADEABLE"],
+        broken_swing=None,
+        broken_at=None,
+        sl_anchor_swing=None,
     )
 
 
@@ -137,12 +120,14 @@ def patch_stages(
     refined_results: list[RefinedZone] | None = None,
     validated_results: list[ValidatedZone] | None = None,
 ) -> dict[str, MagicMock]:
-    """Patch every public function the pipeline calls."""
+    """Patch every public function the pipeline calls.
+
+    Post May-2026 loosened-rules PR: ``analyze_structure`` is no
+    longer called by the pipeline (no break-target lookup), and
+    :func:`validate_strong_point` takes ``(refined, df, cfg)`` —
+    no swings list.
+    """
     stubs: dict[str, MagicMock] = {}
-    stubs["analyze"] = mocker.patch(
-        "bot.strategy.pipeline.analyze_structure",
-        return_value=make_structure_snapshot(),
-    )
     stubs["detect"] = mocker.patch(
         "bot.strategy.pipeline.detect_patterns",
         return_value=patterns or [],
@@ -169,7 +154,7 @@ def patch_stages(
     else:
         stubs["validate"] = mocker.patch(
             "bot.strategy.pipeline.validate_strong_point",
-            side_effect=lambda r, df, sw, cfg: make_validated(direction=r.direction),
+            side_effect=lambda r, df, cfg: make_validated(direction=r.direction),
         )
     return stubs
 
@@ -199,39 +184,17 @@ class TestPipelineComposition:
         assert stubs["refine"].call_count == 1
         assert stubs["validate"].call_count == 1
 
-    def test_swings_passed_into_validate(
+    def test_validate_called_with_df_and_config_no_swings(
         self, mocker: MockerFixture,
     ) -> None:
-        # Pre-built structure with a couple of swings; pipeline should
-        # forward them to validate_strong_point.
-        sw = [Swing(index=2, time=_ts(), price=105.0, kind="HIGH")]
-        snapshot = StructureSnapshot(
-            swings=sw, bos_events=[], state=StructureState.RANGE,
-            last_swing_high=None, last_swing_low=None, last_bos=None,
-        )
-        mocker.patch(
-            "bot.strategy.pipeline.analyze_structure", return_value=snapshot,
-        )
-        mocker.patch(
-            "bot.strategy.pipeline.detect_patterns",
-            return_value=[make_pattern()],
-        )
-        mocker.patch(
-            "bot.strategy.pipeline.mark_zone",
-            side_effect=lambda p, df: make_zone(p.direction, p),
-        )
-        mocker.patch(
-            "bot.strategy.pipeline.refine_zone",
-            side_effect=lambda z, df, cfg: make_refined(direction=z.direction),
-        )
-        validate_stub = mocker.patch(
-            "bot.strategy.pipeline.validate_strong_point",
-            side_effect=lambda r, df, sw_, cfg: make_validated(direction=r.direction),
-        )
+        # Loosened flow: validate_strong_point takes (refined, df, cfg)
+        # — no swings list, no structure analysis.
+        stubs = patch_stages(mocker, patterns=[make_pattern()])
         run_strategy_pipeline(make_df())
-        # 3rd positional arg to validate is the swings list.
-        passed_swings = validate_stub.call_args.args[2]
-        assert passed_swings == sw
+        call = stubs["validate"].call_args
+        # Three positional args: refined, df, cfg.
+        assert len(call.args) == 3
+        assert isinstance(call.args[1], pd.DataFrame)
 
 
 # --------------------------------------------------------------------------- #
@@ -256,9 +219,6 @@ class TestFilters:
         )
         result = run_strategy_pipeline(make_df())
         assert result == []
-        # Pipeline DOES call validate for non-tradeable zones; the
-        # validator itself returns is_strong_point=False with the
-        # NOT_TRADEABLE failure reason. Pipeline filters at the end.
         stubs["validate"].assert_called_once()
 
     def test_non_strong_point_validated_filtered_out(
@@ -323,7 +283,6 @@ class TestConfig:
 
     def test_default_config_values(self) -> None:
         c = StrategyPipelineConfig()
-        assert c.swing_strength == 2
         assert c.impulse_body_to_range_ratio_min == 0.6
         assert c.impulse_atr_multiple_min == 1.0
         assert c.atr_period == 14
@@ -335,3 +294,4 @@ class TestConfig:
         assert c.zone_min_size_points == 5.0
         assert c.zone_max_size_points == 80.0
         assert c.sl_buffer_points == 17.5
+        assert c.tp1_local_peak_lookback_bars == 50

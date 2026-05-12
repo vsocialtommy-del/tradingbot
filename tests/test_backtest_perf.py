@@ -19,7 +19,6 @@ Two flavours of guarantee:
 from __future__ import annotations
 
 import time
-from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -128,41 +127,9 @@ class TestPerfBudget:
         )
 
 
-# --------------------------------------------------------------------------- #
-# Lock the swing-reuse optimisation
-# --------------------------------------------------------------------------- #
-
-
-class TestAnalyzeStructureCalledOncePerIteration:
-    """analyze_structure should fire exactly once per pipeline call.
-
-    Replaces PR #26's ``TestSwingReuse`` which locked in a property
-    of the old W/M pattern detector (where detect_swings was called
-    3× per iteration). The S&D pipeline (PR #31) doesn't call
-    detect_swings from pattern_detection at all — structure analysis
-    is the single source of swings — so the equivalent property is:
-    analyze_structure is invoked exactly once per detection bar.
-    """
-
-    def test_analyze_structure_called_once_per_detection_bar(self) -> None:
-        df = _make_synthetic(150)
-        cfg = BacktestConfig(
-            min_history_bars=100, progress_log_every_bars=0,
-        )
-        # Patch the pipeline's bound reference (the pipeline imports
-        # analyze_structure into its namespace at module load).
-        import bot.strategy.pipeline as pipeline_mod
-
-        with patch.object(
-            pipeline_mod, "analyze_structure",
-            wraps=pipeline_mod.analyze_structure,
-        ) as spy:
-            BacktestEngine(cfg).run(df)
-            # 50 detection bars (150 - 100 min_history). Pipeline runs
-            # once per detection bar; each call invokes analyze_structure
-            # exactly once.
-            assert spy.call_count == 50, (
-                f"expected 50 analyze_structure calls (one per detection "
-                f"bar); got {spy.call_count}. If higher, the pipeline is "
-                f"doing redundant structure analysis."
-            )
+# PR #26's ``TestSwingReuse`` and its PR #31 replacement
+# ``TestAnalyzeStructureCalledOncePerIteration`` are both retired:
+# the loosened-rules pipeline (May 2026) no longer calls
+# ``analyze_structure`` at all — break-and-close validation is gone.
+# Structure is still computed elsewhere (the lifecycle FLIP detector
+# in :mod:`bot.main._run_zone_lifecycle`), but not per pipeline call.

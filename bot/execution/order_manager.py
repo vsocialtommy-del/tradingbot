@@ -6,11 +6,14 @@ the broker as pending limit orders. They're tracked in Supabase as
 fires them as market orders when the live tick reaches each layer's
 trigger price.
 
-**TP1 refinement (May 2026):** TP1 defaults to the BoS level — the swing
-high (BUY) / low (SELL) from before the zone formed that the impulse
-broke through. The legacy ``zone_edge ± tp1_distance_dollars`` method is
-preserved behind ``OrderManagerConfig.tp1_method='FIXED_DISTANCE'`` as a
-backtest-revert path. See spec Section 6.1.
+**TP1 refinement (May 2026, loosened-rules PR):** TP1 is now computed
+in the strategy/orchestrator layer (see
+:mod:`bot.strategy.tp1_target`) and passed in as the ``tp1_price``
+argument. The previous BOS_LEVEL / FIXED_DISTANCE machinery is gone
+along with the break-and-close Strong Point gate that produced
+``broken_swing``. The caller is expected to have already decided
+whether a tradeable TP1 exists; ``place_layered_orders`` just
+records it.
 
 Why bot-managed instead of broker-pending:
 
@@ -25,7 +28,7 @@ Pipeline order
 --------------
 ::
 
-    1. Compute layer prices + TP1 (always doable, no I/O)
+    1. Compute layer prices (always doable, no I/O)
     2. Pre-checks (input validation, zone tradeable, SL sane)
     3. log_setup → Supabase (status=PENDING) ............ side effect #1
     4. place_market_order → MT5 (Layer 1) ............... side effect #2
@@ -39,11 +42,8 @@ Failures degrade ``OrderPlacementResult.status``:
     SKIPPED  Layer 1 placed but gap-through detected; Layer 1 closed
     FAILED   pre-checks failed OR Layer 1 itself failed
 
-The earlier ``PARTIAL`` status is retired — it only applied to L2/L3
-broker failures, which can no longer happen.
-
-Design decisions called out in PR #15
--------------------------------------
+Design decisions
+----------------
 
 1. **Supabase before MT5.** Setup tracked even on MT5 failure;
    ``setup_id`` available to tag MT5 orders via ``comment``.
@@ -55,29 +55,14 @@ Design decisions called out in PR #15
 3. **L2/L3 trade rows have ``mt5_ticket=None`` and ``entry_price=None``.**
    They get populated when ``entry_trigger`` fires the layers.
 
-4. **Idempotency = caller's responsibility.** Documented.
+4. **TP1 is supplied, not computed.** Hoisting TP1 out of
+   ``order_manager`` lets the orchestrator reject zones with no
+   tradeable peak before any DB write or broker call — same shape
+   as the SL-distance gate.
 
 5. **Comment format**: ``bot:L1:s={first 8 chars of setup_id}`` — fits
    MT5's 31-char limit. Only Layer 1 gets a broker comment;
    ``entry_trigger`` writes its own comments when it fires L2/L3.
-
-6. **Setup record stays at PENDING in v1** if downstream fails.
-   Reconciliation via ``position_tracker.reconcile_with_mt5()``.
-
-Design decisions called out in the BoS-TP1 refinement PR
---------------------------------------------------------
-
-7. **TP1 method default = ``BOS_LEVEL``**, gated by an explicit config
-   field rather than a flag scattered across modules. The fixed-distance
-   path stays around so backtesting can A/B them and we can rollback in
-   minutes if BOS_LEVEL underperforms.
-
-8. **Missing ``bos_event`` is a hard pre-check failure** when the method
-   is BOS_LEVEL. Per spec, every Strong Point validation result has a
-   ``bos_event`` (gate 1: NO_BOS_YET fails the validation), and Imbalance
-   zones propagate it. So in practice this is unreachable — but the
-   pre-check guards against bypassed validation paths and gives
-   operators a clear error rather than a None-deref crash.
 """
 
 from __future__ import annotations
@@ -98,30 +83,11 @@ from bot.logging.supabase_logger import (
 from bot.strategy.strong_point import ValidatedZone
 
 PlacementStatus = Literal["PLACED", "FAILED", "SKIPPED"]
-TP1Method = Literal["BOS_LEVEL", "FIXED_DISTANCE"]
 
 
 @dataclass(frozen=True)
 class OrderManagerConfig:
     symbol: str = "XAUUSD"
-    tp1_method: TP1Method = "BOS_LEVEL"
-    """How to compute ``planned_tp1_price``.
-
-    * ``BOS_LEVEL`` (default) — TP1 = ``zone.broken_swing.price``
-      (the structural level the impulse broke before the zone formed).
-      No filter on the resulting distance: a small one is fine, a wide
-      one is fine; the level is what traders watch regardless.
-    * ``FIXED_DISTANCE`` (legacy / fallback) — TP1 =
-      ``zone_edge ± tp1_distance_dollars``. Retained so backtests can
-      A/B against BOS_LEVEL and the operator can roll back without
-      a code deploy.
-    """
-
-    tp1_distance_dollars: float = 4.0
-    """Used only when ``tp1_method='FIXED_DISTANCE'``. Default $4 per
-    spec Section 6.1; will be optimised in the $2-10 range during
-    backtest. Kept on the dataclass so the FIXED_DISTANCE path remains
-    fully functional."""
 
     # Gap-through tolerance in *price units*. Layer 1's filled price
     # must not be more than this much past the far zone edge. Default
@@ -152,6 +118,7 @@ def place_layered_orders(
     zone_id: UUID,
     lot_size: float,
     sl_price: float,
+    tp1_price: float,
     *,
     mt5: MT5Connector,
     supabase: SupabaseLogger,
@@ -161,17 +128,22 @@ def place_layered_orders(
 
     Layers 2 and 3 are NOT sent to the broker. ``entry_trigger`` fires
     them as market orders when the live tick reaches their trigger price.
+
+    ``tp1_price`` is supplied by the caller (see
+    :mod:`bot.strategy.tp1_target`). Pre-checks reject obviously
+    insane values (zero, wrong side of entry) but do not enforce a
+    minimum distance or R:R ratio.
     """
     cfg = config or OrderManagerConfig()
     errors: list[str] = []
 
-    # 1. Compute layer prices + TP1.
-    layer_1_price, layer_2_price, layer_3_price, tp1_price = (
-        _compute_layer_prices(zone, cfg)
+    # 1. Compute layer prices (TP1 already supplied).
+    layer_1_price, layer_2_price, layer_3_price = (
+        _compute_layer_prices(zone)
     )
 
     # 2. Pre-checks.
-    pre_check_error = _validate_inputs(zone, lot_size, sl_price, cfg)
+    pre_check_error = _validate_inputs(zone, lot_size, sl_price, tp1_price)
     if pre_check_error is not None:
         errors.append(pre_check_error)
         logger.warning(f"order_manager pre-check failed: {pre_check_error}")
@@ -293,54 +265,21 @@ def place_layered_orders(
 
 
 def _compute_layer_prices(
-    zone: ValidatedZone, cfg: OrderManagerConfig
-) -> tuple[float, float, float, float]:
-    """Return (layer_1_price, layer_2_price, layer_3_price, tp1_price).
+    zone: ValidatedZone,
+) -> tuple[float, float, float]:
+    """Return (layer_1_price, layer_2_price, layer_3_price).
 
-    Caller must have already validated the zone via :func:`_validate_inputs`,
-    which guarantees ``zone.bos_event is not None`` when
-    ``cfg.tp1_method == 'BOS_LEVEL'``.
+    BUY: L1=zone.top, L2=midpoint, L3=zone.bottom. SELL: mirror.
     """
     midpoint = (zone.top + zone.bottom) / 2.0
-    tp1_price = _compute_tp1_price(zone, cfg)
     if zone.direction == "BUY":
-        return zone.top, midpoint, zone.bottom, tp1_price
-    return zone.bottom, midpoint, zone.top, tp1_price
-
-
-def _compute_tp1_price(
-    zone: ValidatedZone, cfg: OrderManagerConfig
-) -> float:
-    """Resolve TP1 according to the configured method.
-
-    BOS_LEVEL is the strategy default (May 2026 refinement, spec 6.1):
-    the broken structural level is the natural retracement target.
-    FIXED_DISTANCE is the legacy ``zone_edge ± $4`` path, retained for
-    backtest A/B and rollback. Negative-distance / zone-side checks are
-    deliberately omitted — Tommy's directive: take all valid Strong
-    Points, no TP-distance filter.
-
-    Returns 0.0 (placeholder) when method is BOS_LEVEL but ``bos_event``
-    is missing — the subsequent ``_validate_inputs`` call will turn that
-    into a FAILED ``OrderPlacementResult`` with a clear error message.
-    Computing prices before pre-checks is the existing pipeline order
-    (so ``tp1_price`` is in the failed-result envelope); we preserve it
-    here.
-    """
-    if cfg.tp1_method == "BOS_LEVEL":
-        if zone.broken_swing is None:
-            return 0.0
-        return float(zone.broken_swing.price)
-    if cfg.tp1_method == "FIXED_DISTANCE":
-        if zone.direction == "BUY":
-            return zone.top + cfg.tp1_distance_dollars
-        return zone.bottom - cfg.tp1_distance_dollars
-    raise ValueError(f"unknown tp1_method: {cfg.tp1_method!r}")
+        return zone.top, midpoint, zone.bottom
+    return zone.bottom, midpoint, zone.top
 
 
 def _validate_inputs(
     zone: ValidatedZone, lot_size: float, sl_price: float,
-    cfg: OrderManagerConfig,
+    tp1_price: float,
 ) -> str | None:
     if not zone.refined_zone.is_tradeable:
         return f"zone not tradeable: {zone.refined_zone.rejection_reason}"
@@ -356,11 +295,15 @@ def _validate_inputs(
         return (
             f"SL ({sl_price}) must be above zone.bottom ({zone.bottom}) for SELL"
         )
-    if cfg.tp1_method == "BOS_LEVEL" and zone.broken_swing is None:
+    # TP1 must be on the favourable side of Layer 1's entry.
+    if zone.direction == "BUY" and tp1_price <= zone.top:
         return (
-            "tp1_method=BOS_LEVEL requires zone.broken_swing; got None. "
-            "This indicates a zone bypassed Strong Point validation — "
-            "fix upstream or set tp1_method='FIXED_DISTANCE'."
+            f"TP1 ({tp1_price}) must be above zone.top ({zone.top}) for BUY"
+        )
+    if zone.direction == "SELL" and tp1_price >= zone.bottom:
+        return (
+            f"TP1 ({tp1_price}) must be below zone.bottom "
+            f"({zone.bottom}) for SELL"
         )
     return None
 

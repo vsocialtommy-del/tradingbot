@@ -1,8 +1,9 @@
-"""Tests for ``bot.strategy.strong_point`` — break-and-close validation.
+"""Tests for ``bot.strategy.strong_point`` — loosened entry rules.
 
-Constructs RefinedZone + Pattern fixtures directly so we can test
-each branch of validation in isolation. Covers BUY and SELL paths
-symmetrically.
+Post May-2026 refinement: validator is a passthrough that returns
+``is_strong_point=True`` for any size-filter-passing zone that hasn't
+been body-broken since pattern formation. ``compute_sl_price`` returns
+``zone bound ± buffer``.
 """
 
 from __future__ import annotations
@@ -22,7 +23,6 @@ from bot.strategy.strong_point import (
     compute_sl_price,
     validate_strong_point,
 )
-from bot.strategy.structure import Swing
 from bot.strategy.zone_marking import Zone
 from bot.strategy.zone_refinement import RefinedZone
 
@@ -49,7 +49,6 @@ def make_df(closes: list[float], start: str = "2026-01-01T00:00:00Z") -> pd.Data
 
 def make_pattern(
     *,
-    pattern_type: PatternType,
     direction: str,
     df: pd.DataFrame,
     base_start: int = 5,
@@ -58,15 +57,15 @@ def make_pattern(
     base_top: float = 100.5,
     base_bottom: float = 100.0,
 ) -> Pattern:
-    ts = df.index[base_start]
+    pt = PatternType.RBR if direction == "BUY" else PatternType.DBD
     impulse_before = Impulse(
-        direction="RALLY" if pattern_type in (PatternType.RBR, PatternType.RBD) else "DROP",
+        direction="RALLY" if pt == PatternType.RBR else "DROP",
         start_index=0, end_index=base_start - 1,
         start_time=df.index[0], end_time=df.index[base_start - 1],
         range_size=5.0, largest_body=5.0, candle_count=base_start,
     )
     impulse_after = Impulse(
-        direction="RALLY" if pattern_type in (PatternType.RBR, PatternType.DBR) else "DROP",
+        direction="RALLY" if pt == PatternType.RBR else "DROP",
         start_index=base_end + 1, end_index=impulse_after_end,
         start_time=df.index[base_end + 1], end_time=df.index[impulse_after_end],
         range_size=5.0, largest_body=5.0,
@@ -79,7 +78,7 @@ def make_pattern(
         range_size=base_top - base_bottom, largest_body=0.5,
     )
     return Pattern(
-        pattern_type=pattern_type,
+        pattern_type=pt,
         impulse_before=impulse_before,
         base=base,
         impulse_after=impulse_after,
@@ -95,17 +94,16 @@ def make_refined(
     bottom: float = 100.0,
     is_tradeable: bool = True,
     rejection_reason: str | None = None,
-    pattern: Pattern | None = None,
     df: pd.DataFrame | None = None,
+    impulse_after_end: int = 10,
 ) -> RefinedZone:
     if df is None:
         df = make_df([100.0] * 20)
-    if pattern is None:
-        pt = PatternType.RBR if direction == "BUY" else PatternType.DBD
-        pattern = make_pattern(
-            pattern_type=pt, direction=direction, df=df,
-            base_top=top, base_bottom=bottom,
-        )
+    pattern = make_pattern(
+        direction=direction, df=df,
+        base_top=top, base_bottom=bottom,
+        impulse_after_end=impulse_after_end,
+    )
     zone = Zone(
         direction=direction,  # type: ignore[arg-type]
         top=top, bottom=bottom,
@@ -123,267 +121,172 @@ def make_refined(
     )
 
 
-def make_swing(idx: int, df: pd.DataFrame, price: float, kind: str) -> Swing:
-    return Swing(
-        index=idx, time=df.index[idx], price=price,
-        kind=kind,  # type: ignore[arg-type]
-    )
-
-
 # --------------------------------------------------------------------------- #
-# NOT_TRADEABLE short-circuit
+# validate_strong_point — passthrough behaviour
 # --------------------------------------------------------------------------- #
 
 
-class TestNotTradeable:
-    def test_zone_failing_size_filter_skips_validation(self) -> None:
+class TestPassthrough:
+    def test_tradeable_buy_zone_is_strong_point(self) -> None:
+        df = make_df([100.0] * 20)
+        refined = make_refined(direction="BUY", df=df)
+        v = validate_strong_point(refined, df)
+        assert v.is_strong_point is True
+        assert v.validation_failures == []
+        # Loosened-flow shape stability: break-and-close fields are
+        # permanently None now.
+        assert v.broken_swing is None
+        assert v.broken_at is None
+        assert v.sl_anchor_swing is None
+
+    def test_tradeable_sell_zone_is_strong_point(self) -> None:
+        df = make_df([100.0] * 20)
+        refined = make_refined(direction="SELL", df=df)
+        v = validate_strong_point(refined, df)
+        assert v.is_strong_point is True
+
+    def test_not_tradeable_short_circuits(self) -> None:
         df = make_df([100.0] * 20)
         refined = make_refined(
             direction="BUY",
             is_tradeable=False, rejection_reason="ZONE_TOO_NARROW",
             df=df,
         )
-        v = validate_strong_point(refined, df, swings=[])
+        v = validate_strong_point(refined, df)
         assert v.is_strong_point is False
         assert v.validation_failures == ["NOT_TRADEABLE"]
-        # SL anchor + broken swing not even computed.
-        assert v.sl_anchor_swing is None
-        assert v.broken_swing is None
 
 
 # --------------------------------------------------------------------------- #
-# Missing structural swings
+# Body-break safety check — ZONE_VIOLATED_BEFORE_RETEST
 # --------------------------------------------------------------------------- #
 
 
-class TestMissingSwings:
-    def test_buy_zone_no_swing_above(self) -> None:
-        # Zone at 100-100.5; no swing high exists above it in the swing list.
-        df = make_df([100.0] * 20)
-        refined = make_refined(direction="BUY", df=df)
-        swings = [make_swing(2, df, price=99.0, kind="LOW")]  # only a low below
-        v = validate_strong_point(refined, df, swings=swings)
-        assert v.is_strong_point is False
-        assert "NO_SWING_ABOVE" in v.validation_failures
-        # SL anchor was found (the low below).
-        assert v.sl_anchor_swing is not None
-        assert v.sl_anchor_swing.price == 99.0
+class TestBodyBreakSafety:
+    """A freshly-detected pattern whose zone has already been body-broken
+    since formation is rejected. The lifecycle dedup (PR #35) can't
+    catch this because the zone isn't persisted yet."""
 
-    def test_sell_zone_no_swing_below(self) -> None:
-        df = make_df([100.0] * 20)
-        refined = make_refined(direction="SELL", df=df)
-        swings = [make_swing(2, df, price=101.0, kind="HIGH")]
-        v = validate_strong_point(refined, df, swings=swings)
-        assert v.is_strong_point is False
-        assert "NO_SWING_BELOW" in v.validation_failures
-
-    def test_no_sl_anchor(self) -> None:
-        # BUY zone with no low swing below → cannot pin SL.
-        df = make_df([100.0] * 20)
-        refined = make_refined(direction="BUY", df=df)
-        # Only swing highs above the zone, no lows below.
-        swings = [make_swing(2, df, price=101.0, kind="HIGH")]
-        v = validate_strong_point(refined, df, swings=swings)
-        assert v.is_strong_point is False
-        assert v.validation_failures == ["NO_SL_ANCHOR"]
-
-
-# --------------------------------------------------------------------------- #
-# Break-and-close (validation success)
-# --------------------------------------------------------------------------- #
-
-
-class TestBreakAndClose:
-    def test_buy_break_above_nearest_high_with_body_close(self) -> None:
-        # 20 quiet bars at 100 + pattern formed by bar 10 +
-        # bar 15 closes above 101 (the nearest swing high). → SP
-        closes = [100.0] * 14 + [102.0] + [100.0] * 5
-        df = make_df(closes)
-        refined = make_refined(direction="BUY", df=df)
-        swings = [
-            make_swing(8, df, price=99.0, kind="LOW"),    # SL anchor
-            make_swing(9, df, price=101.0, kind="HIGH"),  # break target
-        ]
-        v = validate_strong_point(refined, df, swings=swings)
-        assert v.is_strong_point is True
-        assert v.validation_failures == []
-        assert v.broken_swing is not None
-        assert v.broken_swing.price == 101.0
-        assert v.broken_at == df.index[14]
-        assert v.sl_anchor_swing is not None
-        assert v.sl_anchor_swing.price == 99.0
-
-    def test_sell_break_below_nearest_low_with_body_close(self) -> None:
-        closes = [100.0] * 14 + [98.0] + [100.0] * 5
-        df = make_df(closes)
-        refined = make_refined(direction="SELL", df=df)
-        swings = [
-            make_swing(8, df, price=101.0, kind="HIGH"),  # SL anchor
-            make_swing(9, df, price=99.0, kind="LOW"),    # break target
-        ]
-        v = validate_strong_point(refined, df, swings=swings)
-        assert v.is_strong_point is True
-        assert v.broken_swing.price == 99.0
-        assert v.sl_anchor_swing.price == 101.0
-
-
-class TestNearestSwingSelection:
-    def test_buy_uses_lowest_priced_high_above(self) -> None:
-        # Multiple highs above zone — should pick the LOWEST (closest to zone top).
-        closes = [100.0] * 14 + [101.0] + [100.0] * 5  # body close at 101 — clears 100.8 but not 105
-        df = make_df(closes)
-        refined = make_refined(direction="BUY", df=df)
-        swings = [
-            make_swing(8, df, price=99.0, kind="LOW"),
-            make_swing(9, df, price=100.8, kind="HIGH"),  # nearest (lowest)
-            make_swing(9, df, price=105.0, kind="HIGH"),  # higher up
-        ]
-        v = validate_strong_point(refined, df, swings=swings)
-        # The 101.0 close clears 100.8 (broken_swing) so SP confirmed.
-        assert v.is_strong_point is True
-        assert v.broken_swing.price == 100.8
-
-    def test_sell_uses_highest_priced_low_below(self) -> None:
-        closes = [100.0] * 14 + [99.5] + [100.0] * 5  # clears 99.7 not 90
-        df = make_df(closes)
-        refined = make_refined(direction="SELL", df=df)
-        swings = [
-            make_swing(8, df, price=101.0, kind="HIGH"),
-            make_swing(9, df, price=99.7, kind="LOW"),   # nearest (highest)
-            make_swing(9, df, price=90.0, kind="LOW"),   # lower
-        ]
-        v = validate_strong_point(refined, df, swings=swings)
-        assert v.is_strong_point is True
-        assert v.broken_swing.price == 99.7
-
-    def test_buy_sl_anchor_is_highest_low_below(self) -> None:
-        df = make_df([100.0] * 20)
-        refined = make_refined(direction="BUY", df=df)
-        swings = [
-            make_swing(8, df, price=95.0, kind="LOW"),   # further below
-            make_swing(9, df, price=99.0, kind="LOW"),   # nearest (highest)
-            make_swing(10, df, price=101.0, kind="HIGH"),
-        ]
-        v = validate_strong_point(refined, df, swings=swings)
-        # SL anchor should be 99.0 (the nearest low — highest-priced below).
-        assert v.sl_anchor_swing.price == 99.0
-
-
-# --------------------------------------------------------------------------- #
-# NO_BREAK_YET vs INVALIDATED
-# --------------------------------------------------------------------------- #
-
-
-class TestPendingVsInvalidated:
-    def test_no_break_yet_when_no_post_pattern_break(self) -> None:
-        # Zone formed, no body close past 101.
-        closes = [100.0] * 20
-        df = make_df(closes)
-        refined = make_refined(direction="BUY", df=df)
-        swings = [
-            make_swing(8, df, price=99.0, kind="LOW"),
-            make_swing(9, df, price=101.0, kind="HIGH"),
-        ]
-        v = validate_strong_point(refined, df, swings=swings)
-        assert v.is_strong_point is False
-        assert v.validation_failures == ["NO_BREAK_YET"]
-        # SL anchor still populated (we found it before the scan).
-        assert v.sl_anchor_swing is not None
-
-    def test_buy_invalidated_by_body_close_below_zone_bottom(self) -> None:
-        # Zone 100-100.5. After pattern, bar 14 closes at 99.5 → invalidated.
+    def test_buy_zone_body_close_below_bottom_rejects(self) -> None:
+        # Pattern formed at bar 10 (impulse_after.end_index). Bar 14
+        # body-closes at 99.5, which is below zone.bottom=100.0.
         closes = [100.0] * 14 + [99.5] + [100.0] * 5
         df = make_df(closes)
-        refined = make_refined(direction="BUY", df=df)
-        swings = [
-            make_swing(8, df, price=99.0, kind="LOW"),
-            make_swing(9, df, price=101.0, kind="HIGH"),
-        ]
-        v = validate_strong_point(refined, df, swings=swings)
+        refined = make_refined(direction="BUY", df=df, impulse_after_end=10)
+        v = validate_strong_point(refined, df)
         assert v.is_strong_point is False
-        assert "INVALIDATED" in v.validation_failures
-        assert v.broken_at is None
+        assert v.validation_failures == ["ZONE_VIOLATED_BEFORE_RETEST"]
 
-    def test_sell_invalidated_by_body_close_above_zone_top(self) -> None:
+    def test_sell_zone_body_close_above_top_rejects(self) -> None:
+        # Zone 100-100.5. Body close at 101 = above zone.top.
         closes = [100.0] * 14 + [101.0] + [100.0] * 5
         df = make_df(closes)
-        refined = make_refined(direction="SELL", df=df)
-        swings = [
-            make_swing(8, df, price=101.5, kind="HIGH"),  # well above zone
-            make_swing(9, df, price=99.0, kind="LOW"),
-        ]
-        v = validate_strong_point(refined, df, swings=swings)
+        refined = make_refined(direction="SELL", df=df, impulse_after_end=10)
+        v = validate_strong_point(refined, df)
         assert v.is_strong_point is False
-        assert "INVALIDATED" in v.validation_failures
+        assert v.validation_failures == ["ZONE_VIOLATED_BEFORE_RETEST"]
+
+    def test_wick_only_through_zone_does_not_reject(self) -> None:
+        # The body-break check is on close, not low/high. A wick poking
+        # below zone.bottom while the body closes back inside doesn't
+        # invalidate. Mirrors ``zone_lifecycle.check_violation``.
+        closes = [100.0] * 14 + [100.2] + [100.0] * 5
+        df = make_df(closes)
+        # Manually widen the wick at bar 14: low=99.0 (deep poke),
+        # close stays 100.2 — inside the 100-100.5 zone.
+        df.loc[df.index[14], "low"] = 99.0
+        refined = make_refined(direction="BUY", df=df, impulse_after_end=10)
+        v = validate_strong_point(refined, df)
+        assert v.is_strong_point is True
+
+    def test_close_at_zone_bottom_does_not_reject_buy(self) -> None:
+        # Strict inequality — close == zone.bottom is NOT a body break.
+        closes = [100.0] * 14 + [100.0] + [100.0] * 5
+        df = make_df(closes)
+        refined = make_refined(direction="BUY", df=df, impulse_after_end=10)
+        v = validate_strong_point(refined, df)
+        assert v.is_strong_point is True
+
+    def test_break_before_formation_is_ignored(self) -> None:
+        # The scan only looks at bars AFTER impulse_after.end_index.
+        # A close < zone.bottom on bar 3 (before pattern formed at
+        # bar 10) shouldn't reject the zone — by formation time the
+        # pattern detector already considered that context.
+        closes = [100.0] * 20
+        closes[3] = 90.0
+        df = make_df(closes)
+        refined = make_refined(direction="BUY", df=df, impulse_after_end=10)
+        v = validate_strong_point(refined, df)
+        assert v.is_strong_point is True
+
+    def test_no_bars_after_formation(self) -> None:
+        # Pattern formed on the very last bar — no scan range. Should
+        # be tradeable.
+        df = make_df([100.0] * 11)
+        refined = make_refined(direction="BUY", df=df, impulse_after_end=10)
+        v = validate_strong_point(refined, df)
+        assert v.is_strong_point is True
 
 
 # --------------------------------------------------------------------------- #
-# compute_sl_price
+# compute_sl_price — zone-bound formula
 # --------------------------------------------------------------------------- #
 
 
 class TestComputeSlPrice:
-    def test_buy_sl_below_anchor(self) -> None:
+    def test_buy_sl_is_zone_bottom_minus_buffer(self) -> None:
         df = make_df([100.0] * 20)
-        refined = make_refined(direction="BUY", df=df)
-        anchor = make_swing(8, df, price=99.0, kind="LOW")
-        validated = ValidatedZone(
-            direction="BUY", top=100.5, bottom=100.0,
-            formed_at=refined.formed_at,
-            source_pattern=refined.source_pattern,
-            refined_zone=refined,
-            is_strong_point=True,
-            validation_failures=[],
-            broken_swing=make_swing(9, df, price=101.0, kind="HIGH"),
-            broken_at=df.index[14],
-            sl_anchor_swing=anchor,
-        )
-        sl = compute_sl_price(validated, StrongPointConfig(sl_buffer_points=17.5))
-        # BUY: SL = anchor - buffer = 99 - 17.5 = 81.5.
-        assert sl == 81.5
+        refined = make_refined(direction="BUY", top=100.5, bottom=100.0, df=df)
+        v = validate_strong_point(refined, df)
+        sl = compute_sl_price(v)  # default buffer 17.5
+        assert sl == pytest.approx(100.0 - 17.5)
 
-    def test_sell_sl_above_anchor(self) -> None:
+    def test_sell_sl_is_zone_top_plus_buffer(self) -> None:
         df = make_df([100.0] * 20)
-        refined = make_refined(direction="SELL", df=df)
-        anchor = make_swing(8, df, price=101.0, kind="HIGH")
-        validated = ValidatedZone(
-            direction="SELL", top=100.5, bottom=100.0,
-            formed_at=refined.formed_at,
-            source_pattern=refined.source_pattern,
-            refined_zone=refined,
-            is_strong_point=True,
-            validation_failures=[],
-            broken_swing=make_swing(9, df, price=99.0, kind="LOW"),
-            broken_at=df.index[14],
-            sl_anchor_swing=anchor,
-        )
-        sl = compute_sl_price(validated, StrongPointConfig(sl_buffer_points=17.5))
-        # SELL: SL = anchor + buffer = 101 + 17.5 = 118.5.
-        assert sl == 118.5
+        refined = make_refined(direction="SELL", top=100.5, bottom=100.0, df=df)
+        v = validate_strong_point(refined, df)
+        sl = compute_sl_price(v)
+        assert sl == pytest.approx(100.5 + 17.5)
 
-    def test_no_anchor_raises(self) -> None:
+    def test_buffer_is_tunable(self) -> None:
         df = make_df([100.0] * 20)
-        refined = make_refined(direction="BUY", df=df)
-        validated = ValidatedZone(
-            direction="BUY", top=100.5, bottom=100.0,
+        refined = make_refined(direction="BUY", top=100.5, bottom=100.0, df=df)
+        v = validate_strong_point(refined, df)
+        sl = compute_sl_price(v, StrongPointConfig(sl_buffer_points=10.0))
+        assert sl == pytest.approx(100.0 - 10.0)
+
+    def test_sl_does_not_read_sl_anchor_swing(self) -> None:
+        # Even if sl_anchor_swing happens to be populated by some
+        # exotic code path, compute_sl_price ignores it under the new
+        # rules. Smoke-test that the formula stays zone-bound.
+        df = make_df([100.0] * 20)
+        refined = make_refined(direction="BUY", top=100.5, bottom=100.0, df=df)
+        v = ValidatedZone(
+            direction=refined.direction, top=refined.top, bottom=refined.bottom,
             formed_at=refined.formed_at,
             source_pattern=refined.source_pattern,
             refined_zone=refined,
-            is_strong_point=False,
-            validation_failures=["NO_SL_ANCHOR"],
+            is_strong_point=True, validation_failures=[],
             broken_swing=None, broken_at=None,
             sl_anchor_swing=None,
         )
-        with pytest.raises(ValueError, match="sl_anchor_swing"):
-            compute_sl_price(validated)
+        assert compute_sl_price(v) == pytest.approx(100.0 - 17.5)
 
 
 # --------------------------------------------------------------------------- #
-# Defaults
+# Direction symmetry
 # --------------------------------------------------------------------------- #
 
 
-class TestDefaults:
-    def test_strong_point_config_defaults(self) -> None:
-        c = StrongPointConfig()
-        assert c.sl_buffer_points == 17.5
+class TestDirectionSymmetry:
+    @pytest.mark.parametrize("direction", ["BUY", "SELL"])
+    def test_validator_and_sl_round_trip(self, direction: str) -> None:
+        df = make_df([100.0] * 20)
+        refined = make_refined(direction=direction, df=df)
+        v = validate_strong_point(refined, df)
+        assert v.is_strong_point is True
+        sl = compute_sl_price(v)
+        if direction == "BUY":
+            assert sl < v.bottom
+        else:
+            assert sl > v.top
