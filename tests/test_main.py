@@ -124,6 +124,9 @@ def mock_supabase(mocker: MockerFixture) -> MagicMock:
     m.get_news_events_in_window.return_value = []
     m.log_zone.return_value = {"id": str(uuid4())}
     m.log_setup.return_value = {"id": str(uuid4())}
+    # Empty by default: no zones to dedup against, no zones to scan
+    # for lifecycle transitions. Specific tests override this.
+    m.get_zones_by_status.return_value = []
     m.log_trade.side_effect = [
         {"id": str(uuid4())} for _ in range(20)
     ]
@@ -947,3 +950,309 @@ class TestZoneToInputPersistsRealPatternCode:
         zi = _zone_to_input(_make_validated_for_persistence(pt))
         assert zi.pattern_type == pt.value
         assert zi.zone_type == "STRONG_POINT"
+
+
+# --------------------------------------------------------------------------- #
+# Zone lifecycle — per-bar pass that drives CONSUMED / VIOLATED / FLIPPED.
+# Item 2 of the wicks+lifecycle PR.
+# --------------------------------------------------------------------------- #
+
+
+def _make_zone_row(
+    *,
+    direction: str = "BUY",
+    top: float = 1905.0,
+    bottom: float = 1900.0,
+    status: str = "CONFIRMED",
+    consumed_at: datetime | None = None,
+    violated_at: datetime | None = None,
+    flipped_at: datetime | None = None,
+    flipped_direction: str | None = None,
+):
+    """Build a Zone read model for lifecycle tests."""
+    from bot.logging.supabase_logger import Zone
+    return Zone(
+        id=uuid4(),
+        symbol="XAUUSD",
+        direction=direction,  # type: ignore[arg-type]
+        zone_type="STRONG_POINT",
+        pattern_type="RBR",
+        top=Decimal(str(top)),
+        bottom=Decimal(str(bottom)),
+        approach_count=0,
+        formed_at=NOW,
+        status=status,  # type: ignore[arg-type]
+        consumed_at=consumed_at,
+        violated_at=violated_at,
+        flipped_at=flipped_at,
+        flipped_direction=flipped_direction,  # type: ignore[arg-type]
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+class TestZoneLifecycleLoop:
+    """Bot._run_zone_lifecycle runs on every new M5 close.
+
+    The strategy pipeline is patched to return [] in each test so we
+    can isolate the lifecycle behaviour from setup placement.
+    """
+
+    def test_no_zones_no_writes(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        mock_supabase.get_zones_by_status.return_value = []
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+
+        b.run_iteration(NOW)
+
+        mock_supabase.update_zone_status.assert_not_called()
+
+    def test_wick_touch_consumes_buy_zone(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, mgrs = bot
+        b.state.last_config_refresh = NOW
+
+        zone = _make_zone_row(direction="BUY", top=1905.0, bottom=1900.0)
+        mock_supabase.get_zones_by_status.return_value = [zone]
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+
+        # Build an OHLC frame whose LAST bar wicks INTO the zone.
+        last_time = "2026-05-08T12:00:00Z"
+        times = pd.date_range(end=last_time, periods=30, freq="5min", tz="UTC")
+        opens = [1910.0] * 30
+        highs = [1911.0] * 30
+        lows = [1909.0] * 30
+        closes = [1910.0] * 30
+        # Last bar: low pokes down to 1902 (inside the 1900-1905 zone).
+        lows[-1] = 1902.0
+        df = pd.DataFrame(
+            {"open": opens, "high": highs, "low": lows, "close": closes,
+             "volume": [100] * 30},
+            index=times,
+        )
+        mgrs["ohlc_provider"].get.return_value = df
+
+        b.run_iteration(NOW)
+
+        # Exactly one CONSUMED transition.
+        calls = [
+            c for c in mock_supabase.update_zone_status.call_args_list
+            if c.args[1] == "CONSUMED"
+        ]
+        assert len(calls) == 1
+        assert calls[0].args[0] == zone.id
+
+    def test_body_close_below_buy_zone_violates(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, mgrs = bot
+        b.state.last_config_refresh = NOW
+
+        zone = _make_zone_row(direction="BUY", top=1905.0, bottom=1900.0)
+        mock_supabase.get_zones_by_status.return_value = [zone]
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+
+        last_time = "2026-05-08T12:00:00Z"
+        times = pd.date_range(end=last_time, periods=30, freq="5min", tz="UTC")
+        opens = [1910.0] * 30
+        highs = [1911.0] * 30
+        lows = [1909.0] * 30
+        closes = [1910.0] * 30
+        # Last bar: gaps through the zone — low 1890, close 1895
+        # (CONSUMED via touch on the same bar, then VIOLATED on body).
+        highs[-1] = 1910.0
+        lows[-1] = 1890.0
+        closes[-1] = 1895.0
+        df = pd.DataFrame(
+            {"open": opens, "high": highs, "low": lows, "close": closes,
+             "volume": [100] * 30},
+            index=times,
+        )
+        mgrs["ohlc_provider"].get.return_value = df
+
+        b.run_iteration(NOW)
+
+        statuses = [c.args[1] for c in mock_supabase.update_zone_status.call_args_list]
+        # Both transitions land on the same bar — order: CONSUMED then VIOLATED.
+        assert statuses == ["CONSUMED", "VIOLATED"]
+
+    def test_already_consumed_zone_only_violates(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Zone is already CONSUMED from a prior bar. Today's bar
+        # body-closes below it. Expect only the CONSUMED → VIOLATED
+        # transition (not a redundant CONSUMED rewrite).
+        b, mgrs = bot
+        b.state.last_config_refresh = NOW
+
+        zone = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONSUMED", consumed_at=NOW,
+        )
+        mock_supabase.get_zones_by_status.return_value = [zone]
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+
+        times = pd.date_range(
+            end="2026-05-08T12:00:00Z", periods=30, freq="5min", tz="UTC",
+        )
+        opens = [1910.0] * 30
+        highs = [1911.0] * 30
+        lows = [1909.0] * 30
+        closes = [1910.0] * 30
+        closes[-1] = 1890.0  # body close below zone bottom
+        lows[-1] = 1890.0
+        df = pd.DataFrame(
+            {"open": opens, "high": highs, "low": lows, "close": closes,
+             "volume": [100] * 30},
+            index=times,
+        )
+        mgrs["ohlc_provider"].get.return_value = df
+
+        b.run_iteration(NOW)
+
+        statuses = [c.args[1] for c in mock_supabase.update_zone_status.call_args_list]
+        assert statuses == ["VIOLATED"]
+
+    def test_lifecycle_failure_does_not_block_strategy(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # If get_zones_by_status blows up, the strategy pipeline still
+        # runs (lifecycle is best-effort).
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        mock_supabase.get_zones_by_status.side_effect = RuntimeError("DB down")
+        run_pipeline = mocker.patch(
+            "bot.main.run_strategy_pipeline", return_value=[],
+        )
+
+        b.run_iteration(NOW)  # no raise
+
+        run_pipeline.assert_called_once()
+
+
+# --------------------------------------------------------------------------- #
+# Dedup pre-flight — _try_place_setup skips when a zone with overlapping
+# bounds is already CONSUMED/VIOLATED/FLIPPED.
+# --------------------------------------------------------------------------- #
+
+
+class TestDedupSkip:
+    def test_skip_when_consumed_zone_overlaps(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        # Anchor swing so we get past the SL anchor check.
+        ts = pd.Timestamp("2026-05-08T12:00:00Z")
+        anchor = Swing(index=0, time=ts, price=1880.0, kind="LOW")
+        zone = _ValidatedZone(
+            direction=zone.direction, top=zone.top, bottom=zone.bottom,
+            formed_at=zone.formed_at, source_pattern=zone.source_pattern,
+            refined_zone=zone.refined_zone,
+            is_strong_point=True, validation_failures=[],
+            broken_swing=None, broken_at=None,
+            sl_anchor_swing=anchor,
+        )
+
+        # Existing CONSUMED zone with overlapping bounds.
+        existing = _make_zone_row(
+            direction="BUY", top=1900.6, bottom=1900.0,
+            status="CONSUMED", consumed_at=NOW,
+        )
+        # Two calls: lifecycle pass (no transitions wanted) + dedup.
+        # The lifecycle pass might process the existing CONSUMED zone
+        # and try to transition it; we don't care for this assertion.
+        mock_supabase.get_zones_by_status.return_value = [existing]
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        b.run_iteration(NOW)
+
+        place.assert_not_called()
+
+    def test_no_overlap_proceeds(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        ts = pd.Timestamp("2026-05-08T12:00:00Z")
+        anchor = Swing(index=0, time=ts, price=1880.0, kind="LOW")
+        zone = _ValidatedZone(
+            direction=zone.direction, top=zone.top, bottom=zone.bottom,
+            formed_at=zone.formed_at, source_pattern=zone.source_pattern,
+            refined_zone=zone.refined_zone,
+            is_strong_point=True, validation_failures=[],
+            broken_swing=None, broken_at=None,
+            sl_anchor_swing=anchor,
+        )
+
+        # Existing CONSUMED zone far away — no overlap.
+        existing = _make_zone_row(
+            direction="BUY", top=1800.0, bottom=1795.0,
+            status="CONSUMED", consumed_at=NOW,
+        )
+        mock_supabase.get_zones_by_status.return_value = [existing]
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        place = mocker.patch("bot.main.place_layered_orders")
+        place.return_value = mocker.MagicMock(
+            status="PLACED", setup_id=uuid4(),
+            layer_1_ticket=11111, sl_price=1862.5, tp1_price=1907.5,
+            error_messages=[],
+        )
+
+        b.run_iteration(NOW)
+
+        place.assert_called_once()
+
+    def test_skip_when_flipped_zone_overlaps(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # FLIPPED zones in the same direction also block re-trade
+        # (the flipped zone's original direction = the candidate's).
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        ts = pd.Timestamp("2026-05-08T12:00:00Z")
+        anchor = Swing(index=0, time=ts, price=1880.0, kind="LOW")
+        zone = _ValidatedZone(
+            direction=zone.direction, top=zone.top, bottom=zone.bottom,
+            formed_at=zone.formed_at, source_pattern=zone.source_pattern,
+            refined_zone=zone.refined_zone,
+            is_strong_point=True, validation_failures=[],
+            broken_swing=None, broken_at=None,
+            sl_anchor_swing=anchor,
+        )
+
+        existing = _make_zone_row(
+            direction="BUY",  # Original direction
+            top=1900.5, bottom=1900.0,
+            status="FLIPPED",
+            violated_at=NOW, flipped_at=NOW, flipped_direction="SELL",
+        )
+        mock_supabase.get_zones_by_status.return_value = [existing]
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        b.run_iteration(NOW)
+
+        place.assert_not_called()

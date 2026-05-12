@@ -92,6 +92,7 @@ from bot.filters.news_filter import NewsFilter, NewsFilterConfig
 from bot.logging.supabase_logger import (
     Setup,
     SupabaseLogger,
+    Zone,
     ZoneInput,
 )
 from bot.risk.daily_halt import DailyHaltConfig, check_daily_halt
@@ -109,6 +110,15 @@ from bot.strategy.strong_point import (
 from bot.strategy.pipeline import (
     StrategyPipelineConfig,
     run_strategy_pipeline,
+)
+from bot.strategy.zone_lifecycle import (
+    SKIP_NEW_SETUP_STATUSES,
+    ZoneRef,
+    check_consumption,
+    check_flip,
+    check_violation,
+    log_transition,
+    zone_bounds_overlap,
 )
 
 
@@ -503,10 +513,20 @@ class Bot:
         return False
 
     def _maybe_run_strategy(self, now: datetime) -> None:
-        """Run the strategy pipeline + try to place each detected zone."""
+        """Run the per-bar zone lifecycle pass + strategy pipeline."""
         df: pd.DataFrame | None = getattr(self, "_latest_ohlc", None)
         if df is None:
             return
+
+        # Lifecycle pass first: consumption / violation / flip on the
+        # just-closed M5 bar, BEFORE detecting new Strong Points. This
+        # ensures the dedup pre-flight in _try_place_setup sees the
+        # freshly-CONSUMED state from this bar.
+        try:
+            self._run_zone_lifecycle(df)
+        except Exception:
+            logger.exception("main loop: zone lifecycle pass raised")
+            # Continue — pattern detection isn't impacted by lifecycle errors.
 
         try:
             zones = run_strategy_pipeline(df, self.strategy_pipeline_config)
@@ -541,6 +561,98 @@ class Bot:
                 active_count += 1
                 self.state.placed_setup_count += 1
 
+    def _run_zone_lifecycle(self, df: pd.DataFrame) -> None:
+        """Apply consumption / violation / flip detection to the last bar.
+
+        Operates on the most recently closed M5 bar (``df.iloc[-1]``).
+        Loads all non-terminal zones once per bar; transitions each in
+        priority order (consumption → violation → flip) and persists
+        the result. CONSUMED is fill-agnostic per design decision Q1.
+        FLIP recomputes structure from the current df (option B from
+        the design doc) so the BoS target reflects today's structure,
+        not the swing recorded at zone formation.
+        """
+        if len(df) == 0:
+            return
+        last = df.iloc[-1]
+        bar_high = float(last["high"])
+        bar_low = float(last["low"])
+        bar_close = float(last["close"])
+
+        # Pull only the non-terminal zones we might transition.
+        try:
+            zones = self.supabase.get_zones_by_status(
+                ["CONFIRMED", "ACTIVE", "CONSUMED", "VIOLATED"],
+            )
+        except Exception:
+            logger.exception("zone lifecycle: get_zones_by_status failed")
+            return
+
+        for z in zones:
+            ref = ZoneRef(
+                direction=z.direction,
+                top=float(z.top),
+                bottom=float(z.bottom),
+            )
+
+            # 1. Consumption — any touch consumes (Q1). Only zones not
+            # already CONSUMED/VIOLATED can transition here. CONSUMED
+            # zones move on to the violation check below.
+            if z.status in ("CONFIRMED", "ACTIVE"):
+                if check_consumption(ref, bar_high=bar_high, bar_low=bar_low):
+                    self._safe_update_zone_status(z, "CONSUMED")
+                    # Status changed in this iteration; refresh local
+                    # view so subsequent checks see the new state.
+                    z = z.model_copy(update={"status": "CONSUMED"})
+
+            # 2. Violation — body close past the wrong-side bound.
+            # Reachable from CONFIRMED (gap-through), ACTIVE (rare),
+            # or CONSUMED (the common path: touch then break).
+            if z.status in ("CONFIRMED", "ACTIVE", "CONSUMED"):
+                if check_violation(ref, bar_close=bar_close):
+                    self._safe_update_zone_status(z, "VIOLATED")
+                    z = z.model_copy(update={"status": "VIOLATED"})
+
+            # 3. Flip — only meaningful on VIOLATED zones. The flip
+            # detector scans forward from the violation bar; here the
+            # violation just happened, so violation_index = last bar.
+            if z.status == "VIOLATED":
+                violation_index = len(df) - 1
+                flip = check_flip(ref, df, violation_index)
+                if flip.flipped:
+                    self._safe_update_zone_status(
+                        z, "FLIPPED",
+                        flipped_direction=flip.new_direction,
+                    )
+
+    def _safe_update_zone_status(
+        self,
+        zone: Zone,
+        new_status: str,
+        *,
+        flipped_direction: str | None = None,
+    ) -> None:
+        """Persist a zone transition; log + swallow on failure.
+
+        Single zone's failure shouldn't poison the rest of the loop.
+        Also logs the transition at INFO so the operator can see the
+        full lifecycle in bot_logs / loguru output.
+        """
+        try:
+            self.supabase.update_zone_status(
+                zone.id,
+                new_status,  # type: ignore[arg-type]
+                flipped_direction=flipped_direction,  # type: ignore[arg-type]
+            )
+            log_transition(
+                str(zone.id), zone.status, new_status,  # type: ignore[arg-type]
+            )
+        except Exception:
+            logger.exception(
+                f"zone lifecycle: update_zone_status failed for {zone.id} "
+                f"({zone.status} → {new_status})"
+            )
+
     def _try_place_setup(
         self, zone: ValidatedZone, ohlc_df: pd.DataFrame,
     ) -> bool:
@@ -549,6 +661,17 @@ class Bot:
         Returns True iff ``order_manager.place_layered_orders`` reported
         ``PLACED`` (not FAILED, not SKIPPED-via-gap).
         """
+        # 0. Dedup — skip if a CONSUMED/VIOLATED/FLIPPED zone with
+        # overlapping bounds already exists. Re-arming a CONSUMED zone
+        # is explicitly disallowed (design decision Q3).
+        if self._zone_already_used(zone):
+            logger.info(
+                f"new setup skipped: zone {zone.direction} "
+                f"{zone.bottom:.2f}-{zone.top:.2f} overlaps an existing "
+                f"CONSUMED/VIOLATED/FLIPPED zone"
+            )
+            return False
+
         # 1. SL — pinned to the strategy-layer sl_anchor_swing.
         if zone.sl_anchor_swing is None:
             logger.warning(
@@ -672,6 +795,38 @@ class Bot:
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
+
+    def _zone_already_used(self, candidate: ValidatedZone) -> bool:
+        """True iff a CONSUMED/VIOLATED/FLIPPED zone overlaps ``candidate``.
+
+        Best-effort: if the lookup fails we let the setup proceed
+        (logging the error). Better to occasionally re-trade than to
+        miss real entries because of a Supabase blip.
+        """
+        try:
+            existing = self.supabase.get_zones_by_status(
+                sorted(SKIP_NEW_SETUP_STATUSES),
+            )
+        except Exception:
+            logger.exception(
+                "dedup: get_zones_by_status failed; proceeding without dedup"
+            )
+            return False
+
+        candidate_ref = ZoneRef(
+            direction=candidate.direction,
+            top=float(candidate.top),
+            bottom=float(candidate.bottom),
+        )
+        for z in existing:
+            existing_ref = ZoneRef(
+                direction=z.direction,
+                top=float(z.top),
+                bottom=float(z.bottom),
+            )
+            if zone_bounds_overlap(candidate_ref, existing_ref):
+                return True
+        return False
 
     def _safe_get_active_setups(self) -> list[Setup]:
         """Read the active-setups list; return ``[]`` on any failure.

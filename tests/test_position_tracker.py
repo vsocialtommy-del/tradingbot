@@ -861,3 +861,132 @@ class TestActiveSetupsCache:
         # (length 1, not 0).
         second = tracker.get_active_setups()
         assert len(second) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Zone promotion CONFIRMED → ACTIVE on first PENDING → ACTIVE setup transition
+# --------------------------------------------------------------------------- #
+
+
+def make_zone_row(
+    *, id: UUID | None = None, status: str = "CONFIRMED",
+) -> Any:
+    """Build a Zone read model with the lifecycle fields populated."""
+    from bot.logging.supabase_logger import Zone
+    return Zone(
+        id=id or uuid4(),
+        symbol="XAUUSD",
+        direction="BUY",
+        zone_type="STRONG_POINT",
+        pattern_type="RBR",
+        top=Decimal("105"),
+        bottom=Decimal("100"),
+        approach_count=0,
+        formed_at=NOW,
+        status=status,  # type: ignore[arg-type]
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+class TestZonePromotionOnSetupActivation:
+    """PENDING → ACTIVE on a setup also promotes its zone CONFIRMED → ACTIVE."""
+
+    def test_promotes_confirmed_zone_to_active(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        zone_id = uuid4()
+        setup = make_setup(status="PENDING")
+        setup_active = make_setup(id=setup.id, status="ACTIVE", activated_at=NOW)
+        # update_setup returns the new ACTIVE row; we need its zone_id
+        # for the promotion path. The Setup model carries zone_id, so
+        # patch it on the returned object.
+        setup_active = setup_active.model_copy(update={"zone_id": zone_id})
+
+        mock_supabase.get_setup_by_id.return_value = setup
+        mock_supabase.update_setup.return_value = setup_active
+        mock_supabase.get_zone_by_id.return_value = make_zone_row(
+            id=zone_id, status="CONFIRMED",
+        )
+
+        tracker.update_setup_status(setup.id, "ACTIVE")
+
+        mock_supabase.update_zone_status.assert_called_once_with(
+            zone_id, "ACTIVE",
+        )
+
+    def test_skips_promotion_when_zone_already_active(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        zone_id = uuid4()
+        setup = make_setup(status="PENDING")
+        setup_active = make_setup(id=setup.id, status="ACTIVE")
+        setup_active = setup_active.model_copy(update={"zone_id": zone_id})
+
+        mock_supabase.get_setup_by_id.return_value = setup
+        mock_supabase.update_setup.return_value = setup_active
+        # Zone already ACTIVE (concurrent setup activation, or replay)
+        mock_supabase.get_zone_by_id.return_value = make_zone_row(
+            id=zone_id, status="ACTIVE",
+        )
+
+        tracker.update_setup_status(setup.id, "ACTIVE")
+
+        mock_supabase.update_zone_status.assert_not_called()
+
+    def test_skips_promotion_when_zone_past_active(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        # CONSUMED/VIOLATED/FLIPPED zones shouldn't get yanked back.
+        zone_id = uuid4()
+        setup = make_setup(status="PENDING")
+        setup_active = make_setup(id=setup.id, status="ACTIVE")
+        setup_active = setup_active.model_copy(update={"zone_id": zone_id})
+
+        mock_supabase.get_setup_by_id.return_value = setup
+        mock_supabase.update_setup.return_value = setup_active
+        # Zone has already been CONSUMED — leave it.
+        # (The Zone read model with the CONSUMED status also needs
+        # consumed_at to satisfy the DB CHECK in production, but for
+        # the in-memory mock we just set status.)
+        mock_supabase.get_zone_by_id.return_value = make_zone_row(
+            id=zone_id, status="CONSUMED",
+        ).model_copy(update={"consumed_at": NOW})
+
+        tracker.update_setup_status(setup.id, "ACTIVE")
+
+        mock_supabase.update_zone_status.assert_not_called()
+
+    def test_non_pending_to_active_transition_does_not_promote(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        # ACTIVE → TP1_HIT shouldn't drive zone promotion.
+        setup = make_setup(status="ACTIVE")
+        mock_supabase.get_setup_by_id.return_value = setup
+        mock_supabase.update_setup.return_value = make_setup(
+            id=setup.id, status="TP1_HIT",
+        )
+
+        tracker.update_setup_status(setup.id, "TP1_HIT")
+
+        mock_supabase.update_zone_status.assert_not_called()
+
+    def test_promotion_failure_does_not_break_setup_update(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        # Best-effort: a Supabase error on the zone update is logged
+        # + swallowed; the setup transition has already succeeded and
+        # must remain successful.
+        zone_id = uuid4()
+        setup = make_setup(status="PENDING")
+        setup_active = make_setup(
+            id=setup.id, status="ACTIVE", activated_at=NOW,
+        ).model_copy(update={"zone_id": zone_id})
+
+        mock_supabase.get_setup_by_id.return_value = setup
+        mock_supabase.update_setup.return_value = setup_active
+        mock_supabase.get_zone_by_id.side_effect = RuntimeError("blip")
+
+        # No exception should escape.
+        result = tracker.update_setup_status(setup.id, "ACTIVE")
+        assert result.status == "ACTIVE"

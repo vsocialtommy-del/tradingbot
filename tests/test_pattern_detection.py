@@ -284,9 +284,9 @@ class TestDetectBases:
         assert base.candle_count == 3
         assert base.start_index == 21
         assert base.end_index == 23
-        # Body envelope of the 3 quiet bars at 105.
-        assert base.top == pytest.approx(105.0)
-        assert base.bottom == pytest.approx(105.0)
+        # Wick-inclusive envelope: highs = 105.3, lows = 104.7.
+        assert base.top == pytest.approx(105.3)
+        assert base.bottom == pytest.approx(104.7)
 
     def test_one_bar_base_valid(self) -> None:
         opens, highs, lows, closes = quiet_prelude(100.0)

@@ -1,4 +1,4 @@
-"""Zone marking — body extremes of the pattern's base candles.
+"""Zone marking — wick-inclusive envelope of the pattern's base candles.
 
 Step 1 of zone construction. The remaining steps live in
 :mod:`bot.strategy.zone_refinement` (size filter) and
@@ -8,31 +8,30 @@ Geometry
 --------
 
 For both demand zones (RBR / DBR, BUY) and supply zones (DBD / RBD,
-SELL) the zone is the **body envelope** of the pattern's base:
+SELL) the zone is the **wick-inclusive envelope** of the base:
 
 ::
 
-    body_top(bar)    = max(bar.open, bar.close)
-    body_bottom(bar) = min(bar.open, bar.close)
+    zone.top    = max(bar.high for bar in base)
+    zone.bottom = min(bar.low  for bar in base)
 
-    zone.top    = max(body_top    for bar in base)
-    zone.bottom = min(body_bottom for bar in base)
+Wicks are INCLUDED. Rationale: long wicks at the base mark the
+exact prices where institutional orders defended the level; the
+zone should encompass the full rejection range, not just where bars
+happened to close. The base candles are already known to be tightly
+clustered (:mod:`bot.strategy.pattern_detection` — base validation
+enforces total-range and per-body limits over the wick range), so
+the zone is automatically "compact" without any further refinement.
 
-Wicks are excluded by construction (we operate on bodies, not
-highs/lows). The base candles are already known to be tightly clustered
-(see :mod:`bot.strategy.pattern_detection` — base validation enforces
-total-range and per-body limits), so the zone is automatically
-"compact" without any further refinement step.
-
-Pre-PR #31 history
-------------------
-Earlier versions of this module produced a wide initial box (including
-wicks) that ``zone_refinement.refine_zone`` then stripped down. That
-two-step process made sense for W/M pattern detection where the
-"pattern area" was the swing-low / swing-high bars. With the new S&D
-methodology the base IS the body envelope by definition — no separate
-refinement step required. ``refine_zone`` still exists for the size
-filter (5-80 points) but no longer mutates the zone's top/bottom.
+Pre-PR (body-only) history
+--------------------------
+Earlier versions marked the zone from candle bodies only
+(``max(open, close)`` / ``min(open, close)``), excluding wicks. The
+move to wick-inclusive marking is documented in the PR introducing
+this change; downstream Strong Point validation still uses body
+closes for breaks and the SL anchor is independent of zone bounds,
+so SL distance and break detection are unaffected — only zone
+widths shift.
 """
 
 from __future__ import annotations
@@ -50,11 +49,11 @@ Direction = Literal["BUY", "SELL"]
 
 @dataclass(frozen=True)
 class Zone:
-    """The body envelope of a pattern's base.
+    """The wick-inclusive envelope of a pattern's base.
 
     Invariant: ``top >= bottom`` (they can be equal in pathological
-    cases — e.g. an all-doji base where every bar has open == close;
-    the size filter rejects those).
+    cases — e.g. a single-bar base with high == low; the size filter
+    rejects those).
     """
 
     direction: Direction
@@ -65,21 +64,19 @@ class Zone:
 
 
 def mark_zone(pattern: Pattern, df: pd.DataFrame) -> Zone:
-    """Compute the zone's body envelope from the pattern's base.
+    """Compute the zone's wick-inclusive envelope from the pattern's base.
 
     The base's candles are validated upstream by
     :func:`pattern_detection.detect_bases` — their range is bounded
-    relative to the surrounding impulses. We just read the body
-    extremes here.
+    relative to the surrounding impulses. We just read the wick
+    extremes here (the upstream :class:`Base` already stores
+    ``top = max(high)`` and ``bottom = min(low)``).
 
-    ``df`` is accepted (and validated) for API symmetry with the
-    previous version of this module; we don't actually need to
-    re-read OHLC here because ``Pattern.base`` already carries
-    ``top`` and ``bottom`` (computed from bodies during base
-    detection). Keeping ``df`` in the signature avoids breaking
-    callers + tests during the methodology transition.
+    ``df`` is accepted (and column-checked) for API symmetry with
+    callers and historical signatures; the actual zone bounds come
+    from ``pattern.base`` so no OHLC re-read happens here.
     """
-    for col in ("open", "close"):
+    for col in ("open", "high", "low", "close"):
         if col not in df.columns:
             raise ValueError(f"df must have a '{col}' column")
     base = pattern.base
@@ -99,8 +96,8 @@ def mark_zone(pattern: Pattern, df: pd.DataFrame) -> Zone:
 
     zone = Zone(
         direction=pattern.direction,
-        top=base.top,
-        bottom=base.bottom,
+        top=base.top,        # max(high) over base bars — wicks included
+        bottom=base.bottom,  # min(low)  over base bars
         formed_at=pattern.formed_at,
         source_pattern=pattern,
     )

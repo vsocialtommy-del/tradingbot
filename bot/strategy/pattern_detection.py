@@ -43,13 +43,19 @@ An **impulse candle** requires BOTH:
 
 A **tight base** requires BOTH:
 
-1. Total base range ≤ ``base_range_to_impulse_ratio_max`` × mean of
-   the two adjacent impulses' ranges (default 0.6).
-2. Largest base candle body ≤ ``base_max_body_to_impulse_body_ratio``
-   × the larger of the two adjacent impulses' largest bodies
-   (default 0.4).
+1. Total base range (``max(high) - min(low)``, **wick-inclusive**)
+   ≤ ``base_range_to_impulse_ratio_max`` × mean of the two adjacent
+   impulses' ranges (default 0.6).
+2. Largest base candle body (``max |close - open|``, body-only)
+   ≤ ``base_max_body_to_impulse_body_ratio`` × the larger of the two
+   adjacent impulses' largest bodies (default 0.4).
 
 Both criteria must hold; either fails, the gap isn't a base.
+
+The wick-inclusive range in criterion 1 means bases with long
+rejection tails register as "wider" than the pre-wicks body-only
+definition; the 0.6 default may need re-tuning against demo data —
+flagged as a known calibration target.
 
 Multi-candle impulses
 ---------------------
@@ -127,15 +133,30 @@ class Impulse:
 
 @dataclass(frozen=True)
 class Base:
-    """A compact consolidation between two impulses (1-N candles)."""
+    """A compact consolidation between two impulses (1-N candles).
+
+    ``top`` / ``bottom`` are **wick-inclusive** — max(high) / min(low)
+    across the base bars. Zones are drawn at this envelope so the full
+    rejection range is captured (PR adopting wick-marked zones).
+
+    ``range_size = top - bottom`` therefore widens vs the previous
+    body-only definition. The tightness check
+    (``_tight_enough``, threshold ``base_range_to_impulse_ratio_max``)
+    keys off this value; the 0.6 default may need re-tuning against
+    demo-account data — left as a follow-up calibration.
+
+    ``largest_body`` stays body-only (``max |close - open|``) — it's
+    a "is any single candle in this 'base' actually impulse-sized?"
+    sanity check that wicks shouldn't change.
+    """
 
     start_index: int
     end_index: int
     candle_count: int
-    top: float                      # max(max(open, close)) across base candles
-    bottom: float                   # min(min(open, close))
-    range_size: float               # top - bottom
-    largest_body: float
+    top: float                      # max(high) across base candles (wick top)
+    bottom: float                   # min(low) across base candles (wick bottom)
+    range_size: float               # top - bottom (wick-inclusive)
+    largest_body: float             # max |close - open| (body-only)
 
 
 @dataclass(frozen=True)
@@ -362,6 +383,8 @@ def detect_bases(
         return []
 
     opens = df["open"].to_numpy()
+    highs = df["high"].to_numpy()
+    lows = df["low"].to_numpy()
     closes = df["close"].to_numpy()
     bases: list[Base] = []
     for imp_a, imp_b in zip(impulses, impulses[1:]):
@@ -371,7 +394,7 @@ def detect_bases(
         if n_gap < cfg.min_base_candles or n_gap > cfg.max_base_candles:
             continue
 
-        base = _build_base(gap_start, gap_end, opens, closes)
+        base = _build_base(gap_start, gap_end, opens, highs, lows, closes)
         if not _tight_enough(base, imp_a, imp_b, cfg):
             continue
         bases.append(base)
@@ -383,15 +406,21 @@ def detect_bases(
 
 def _build_base(
     start_index: int, end_index: int,
-    opens: np.ndarray, closes: np.ndarray,
+    opens: np.ndarray, highs: np.ndarray,
+    lows: np.ndarray, closes: np.ndarray,
 ) -> Base:
-    """Compute body-only extremes across the base range."""
+    """Wick-inclusive extents; body-only ``largest_body``.
+
+    ``top = max(high)``, ``bottom = min(low)`` so zones drawn from this
+    base include wicks (institutional rejection range). ``largest_body``
+    stays body-only — wicks shouldn't make a candle look impulse-sized.
+    """
     o = opens[start_index : end_index + 1]
+    h = highs[start_index : end_index + 1]
+    lo = lows[start_index : end_index + 1]
     c = closes[start_index : end_index + 1]
-    body_tops = np.maximum(o, c)
-    body_bottoms = np.minimum(o, c)
-    top = float(body_tops.max())
-    bottom = float(body_bottoms.min())
+    top = float(h.max())
+    bottom = float(lo.min())
     largest_body = float(np.abs(c - o).max())
     return Base(
         start_index=start_index,

@@ -8,10 +8,10 @@ Originally this module did two things:
    narrow or too wide to be tradeable.
 
 After the S&D methodology switch (PR #31), step 1 is redundant:
-``zone_marking.mark_zone`` now produces a body-only zone directly
-from the pattern's base candles (which are themselves validated for
-tightness at detection time). So this module becomes **just the
-size filter** — top/bottom pass through unchanged.
+``zone_marking.mark_zone`` now produces a wick-inclusive zone
+directly from the pattern's base candles (which are themselves
+validated for tightness at detection time). So this module becomes
+**just the size filter** — top/bottom pass through unchanged.
 
 The shape of :class:`RefinedZone` is preserved for backward compat
 with all the consumers that already speak its API
@@ -60,8 +60,8 @@ class RefinedZone:
 
     Same shape as before the methodology change so downstream consumers
     don't break. ``top`` / ``bottom`` are now pass-through from the
-    upstream :class:`Zone` (which is already body-only); we just
-    attach a tradeability verdict.
+    upstream :class:`Zone` (wick-inclusive); we just attach a
+    tradeability verdict.
     """
 
     direction: Direction
