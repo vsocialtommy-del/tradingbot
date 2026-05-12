@@ -58,18 +58,19 @@ def make_impulse(
 
 
 def make_base(start_index: int, end_index: int, df: pd.DataFrame) -> Base:
+    """Build a Base matching production semantics: top/bottom are wick-inclusive."""
     o = df["open"].iloc[start_index : end_index + 1].to_numpy()
+    h = df["high"].iloc[start_index : end_index + 1].to_numpy()
+    lo = df["low"].iloc[start_index : end_index + 1].to_numpy()
     c = df["close"].iloc[start_index : end_index + 1].to_numpy()
-    body_tops = [max(oi, ci) for oi, ci in zip(o, c)]
-    body_bottoms = [min(oi, ci) for oi, ci in zip(o, c)]
+    top = float(h.max())
+    bottom = float(lo.min())
     bodies = [abs(ci - oi) for oi, ci in zip(o, c)]
-    top = max(body_tops)
-    bottom = min(body_bottoms)
     return Base(
         start_index=start_index, end_index=end_index,
         candle_count=end_index - start_index + 1,
-        top=float(top), bottom=float(bottom),
-        range_size=float(top - bottom),
+        top=top, bottom=bottom,
+        range_size=top - bottom,
         largest_body=float(max(bodies)),
     )
 
@@ -108,7 +109,11 @@ class TestZoneMarkingGeometry:
     def test_single_bullish_base_candle(self) -> None:
         opens = [100.0, 100.0, 105.0]
         closes = [100.0, 100.5, 105.0]
-        df = make_ohlc(opens, closes=closes)
+        # Explicit highs/lows so the test isn't sensitive to the
+        # ``make_ohlc`` defaults (which auto-add a ±0.2 wick).
+        highs = [100.0, 100.8, 105.0]
+        lows = [100.0, 99.7, 105.0]
+        df = make_ohlc(opens, closes=closes, highs=highs, lows=lows)
         pattern = make_pattern(
             PatternType.RBR, df,
             imp_before_indices=(0, 0),
@@ -116,14 +121,17 @@ class TestZoneMarkingGeometry:
             imp_after_indices=(2, 2),
         )
         zone = mark_zone(pattern, df)
-        assert zone.top == 100.5
-        assert zone.bottom == 100.0
+        # Wick-inclusive: top = high (100.8), bottom = low (99.7).
+        assert zone.top == 100.8
+        assert zone.bottom == 99.7
         assert zone.direction == "BUY"
 
     def test_single_bearish_base_candle(self) -> None:
         opens = [100.0, 100.5, 95.0]
         closes = [100.0, 100.0, 95.0]
-        df = make_ohlc(opens, closes=closes)
+        highs = [100.0, 100.9, 95.0]
+        lows = [100.0, 99.5, 95.0]
+        df = make_ohlc(opens, closes=closes, highs=highs, lows=lows)
         pattern = make_pattern(
             PatternType.DBD, df,
             imp_before_indices=(0, 0),
@@ -131,9 +139,9 @@ class TestZoneMarkingGeometry:
             imp_after_indices=(2, 2),
         )
         zone = mark_zone(pattern, df)
-        # bearish bar: body_top = open = 100.5; body_bottom = close = 100.0
-        assert zone.top == 100.5
-        assert zone.bottom == 100.0
+        # Wick-inclusive: top = high (100.9), bottom = low (99.5).
+        assert zone.top == 100.9
+        assert zone.bottom == 99.5
         assert zone.direction == "SELL"
 
     def test_multi_base_mixed_bullish_bearish(self) -> None:
@@ -147,7 +155,10 @@ class TestZoneMarkingGeometry:
             100.0, 100.7, 100.3,
             105.0,
         ]
-        df = make_ohlc(opens, closes=closes)
+        # Explicit highs/lows on base bars so wick extents are predictable.
+        highs = [100.0, 100.9, 100.8, 100.7, 105.0]
+        lows  = [100.0,  99.8,  99.9,  99.6, 105.0]
+        df = make_ohlc(opens, closes=closes, highs=highs, lows=lows)
         pattern = make_pattern(
             PatternType.RBR, df,
             imp_before_indices=(0, 0),
@@ -155,15 +166,19 @@ class TestZoneMarkingGeometry:
             imp_after_indices=(4, 4),
         )
         zone = mark_zone(pattern, df)
-        # body_tops:   max(100.5, 100.7, 100.7) = 100.7
-        # body_bottoms: min(100.0, 100.0, 100.3) = 100.0
-        assert zone.top == 100.7
-        assert zone.bottom == 100.0
+        # Wick-inclusive: top = max(highs[1:4]) = 100.9
+        #                 bottom = min(lows[1:4]) = 99.6
+        assert zone.top == 100.9
+        assert zone.bottom == 99.6
 
-    def test_all_doji_base_produces_zero_height(self) -> None:
+    def test_doji_base_with_flat_wicks_produces_zero_height(self) -> None:
+        # If high == low == open == close on every base bar, the zone
+        # has zero height. The size filter rejects these downstream.
         opens = [100.0, 100.0, 100.0, 100.0, 105.0]
         closes = [100.0, 100.0, 100.0, 100.0, 105.0]
-        df = make_ohlc(opens, closes=closes)
+        highs = [100.0, 100.0, 100.0, 100.0, 105.0]
+        lows = [100.0, 100.0, 100.0, 100.0, 105.0]
+        df = make_ohlc(opens, closes=closes, highs=highs, lows=lows)
         pattern = make_pattern(
             PatternType.RBR, df,
             imp_before_indices=(0, 0),
@@ -173,11 +188,14 @@ class TestZoneMarkingGeometry:
         zone = mark_zone(pattern, df)
         assert zone.top == zone.bottom == 100.0
 
-    def test_wicks_excluded(self) -> None:
+    def test_wicks_included(self) -> None:
+        # A long-wick rejection on the base bar should widen the zone
+        # to encompass the full rejection range — that's the whole
+        # point of wick-inclusive marking.
         opens = [100.0, 100.0, 105.0]
         closes = [100.0, 100.5, 105.0]
-        highs = [100.0, 110.0, 105.0]   # massive wick on base bar
-        lows = [100.0, 90.0, 105.0]
+        highs = [100.0, 110.0, 105.0]   # tall upper wick on base bar
+        lows = [100.0, 90.0, 105.0]      # tall lower wick
         df = make_ohlc(opens, closes=closes, highs=highs, lows=lows)
         pattern = make_pattern(
             PatternType.RBR, df,
@@ -186,9 +204,9 @@ class TestZoneMarkingGeometry:
             imp_after_indices=(2, 2),
         )
         zone = mark_zone(pattern, df)
-        # Wick from 90 to 110 ignored; body envelope is 100-100.5.
-        assert zone.top == 100.5
-        assert zone.bottom == 100.0
+        # Wicks INCLUDED: zone spans the rejection range 90-110.
+        assert zone.top == 110.0
+        assert zone.bottom == 90.0
 
 
 # --------------------------------------------------------------------------- #

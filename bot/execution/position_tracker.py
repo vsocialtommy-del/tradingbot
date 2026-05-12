@@ -264,10 +264,43 @@ class PositionTracker:
         if new_status in CASCADE_CANCEL_SETUP_STATUSES:
             self._cascade_cancel_waiting(setup_id)
 
+        # Zone lifecycle: PENDING → ACTIVE promotes the parent zone
+        # CONFIRMED → ACTIVE (idempotent for zones already ACTIVE).
+        # Other transitions don't drive zone status — CONSUMED is
+        # price-touch-triggered (main loop's per-bar pass), not
+        # setup-state-triggered. (See migration 007 + zone_lifecycle.)
+        if current.status == "PENDING" and new_status == "ACTIVE":
+            self._maybe_promote_zone_to_active(updated.zone_id)
+
         logger.info(
             f"setup {setup_id} transitioned: {current.status} → {new_status}"
         )
         return updated
+
+    def _maybe_promote_zone_to_active(self, zone_id: UUID) -> None:
+        """Move the parent zone CONFIRMED → ACTIVE; no-op if already ACTIVE.
+
+        Best-effort: a failure here shouldn't roll back the successful
+        setup update, so we log + swallow. The zone will get fixed up
+        on the next lifecycle scan or via manual reconciliation.
+        """
+        try:
+            zone = self._supabase.get_zone_by_id(zone_id)
+            if zone is None:
+                logger.warning(
+                    f"zone {zone_id} not found while promoting to ACTIVE"
+                )
+                return
+            if zone.status != "CONFIRMED":
+                # Already ACTIVE (concurrent setup activation) or past
+                # ACTIVE (CONSUMED/VIOLATED/FLIPPED) — leave it.
+                return
+            self._supabase.update_zone_status(zone_id, "ACTIVE")
+            logger.info(f"zone {zone_id} transitioned: CONFIRMED → ACTIVE")
+        except Exception:
+            logger.exception(
+                f"zone promotion CONFIRMED → ACTIVE failed for {zone_id}"
+            )
 
     def _cascade_cancel_waiting(self, setup_id: UUID | str) -> None:
         """Cancel all WAITING trades belonging to a now-terminal setup."""

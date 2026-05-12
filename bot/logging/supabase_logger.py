@@ -23,7 +23,7 @@ Design notes
 from __future__ import annotations
 
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
@@ -66,6 +66,12 @@ def _get_create_client() -> Any:
 
 Direction = Literal["BUY", "SELL"]
 ZoneType = Literal["STRONG_POINT", "IMBALANCE"]
+ZoneStatus = Literal[
+    "CONFIRMED", "ACTIVE", "CONSUMED", "VIOLATED", "FLIPPED",
+]
+"""See ``migrations/007_zone_lifecycle.sql`` for the state machine. The
+in-memory pre-states (FRESH / TRADEABLE) never reach the DB and are
+deliberately absent from this literal."""
 PatternType = Literal[
     # Legacy W/M era (preserved for back-compat on existing rows).
     "W", "M", "N",
@@ -92,7 +98,14 @@ class _ModelBase(BaseModel):
 
 
 class ZoneInput(_ModelBase):
-    """Insert payload for ``zones``."""
+    """Insert payload for ``zones``.
+
+    ``status`` defaults to ``"CONFIRMED"`` because the bot only persists
+    zones at the Strong Point confirmation boundary; pre-confirmation
+    states (FRESH / TRADEABLE) live only in pipeline output. Downstream
+    transitions are made via :meth:`SupabaseLogger.update_zone_status`,
+    not by re-inserting with a different status.
+    """
 
     symbol: str = "XAUUSD"
     direction: Direction
@@ -104,6 +117,7 @@ class ZoneInput(_ModelBase):
     qualified_imbalance_at: datetime | None = None
     formed_at: datetime
     last_evaluation_result: dict[str, Any] | None = None
+    status: ZoneStatus = "CONFIRMED"
 
 
 class SetupInput(_ModelBase):
@@ -183,6 +197,37 @@ class _ReadModelBase(BaseModel):
     """Read models are lenient: extra fields ignored (forward-compat)."""
 
     model_config = ConfigDict(extra="ignore")
+
+
+class Zone(_ReadModelBase):
+    """A row from the ``zones`` table.
+
+    Lifecycle columns (``status`` / ``consumed_at`` / ``violated_at`` /
+    ``flipped_at`` / ``flipped_direction``) were added in migration
+    007. ``invalidated_at`` is the legacy column kept for back-compat
+    with rows predating migration 007 — new code reads / writes the
+    explicit lifecycle columns above instead.
+    """
+
+    id: UUID
+    symbol: str
+    direction: Direction
+    zone_type: ZoneType
+    pattern_type: PatternType
+    top: Decimal
+    bottom: Decimal
+    approach_count: int = 0
+    qualified_imbalance_at: datetime | None = None
+    formed_at: datetime
+    invalidated_at: datetime | None = None  # legacy; see docstring
+    last_evaluation_result: dict[str, Any] | None = None
+    status: ZoneStatus = "CONFIRMED"
+    consumed_at: datetime | None = None
+    violated_at: datetime | None = None
+    flipped_at: datetime | None = None
+    flipped_direction: Direction | None = None
+    created_at: datetime
+    updated_at: datetime
 
 
 class Setup(_ReadModelBase):
@@ -278,6 +323,76 @@ class SupabaseLogger:
         payload = zone.model_dump(mode="json", exclude_none=True)
         result = self._client.table("zones").insert(payload).execute()
         return result.data[0]
+
+    def get_zones_by_status(
+        self, statuses: list[ZoneStatus],
+    ) -> list[Zone]:
+        """Return every zone whose ``status`` is in ``statuses``.
+
+        The per-bar lifecycle scanner uses this with the non-terminal
+        set (CONFIRMED / ACTIVE / CONSUMED / VIOLATED). FLIPPED is
+        terminal so callers usually exclude it.
+        """
+        result = (
+            self._client.table("zones")
+            .select("*")
+            .in_("status", list(statuses))
+            .execute()
+        )
+        return [Zone.model_validate(row) for row in (result.data or [])]
+
+    def get_zone_by_id(self, zone_id: UUID | str) -> Zone | None:
+        result = (
+            self._client.table("zones")
+            .select("*")
+            .eq("id", str(zone_id))
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return None
+        return Zone.model_validate(rows[0])
+
+    def update_zone_status(
+        self,
+        zone_id: UUID | str,
+        status: ZoneStatus,
+        *,
+        flipped_direction: Direction | None = None,
+    ) -> Zone:
+        """Patch a zone to ``status`` and stamp the matching timestamp.
+
+        The DB-level ``zones_status_timestamps_consistent`` CHECK
+        (migration 007) enforces that each status carries exactly the
+        right timestamp set — so we always set them here together.
+        ``flipped_direction`` must be supplied iff ``status='FLIPPED'``;
+        the DB CHECK will reject it otherwise.
+        """
+        now = datetime.now(tz=timezone.utc)
+        fields: dict[str, Any] = {"status": status}
+        if status == "CONSUMED":
+            fields["consumed_at"] = now
+        elif status == "VIOLATED":
+            fields["violated_at"] = now
+        elif status == "FLIPPED":
+            if flipped_direction is None:
+                raise ValueError(
+                    "update_zone_status: flipped_direction is required "
+                    "when status='FLIPPED'"
+                )
+            fields["flipped_at"] = now
+            fields["flipped_direction"] = flipped_direction
+        payload = _serialize_update_payload(fields)
+        result = (
+            self._client.table("zones")
+            .update(payload)
+            .eq("id", str(zone_id))
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            raise ValueError(f"zone {zone_id} not found for update")
+        return Zone.model_validate(rows[0])
 
     # ---- setups ----
     def log_setup(self, setup: SetupInput) -> dict[str, Any]:
