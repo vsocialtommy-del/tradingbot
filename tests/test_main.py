@@ -889,7 +889,10 @@ class TestDefaults:
         assert c.heartbeat_seconds == 300
         assert c.max_simultaneous_setups == 3
         assert c.daily_loss_limit_pct == 10.0
-        assert c.ohlc_count == 200
+        # 1000 M5 bars ≈ 3.5 days of history — wide enough for zones
+        # that formed 24-48 h ago to still be detectable. Pre-2026-05
+        # default was 200 (~16 h). See BotLoopConfig docstring.
+        assert c.ohlc_count == 1000
         assert c.ohlc_timeframe == "M5"
 
 

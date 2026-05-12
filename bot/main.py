@@ -161,7 +161,11 @@ class BotLoopConfig:
 
     max_simultaneous_setups: int = 3
     daily_loss_limit_pct: float = 10.0
-    ohlc_count: int = 200
+    ohlc_count: int = 1000
+    """Number of M5 bars to pull per pipeline run. 1000 ≈ 3.5 days of
+    history — wide enough that recent-but-not-current zones (24-48h
+    old) are still detectable. Pre-2026-05 default was 200 (~16 h),
+    which excluded zones the user trades manually."""
     ohlc_timeframe: Literal["M5"] = "M5"
     error_backoff_seconds: float = 5.0
 
@@ -254,6 +258,13 @@ class Bot:
 
     def initialize(self) -> None:
         """Connect to MT5, capture starting balance, reconcile."""
+        # ~3.5 days of M5 history at the default. Logged so the
+        # operator can confirm at restart without grepping config.
+        logger.info(
+            f"OHLC fetch window: {self.config.ohlc_count} "
+            f"{self.config.ohlc_timeframe} bars per pipeline run "
+            f"(~{self.config.ohlc_count * 5 / 60 / 24:.1f} days history)"
+        )
         self.mt5.connect()
         try:
             self.state.starting_balance = self.mt5.get_balance()
