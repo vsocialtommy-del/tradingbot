@@ -7,7 +7,7 @@ The previous break-and-close Strong Point gate is gone; zones are
 tradeable on the first retest once they pass the size filter and
 haven't been body-broken since formation. TP1 is computed by the
 orchestrator (``main._try_place_setup``) via
-:mod:`bot.strategy.tp1_target` so it can skip zones without a
+:mod:`bot.strategy.tp_target` so it can skip zones without a
 qualifying peak before committing to order placement.
 
 ::

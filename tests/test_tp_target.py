@@ -1,4 +1,4 @@
-"""Tests for ``bot.strategy.tp1_target``.
+"""Tests for ``bot.strategy.tp_target``.
 
 Pure-logic coverage of the local-peak detector that drives the new
 TP1 source in the loosened entry flow.
@@ -9,7 +9,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from bot.strategy.tp1_target import find_nearest_local_peak
+from bot.strategy.tp_target import find_nearest_local_peak
 
 
 # --------------------------------------------------------------------------- #

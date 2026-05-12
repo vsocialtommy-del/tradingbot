@@ -7,7 +7,7 @@ Two methodology updates land in this test file:
   by ``entry_trigger``.
 * Loosened-rules PR (May 2026) — ``place_layered_orders`` now takes
   ``tp1_price`` as a required argument. The TP1 source moved upstream
-  to ``main._try_place_setup`` (via :mod:`bot.strategy.tp1_target`),
+  to ``main._try_place_setup`` (via :mod:`bot.strategy.tp_target`),
   and the BOS_LEVEL / FIXED_DISTANCE machinery in this module is
   gone. The pre-checks now also enforce that ``tp1_price`` is on the
   favourable side of Layer 1's entry — a defensive sanity check, not
@@ -651,3 +651,59 @@ class TestSetupActivation:
         assert any(
             "PENDING → ACTIVE" in m for m in result.error_messages
         )
+
+
+# --------------------------------------------------------------------------- #
+# Per-layer TPs (PR #41) — tp2_price / tp3_price flow through to the
+# setup row. NULLs round-trip too.
+# --------------------------------------------------------------------------- #
+
+
+class TestPerLayerTpsThreadThrough:
+    def test_all_three_tps_persisted_when_set(
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
+    ) -> None:
+        zone = make_zone_for_test(direction="BUY", top=1900, bottom=1895)
+        place_layered_orders(
+            zone, zone_id, 0.01, 1880.0,
+            tp1_price=1908.0,
+            tp2_price=1916.0,
+            tp3_price=1925.0,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
+        )
+        si = mock_supabase.log_setup.call_args.args[0]
+        assert float(si.planned_tp1_price) == 1908.0
+        assert si.planned_tp2_price is not None
+        assert float(si.planned_tp2_price) == 1916.0
+        assert si.planned_tp3_price is not None
+        assert float(si.planned_tp3_price) == 1925.0
+
+    def test_tp2_tp3_default_to_none_when_omitted(
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
+    ) -> None:
+        # The recompute-on-hit path (PR #41 Q-C) populates NULL slots
+        # later. Confirms the setup creation path tolerates NULLs.
+        zone = make_zone_for_test(direction="BUY", top=1900, bottom=1895)
+        place_layered_orders(
+            zone, zone_id, 0.01, 1880.0,
+            tp1_price=1908.0,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
+        )
+        si = mock_supabase.log_setup.call_args.args[0]
+        assert si.planned_tp2_price is None
+        assert si.planned_tp3_price is None
+
+    def test_partial_chain_tp1_tp2_only(
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
+    ) -> None:
+        zone = make_zone_for_test(direction="BUY", top=1900, bottom=1895)
+        place_layered_orders(
+            zone, zone_id, 0.01, 1880.0,
+            tp1_price=1908.0,
+            tp2_price=1916.0,
+            # tp3 omitted
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
+        )
+        si = mock_supabase.log_setup.call_args.args[0]
+        assert float(si.planned_tp2_price) == 1916.0
+        assert si.planned_tp3_price is None

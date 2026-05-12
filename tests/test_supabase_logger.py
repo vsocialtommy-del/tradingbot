@@ -270,3 +270,77 @@ class TestUpdateZoneStatus:
 
         with pytest.raises(ValueError, match="not found for update"):
             logger.update_zone_status(uuid4(), "CONSUMED")
+
+
+# --------------------------------------------------------------------------- #
+# Per-layer TP fields (PR #41 / migration 009)
+# --------------------------------------------------------------------------- #
+
+
+class TestPerLayerTpFields:
+    def test_setup_input_accepts_tp2_tp3(self) -> None:
+        from bot.logging.supabase_logger import SetupInput
+        si = SetupInput(
+            zone_id=uuid4(),
+            direction="BUY",
+            entry_mode="STRONG_POINT_FIRST_TOUCH",
+            planned_layer1_price=Decimal("1900"),
+            planned_layer2_price=Decimal("1897.5"),
+            planned_layer3_price=Decimal("1895"),
+            planned_sl_price=Decimal("1880"),
+            planned_tp1_price=Decimal("1910"),
+            planned_tp2_price=Decimal("1920"),
+            planned_tp3_price=Decimal("1930"),
+            status="PENDING",
+        )
+        assert si.planned_tp2_price == Decimal("1920")
+        assert si.planned_tp3_price == Decimal("1930")
+
+    def test_setup_input_tp2_tp3_default_none(self) -> None:
+        from bot.logging.supabase_logger import SetupInput
+        si = SetupInput(
+            zone_id=uuid4(),
+            direction="BUY",
+            entry_mode="STRONG_POINT_FIRST_TOUCH",
+            planned_layer1_price=Decimal("1900"),
+            planned_layer2_price=Decimal("1897.5"),
+            planned_layer3_price=Decimal("1895"),
+            planned_sl_price=Decimal("1880"),
+            planned_tp1_price=Decimal("1910"),
+            status="PENDING",
+        )
+        assert si.planned_tp2_price is None
+        assert si.planned_tp3_price is None
+
+    def test_setup_read_model_round_trips_tp2_tp3(self) -> None:
+        from bot.logging.supabase_logger import Setup
+        payload = {
+            "id": str(uuid4()),
+            "zone_id": str(uuid4()),
+            "direction": "BUY",
+            "entry_mode": "STRONG_POINT_FIRST_TOUCH",
+            "planned_layer1_price": "1900",
+            "planned_layer2_price": "1897.5",
+            "planned_layer3_price": "1895",
+            "planned_sl_price": "1880",
+            "planned_tp1_price": "1910",
+            "planned_tp2_price": "1920",
+            "planned_tp3_price": "1930",
+            "status": "ACTIVE",
+            "created_at": NOW.isoformat(),
+            "updated_at": NOW.isoformat(),
+        }
+        s = Setup.model_validate(payload)
+        assert s.planned_tp2_price == Decimal("1920")
+        assert s.planned_tp3_price == Decimal("1930")
+
+    def test_close_reason_literal_includes_tp2_tp3(self) -> None:
+        from bot.logging.supabase_logger import CloseReason
+        from typing import get_args
+        values = set(get_args(CloseReason))
+        # PR #41 adds TP2 and TP3.
+        assert "TP2" in values
+        assert "TP3" in values
+        # Existing values preserved.
+        assert "TP1" in values
+        assert "SL_HIT" in values

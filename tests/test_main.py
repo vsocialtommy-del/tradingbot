@@ -27,7 +27,7 @@ from bot.exits.sl_manager import (
     SLManager,
     SLValidation,
 )
-from bot.exits.tp1_manager import TP1Manager, TP1Result
+from bot.exits.tp_manager import TPManager, LayerCloseResult
 from bot.filters.news_filter import (
     NewsCheckResult,
     NewsFilter,
@@ -148,8 +148,8 @@ def _replace_managers(
     bot.ohlc_provider = mocker.MagicMock(spec=OHLCProvider)
     bot.ohlc_provider.get.return_value = make_ohlc(n=30)
 
-    bot.tp1_manager = mocker.MagicMock(spec=TP1Manager)
-    bot.tp1_manager.check.return_value = TP1Result(triggered=False)
+    bot.tp_manager = mocker.MagicMock(spec=TPManager)
+    bot.tp_manager.check.return_value = []
 
     bot.sl_manager = mocker.MagicMock(spec=SLManager)
     bot.sl_manager.calculate_initial_sl.return_value = SLCalculation(
@@ -170,7 +170,7 @@ def _replace_managers(
     return {
         "position_tracker": bot.position_tracker,
         "ohlc_provider": bot.ohlc_provider,
-        "tp1_manager": bot.tp1_manager,
+        "tp_manager": bot.tp_manager,
         "sl_manager": bot.sl_manager,
         "entry_trigger": bot.entry_trigger,
         "news_filter": bot.news_filter,
@@ -337,7 +337,7 @@ class TestRunIterationEmpty:
         # entry_trigger.check_live runs every tick (it iterates internally).
         mgrs["entry_trigger"].check_live.assert_called_once()
         # tp1_manager.check is per-active-setup → 0 calls when none active.
-        mgrs["tp1_manager"].check.assert_not_called()
+        mgrs["tp_manager"].check.assert_not_called()
 
     def test_get_current_price_failure_returns_early(
         self, bot: tuple[Bot, dict[str, MagicMock]],
@@ -349,7 +349,7 @@ class TestRunIterationEmpty:
         b.run_iteration(NOW)
         # entry_trigger / tp1_manager not called when tick read fails.
         mgrs["entry_trigger"].check_live.assert_not_called()
-        mgrs["tp1_manager"].check.assert_not_called()
+        mgrs["tp_manager"].check.assert_not_called()
 
 
 class TestRunIterationActiveSetups:
@@ -361,7 +361,7 @@ class TestRunIterationActiveSetups:
         mgrs["position_tracker"].get_active_setups.return_value = [s1, s2]
         b.run_iteration(NOW)
         # ACTIVE → tp1_manager.check called once per setup.
-        assert mgrs["tp1_manager"].check.call_count == 2
+        assert mgrs["tp_manager"].check.call_count == 2
 
     def test_pending_setup_skipped_for_tp1(
         self, bot: tuple[Bot, dict[str, MagicMock]],
@@ -374,7 +374,7 @@ class TestRunIterationActiveSetups:
         ]
         b.run_iteration(NOW)
         # Only the ACTIVE one gets a TP1 check.
-        assert mgrs["tp1_manager"].check.call_count == 1
+        assert mgrs["tp_manager"].check.call_count == 1
 
     def test_entry_trigger_fired_layer_increments_counter(
         self, bot: tuple[Bot, dict[str, MagicMock]],
@@ -389,16 +389,22 @@ class TestRunIterationActiveSetups:
         b.run_iteration(NOW)
         assert b.state.fired_layer_count == 1
 
-    def test_tp1_triggered_increments_counter(
+    def test_tp_close_increments_counter(
         self, bot: tuple[Bot, dict[str, MagicMock]],
     ) -> None:
         b, mgrs = bot
         s = make_setup(status="ACTIVE")
         mgrs["position_tracker"].get_active_setups.return_value = [s]
-        mgrs["tp1_manager"].check.return_value = TP1Result(
-            triggered=True, tp1_price=1907.0,
-            closed_lots=0.0, new_sl_price=1900.0,
-        )
+        # PR #41: tp_manager.check returns a list of LayerCloseResult.
+        # Each entry increments the (still legacy-named) tp1_count
+        # counter so the heartbeat reflects "TP layer closes this run".
+        mgrs["tp_manager"].check.return_value = [
+            LayerCloseResult(
+                setup_id=s.id, trade_id=uuid4(),
+                layer_number=1, tp_price=1907.0, close_price=1907.0,
+                cascaded_sl=1900.0, needs_next_tp_recompute=False,
+            ),
+        ]
         b.run_iteration(NOW)
         assert b.state.tp1_count == 1
 
@@ -408,7 +414,7 @@ class TestRunIterationActiveSetups:
         b, mgrs = bot
         s = make_setup(status="ACTIVE")
         mgrs["position_tracker"].get_active_setups.return_value = [s]
-        mgrs["tp1_manager"].check.side_effect = RuntimeError("boom")
+        mgrs["tp_manager"].check.side_effect = RuntimeError("boom")
         # Doesn't raise.
         b.run_iteration(NOW)
 
@@ -489,7 +495,7 @@ class TestNewsBlock:
         mgrs["position_tracker"].get_active_setups.return_value = [s]
         b.run_iteration(NOW)
         # TP1 still checked even during blackout.
-        mgrs["tp1_manager"].check.assert_called_once()
+        mgrs["tp_manager"].check.assert_called_once()
 
 
 class TestDailyHalt:
@@ -1326,11 +1332,12 @@ class TestLoosenedRulesEntry:
 
         b.run_iteration(NOW)
 
-        # Verify the entry_price passed into the peak finder is the
-        # zone's Layer 1 entry (= zone.top for BUY).
-        call_kwargs = peak.call_args.kwargs
-        assert call_kwargs["entry_price"] == pytest.approx(1900.5)
-        assert call_kwargs["direction"] == "BUY"
+        # PR #41: find_nearest_local_peak is called 3× (TP1/TP2/TP3
+        # chain). Assert on the FIRST call — that's the TP1 lookup
+        # that uses Layer 1's entry as the reference.
+        first_call = peak.call_args_list[0]
+        assert first_call.kwargs["entry_price"] == pytest.approx(1900.5)
+        assert first_call.kwargs["direction"] == "BUY"
 
     def test_tp1_lookup_uses_layer_1_entry_for_sell(
         self, bot: tuple[Bot, dict[str, MagicMock]],
@@ -1356,9 +1363,10 @@ class TestLoosenedRulesEntry:
 
         b.run_iteration(NOW)
 
-        call_kwargs = peak.call_args.kwargs
-        assert call_kwargs["entry_price"] == pytest.approx(1900.0)
-        assert call_kwargs["direction"] == "SELL"
+        # PR #41: first call = TP1 lookup with Layer 1's entry.
+        first_call = peak.call_args_list[0]
+        assert first_call.kwargs["entry_price"] == pytest.approx(1900.0)
+        assert first_call.kwargs["direction"] == "SELL"
 
     def test_tp1_lookback_threaded_from_config(
         self, bot: tuple[Bot, dict[str, MagicMock]],
@@ -1389,7 +1397,8 @@ class TestLoosenedRulesEntry:
 
         b.run_iteration(NOW)
 
-        assert peak.call_args.kwargs["lookback_bars"] == 123
+        # All 3 TP-chain calls share the same lookback config.
+        assert peak.call_args_list[0].kwargs["lookback_bars"] == 123
 
 
 # --------------------------------------------------------------------------- #
@@ -1720,9 +1729,11 @@ class TestFlippedZoneTrading:
         # SL = zone.top + 17.5 for SELL = 1922.5
         assert call.kwargs["sl_price"] == pytest.approx(1922.5)
         # TP1 search ran in the flipped direction with the SELL entry
-        # reference (= zone.bottom).
-        assert peak.call_args.kwargs["direction"] == "SELL"
-        assert peak.call_args.kwargs["entry_price"] == pytest.approx(1900.0)
+        # reference (= zone.bottom). PR #41: subsequent calls in the
+        # same iteration are for TP2 / TP3 — assert on the first call.
+        first_call = peak.call_args_list[0]
+        assert first_call.kwargs["direction"] == "SELL"
+        assert first_call.kwargs["entry_price"] == pytest.approx(1900.0)
 
     def test_body_break_since_flip_rejects_dead_zone(
         self, bot: tuple[Bot, dict[str, MagicMock]],
