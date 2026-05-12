@@ -75,6 +75,7 @@ from uuid import UUID
 from loguru import logger
 
 from bot.execution.mt5_connector import MT5Connector
+from bot.execution.position_tracker import PositionTracker
 from bot.logging.supabase_logger import (
     SetupInput,
     SupabaseLogger,
@@ -122,12 +123,21 @@ def place_layered_orders(
     *,
     mt5: MT5Connector,
     supabase: SupabaseLogger,
+    tracker: PositionTracker,
     config: OrderManagerConfig | None = None,
 ) -> OrderPlacementResult:
     """Place Layer 1 + write Supabase rows for Layers 2/3 (status=WAITING).
 
     Layers 2 and 3 are NOT sent to the broker. ``entry_trigger`` fires
     them as market orders when the live tick reaches their trigger price.
+
+    On a successful PLACED outcome (Layer 1 filled + no gap-through),
+    the setup is transitioned PENDING → ACTIVE via ``tracker``. This
+    is the activation hook ``entry_trigger`` and ``tp1_manager`` both
+    rely on — without it (the pre-2026-05 state), Layers 2/3 never
+    fire and TP1 management never runs. SKIPPED / FAILED outcomes do
+    NOT promote the setup; it stays PENDING (and the cascade-cancel
+    path eventually marks it SKIPPED).
 
     ``tp1_price`` is supplied by the caller (see
     :mod:`bot.strategy.tp1_target`). Pre-checks reject obviously
@@ -245,6 +255,24 @@ def place_layered_orders(
         layer_1_filled_price=layer_1_filled_price,
         errors=errors,
     )
+
+    # 7. Promote setup PENDING → ACTIVE. Layer 1 is on the broker and
+    # the trade row is FILLED — the setup is "activated" and the
+    # downstream managers (entry_trigger for Layers 2/3, tp1_manager
+    # for TP1) gate on ``status == "ACTIVE"``. Without this hop those
+    # managers silently skip the setup and Layers 2/3 + TP1 never
+    # fire. (Bug 0 fix.)
+    try:
+        tracker.update_setup_status(setup_id, "ACTIVE")
+    except Exception:
+        errors.append(
+            "Setup PENDING → ACTIVE transition failed; Layer 1 is on "
+            "the broker but Layers 2/3 + TP1 won't fire until status "
+            "is corrected. Reconciliation needed."
+        )
+        logger.exception(
+            f"order_manager: failed to promote setup {setup_id} to ACTIVE"
+        )
 
     return OrderPlacementResult(
         setup_id=setup_id,

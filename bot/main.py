@@ -438,7 +438,7 @@ class Bot:
                     f"new setups blocked: news → {news_check.block_reason}"
                 )
             elif self._has_new_m5_close(now):
-                self._maybe_run_strategy(now)
+                self._maybe_run_strategy(now, bid=bid, ask=ask)
 
         # 6. Reconcile (cadenced).
         if self._should_reconcile(now):
@@ -576,8 +576,16 @@ class Bot:
             return True
         return False
 
-    def _maybe_run_strategy(self, now: datetime) -> None:
-        """Run the per-bar zone lifecycle pass + strategy pipeline."""
+    def _maybe_run_strategy(
+        self, now: datetime, *, bid: float, ask: float,
+    ) -> None:
+        """Run the per-bar zone lifecycle pass + strategy pipeline.
+
+        ``bid`` / ``ask`` are the current tick prices threaded from the
+        outer loop. Used by the price-vs-zone gate in
+        :meth:`_try_place_setup` to skip placement when price hasn't
+        reached the planned Layer 1 entry yet.
+        """
         df: pd.DataFrame | None = getattr(self, "_latest_ohlc", None)
         if df is None:
             return
@@ -663,7 +671,7 @@ class Bot:
                     f"({exp.current_count}/{exp.max_allowed})"
                 )
                 break
-            if self._try_place_setup(zone, df, zid):
+            if self._try_place_setup(zone, df, zid, bid=bid, ask=ask):
                 active_count += 1
                 self.state.placed_setup_count += 1
                 logger.info(
@@ -845,12 +853,18 @@ class Bot:
 
     def _try_place_setup(
         self, zone: ValidatedZone, ohlc_df: pd.DataFrame, zone_id: UUID,
+        *,
+        bid: float, ask: float,
     ) -> bool:
         """Compute SL + TP1 + lot size, validate, place orders.
 
         ``zone_id`` is supplied by the caller — the zone row was already
         inserted (or looked up from cache) by ``_persist_zone_if_new``
         before we got here. Setup row FKs to it.
+
+        ``bid`` / ``ask`` are the current tick prices, used by the
+        price-vs-zone gate to skip setups when price hasn't reached
+        the planned Layer 1 entry yet. (Bug 2 fix.)
 
         Returns True iff ``order_manager.place_layered_orders`` reported
         ``PLACED`` (not FAILED, not SKIPPED-via-gap).
@@ -863,6 +877,35 @@ class Bot:
                 f"new setup skipped: zone {zone.direction} "
                 f"{zone.bottom:.2f}-{zone.top:.2f} overlaps an existing "
                 f"CONSUMED/VIOLATED/FLIPPED zone"
+            )
+            return False
+
+        # 0b. Price-vs-zone gate (Bug 2 fix). Don't place Layer 1 as a
+        # market order if current price hasn't reached the zone yet —
+        # we'd fill at the wrong price (potentially many points away
+        # from the planned Layer 1 entry). Skip this iteration; the
+        # next M5 close re-evaluates.
+        #
+        # * BUY  Layer 1 = zone.top.  Fires when price drops in from
+        #        above → bid must be ≤ zone.top.
+        # * SELL Layer 1 = zone.bottom. Fires when price rises in from
+        #        below → ask must be ≥ zone.bottom.
+        #
+        # Overshoot (price past the FAR edge) is caught by the existing
+        # ``_detect_gap_through`` check in order_manager; this gate
+        # only covers the "not yet at zone" case.
+        if zone.direction == "BUY" and bid > zone.top:
+            logger.info(
+                f"new setup deferred: BUY zone {zone.bottom:.2f}-"
+                f"{zone.top:.2f}, current bid {bid:.2f} above zone.top; "
+                f"waiting for price to retest"
+            )
+            return False
+        if zone.direction == "SELL" and ask < zone.bottom:
+            logger.info(
+                f"new setup deferred: SELL zone {zone.bottom:.2f}-"
+                f"{zone.top:.2f}, current ask {ask:.2f} below zone.bottom; "
+                f"waiting for price to retest"
             )
             return False
 
@@ -930,7 +973,9 @@ class Bot:
                 lot_size=lot_result.lot_size,
                 sl_price=sl_price,
                 tp1_price=tp1_price,
-                mt5=self.mt5, supabase=self.supabase,
+                mt5=self.mt5,
+                supabase=self.supabase,
+                tracker=self.position_tracker,
                 config=self.order_manager_config,
             )
         except Exception:

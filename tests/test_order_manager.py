@@ -24,6 +24,7 @@ import pytest
 from pytest_mock import MockerFixture
 
 from bot.execution.mt5_connector import MT5Connector
+from bot.execution.position_tracker import PositionTracker
 from bot.execution.order_manager import (
     OrderManagerConfig,
     place_layered_orders,
@@ -143,6 +144,13 @@ def mock_mt5(mocker: MockerFixture) -> MagicMock:
 
 
 @pytest.fixture
+def mock_tracker(mocker: MockerFixture) -> MagicMock:
+    """PositionTracker mock for the PENDING → ACTIVE activation hook
+    (Bug 0 fix). Default: ``update_setup_status`` succeeds silently."""
+    return mocker.MagicMock(spec=PositionTracker)
+
+
+@pytest.fixture
 def mock_supabase(
     mocker: MockerFixture,
     setup_id: UUID,
@@ -166,14 +174,14 @@ def mock_supabase(
 
 class TestHappyPath:
     def test_buy_layer_1_places_and_l2_l3_are_waiting_rows(
-        self, mock_mt5, mock_supabase, zone_id, setup_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id, setup_id,
         layer_2_trade_id, layer_3_trade_id,
     ) -> None:
         zone = make_zone_for_test(direction="BUY", top=1900, bottom=1895)
         result = place_layered_orders(
             zone, zone_id, lot_size=0.01,
             sl_price=1880.0, tp1_price=DEFAULT_BUY_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         assert result.status == "PLACED"
         assert result.setup_id == setup_id
@@ -185,7 +193,7 @@ class TestHappyPath:
         assert result.tp1_price == DEFAULT_BUY_TP1
 
     def test_sell_layer_1_places_and_l2_l3_are_waiting_rows(
-        self, mock_mt5, mock_supabase, zone_id, setup_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id, setup_id,
         layer_2_trade_id, layer_3_trade_id,
     ) -> None:
         # SELL: fill below zone top, TP1 below zone bottom.
@@ -196,7 +204,7 @@ class TestHappyPath:
         result = place_layered_orders(
             zone, zone_id, lot_size=0.01,
             sl_price=1925.0, tp1_price=DEFAULT_SELL_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         assert result.status == "PLACED"
         assert result.layer_1_ticket == 11111
@@ -207,23 +215,23 @@ class TestLayerOrderToBroker:
     """The headline behaviour: only Layer 1 hits MT5."""
 
     def test_layer_2_and_3_NOT_sent_to_mt5(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         zone = make_zone_for_test()
         place_layered_orders(
             zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         mock_mt5.place_limit_order.assert_not_called()
         assert mock_mt5.place_market_order.call_count == 1
 
     def test_only_layer_1_gets_a_broker_comment(
-        self, mock_mt5, mock_supabase, zone_id, setup_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id, setup_id,
     ) -> None:
         zone = make_zone_for_test()
         place_layered_orders(
             zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         comment = mock_mt5.place_market_order.call_args.kwargs["comment"]
         assert comment.startswith("bot:L1:s=")
@@ -233,7 +241,7 @@ class TestLayerOrderToBroker:
 
 class TestCallOrder:
     def test_setup_then_market_then_trades(
-        self, mock_mt5, mock_supabase, zone_id, mocker: MockerFixture,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id, mocker: MockerFixture,
     ) -> None:
         zone = make_zone_for_test()
         parent = mocker.MagicMock()
@@ -244,7 +252,7 @@ class TestCallOrder:
 
         place_layered_orders(
             zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
 
         names = [c[0] for c in parent.mock_calls]
@@ -264,14 +272,14 @@ class TestCallOrder:
 
 class TestPreChecks:
     def test_zone_not_tradeable_returns_failed_no_mt5_calls(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         zone = make_zone_for_test(
             is_tradeable=False, rejection_reason="ZONE_TOO_NARROW",
         )
         result = place_layered_orders(
             zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         assert result.status == "FAILED"
         assert result.setup_id is None
@@ -280,49 +288,49 @@ class TestPreChecks:
         assert any("not tradeable" in m for m in result.error_messages)
 
     def test_not_strong_point_returns_failed(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         zone = make_zone_for_test(is_strong_point=False)
         result = place_layered_orders(
             zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         assert result.status == "FAILED"
         mock_mt5.place_market_order.assert_not_called()
 
     def test_lot_size_zero_rejected(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         zone = make_zone_for_test()
         result = place_layered_orders(
             zone, zone_id, 0.0, 1880.0, DEFAULT_BUY_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         assert result.status == "FAILED"
         mock_mt5.place_market_order.assert_not_called()
 
     def test_sl_above_zone_top_for_buy_rejected(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         zone = make_zone_for_test(direction="BUY", top=1900, bottom=1895)
         result = place_layered_orders(
             zone, zone_id, 0.01, 1910.0, DEFAULT_BUY_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         assert result.status == "FAILED"
 
     def test_sl_below_zone_bottom_for_sell_rejected(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         zone = make_zone_for_test(direction="SELL", top=1905, bottom=1900)
         result = place_layered_orders(
             zone, zone_id, 0.01, 1895.0, DEFAULT_SELL_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         assert result.status == "FAILED"
 
     def test_tp1_below_zone_top_for_buy_rejected(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         # Loosened-rules pre-check: TP1 must be above zone.top for BUY.
         # Caller (main._try_place_setup) skips zones with no qualifying
@@ -331,19 +339,19 @@ class TestPreChecks:
         zone = make_zone_for_test(direction="BUY", top=1900, bottom=1895)
         result = place_layered_orders(
             zone, zone_id, 0.01, 1880.0, tp1_price=1895.0,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         assert result.status == "FAILED"
         assert any("TP1" in m for m in result.error_messages)
         mock_mt5.place_market_order.assert_not_called()
 
     def test_tp1_above_zone_bottom_for_sell_rejected(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         zone = make_zone_for_test(direction="SELL", top=1905, bottom=1900)
         result = place_layered_orders(
             zone, zone_id, 0.01, 1925.0, tp1_price=1905.0,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         assert result.status == "FAILED"
         assert any("TP1" in m for m in result.error_messages)
@@ -356,26 +364,26 @@ class TestPreChecks:
 
 class TestFailureModes:
     def test_layer_1_market_failure_returns_failed(
-        self, mock_mt5, mock_supabase, zone_id, setup_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id, setup_id,
     ) -> None:
         mock_mt5.place_market_order.side_effect = RuntimeError("broker error")
         zone = make_zone_for_test()
         result = place_layered_orders(
             zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         assert result.status == "FAILED"
         assert result.setup_id == setup_id
         mock_supabase.log_trade.assert_not_called()
 
     def test_supabase_log_setup_failure_no_mt5_calls(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         mock_supabase.log_setup.side_effect = RuntimeError("DB down")
         zone = make_zone_for_test()
         result = place_layered_orders(
             zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         assert result.status == "FAILED"
         assert result.setup_id is None
@@ -389,7 +397,7 @@ class TestFailureModes:
 
 class TestGapThrough:
     def test_buy_filled_below_zone_bottom_triggers_skip(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         mock_mt5.get_open_positions.return_value = [
             {"ticket": 11111, "price_open": 1893.0},
@@ -397,7 +405,7 @@ class TestGapThrough:
         zone = make_zone_for_test(direction="BUY", top=1900, bottom=1895)
         result = place_layered_orders(
             zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         assert result.status == "SKIPPED"
         assert result.layer_1_ticket == 11111
@@ -408,7 +416,7 @@ class TestGapThrough:
         mock_supabase.log_event.assert_called()
 
     def test_sell_filled_above_zone_top_triggers_skip(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         mock_mt5.get_open_positions.return_value = [
             {"ticket": 11111, "price_open": 1908.0},
@@ -416,7 +424,7 @@ class TestGapThrough:
         zone = make_zone_for_test(direction="SELL", top=1905, bottom=1900)
         result = place_layered_orders(
             zone, zone_id, 0.01, 1925.0, DEFAULT_SELL_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         assert result.status == "SKIPPED"
         mock_mt5.close_position.assert_called_once_with(11111)
@@ -429,12 +437,12 @@ class TestGapThrough:
 
 class TestTradeRowContents:
     def test_layer_1_row_is_filled_with_ticket_and_entry_price(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         zone = make_zone_for_test()
         place_layered_orders(
             zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         layer_1_input = mock_supabase.log_trade.call_args_list[0].args[0]
         assert layer_1_input.layer_number == 1
@@ -445,12 +453,12 @@ class TestTradeRowContents:
         assert float(layer_1_input.entry_price) == 1900.00
 
     def test_layer_2_and_3_rows_are_waiting_with_no_ticket(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         zone = make_zone_for_test()
         place_layered_orders(
             zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         assert mock_supabase.log_trade.call_count == 3
         layer_2_input = mock_supabase.log_trade.call_args_list[1].args[0]
@@ -473,12 +481,12 @@ class TestTradeRowContents:
 
 class TestNoTpOnBroker:
     def test_layer_1_market_order_has_no_tp(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         zone = make_zone_for_test()
         place_layered_orders(
             zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         kwargs = mock_mt5.place_market_order.call_args.kwargs
         assert kwargs["tp"] is None
@@ -492,23 +500,23 @@ class TestNoTpOnBroker:
 
 class TestSetupRecord:
     def test_strong_point_uses_strong_point_entry_mode(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         zone = make_zone_for_test()
         place_layered_orders(
             zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         setup_input = mock_supabase.log_setup.call_args.args[0]
         assert setup_input.entry_mode == "STRONG_POINT_FIRST_TOUCH"
 
     def test_setup_record_planned_prices_match_zone_geometry(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         zone = make_zone_for_test(direction="BUY", top=1900, bottom=1895)
         place_layered_orders(
             zone, zone_id, 0.01, 1880.0, tp1_price=1908.0,
-            mt5=mock_mt5, supabase=mock_supabase,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
         )
         s = mock_supabase.log_setup.call_args.args[0]
         assert float(s.planned_layer1_price) == 1900.0  # zone top
@@ -519,7 +527,7 @@ class TestSetupRecord:
         assert s.status == "PENDING"
 
     def test_tp1_passes_through_to_setup_row(
-        self, mock_mt5, mock_supabase, zone_id,
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
     ) -> None:
         # Different TP1 each time → setup row reflects it. No internal
         # computation that could overwrite the caller's choice.
@@ -532,7 +540,7 @@ class TestSetupRecord:
             zone = make_zone_for_test(direction="BUY", top=1900, bottom=1895)
             place_layered_orders(
                 zone, zone_id, 0.01, 1880.0, tp1_price=tp1,
-                mt5=mock_mt5, supabase=mock_supabase,
+                mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
             )
             s = mock_supabase.log_setup.call_args.args[0]
             assert float(s.planned_tp1_price) == tp1
@@ -552,3 +560,94 @@ class TestConfig:
         assert cfg.gap_tolerance_dollars == pytest.approx(0.05)
         assert not hasattr(cfg, "tp1_method")
         assert not hasattr(cfg, "tp1_distance_dollars")
+
+
+# --------------------------------------------------------------------------- #
+# Setup activation (Bug 0 fix) — PENDING → ACTIVE happens after Layer 1
+# is FILLED + trade rows written. Without this hop entry_trigger and
+# tp1_manager silently ignore the setup (they gate on status='ACTIVE').
+# --------------------------------------------------------------------------- #
+
+
+class TestSetupActivation:
+    def test_placed_promotes_setup_to_active(
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id, setup_id,
+    ) -> None:
+        zone = make_zone_for_test(direction="BUY", top=1900, bottom=1895)
+        result = place_layered_orders(
+            zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
+        )
+        assert result.status == "PLACED"
+        mock_tracker.update_setup_status.assert_called_once_with(
+            setup_id, "ACTIVE",
+        )
+
+    def test_gap_through_skipped_does_not_promote(
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
+    ) -> None:
+        # Layer 1 filled past the far edge → SKIPPED. Setup stays
+        # PENDING (cascade-cancel path will handle it).
+        mock_mt5.get_open_positions.return_value = [
+            {"ticket": 11111, "price_open": 1893.0},
+        ]
+        zone = make_zone_for_test(direction="BUY", top=1900, bottom=1895)
+        result = place_layered_orders(
+            zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
+        )
+        assert result.status == "SKIPPED"
+        mock_tracker.update_setup_status.assert_not_called()
+
+    def test_pre_check_failed_does_not_promote(
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
+    ) -> None:
+        # Pre-check rejects the zone — never even hits MT5. No setup
+        # was created, so no promotion to attempt.
+        zone = make_zone_for_test(
+            is_tradeable=False, rejection_reason="ZONE_TOO_NARROW",
+        )
+        result = place_layered_orders(
+            zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
+        )
+        assert result.status == "FAILED"
+        mock_tracker.update_setup_status.assert_not_called()
+
+    def test_layer_1_market_failure_does_not_promote(
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
+    ) -> None:
+        # Setup row was created (PENDING) but Layer 1 broker call
+        # failed → no market position → don't promote. The PENDING
+        # setup is repairable via reconciliation.
+        mock_mt5.place_market_order.side_effect = RuntimeError("broker err")
+        zone = make_zone_for_test()
+        result = place_layered_orders(
+            zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
+        )
+        assert result.status == "FAILED"
+        mock_tracker.update_setup_status.assert_not_called()
+
+    def test_promotion_failure_does_not_break_placement(
+        self, mock_mt5, mock_supabase, mock_tracker, zone_id,
+    ) -> None:
+        # The market order succeeded and trade rows are written.
+        # If the activation hop fails (Supabase blip), Layer 1 is
+        # still on the broker — we must NOT downgrade the result to
+        # FAILED. The error gets attached to ``error_messages`` so
+        # reconciliation can spot it.
+        mock_tracker.update_setup_status.side_effect = RuntimeError(
+            "supabase outage",
+        )
+        zone = make_zone_for_test()
+        result = place_layered_orders(
+            zone, zone_id, 0.01, 1880.0, DEFAULT_BUY_TP1,
+            mt5=mock_mt5, supabase=mock_supabase, tracker=mock_tracker,
+        )
+        # Still PLACED — Layer 1 is on the broker.
+        assert result.status == "PLACED"
+        # But the activation failure surfaces in error_messages.
+        assert any(
+            "PENDING → ACTIVE" in m for m in result.error_messages
+        )
