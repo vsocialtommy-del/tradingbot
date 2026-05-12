@@ -934,10 +934,10 @@ class TestZonePromotionOnSetupActivation:
 
         mock_supabase.update_zone_status.assert_not_called()
 
-    def test_skips_promotion_when_zone_past_active(
+    def test_skips_promotion_when_zone_consumed(
         self, tracker: PositionTracker, mock_supabase: MagicMock,
     ) -> None:
-        # CONSUMED/VIOLATED/FLIPPED zones shouldn't get yanked back.
+        # CONSUMED zones shouldn't get yanked back.
         zone_id = uuid4()
         setup = make_setup(status="PENDING")
         setup_active = make_setup(id=setup.id, status="ACTIVE")
@@ -945,10 +945,6 @@ class TestZonePromotionOnSetupActivation:
 
         mock_supabase.get_setup_by_id.return_value = setup
         mock_supabase.update_setup.return_value = setup_active
-        # Zone has already been CONSUMED — leave it.
-        # (The Zone read model with the CONSUMED status also needs
-        # consumed_at to satisfy the DB CHECK in production, but for
-        # the in-memory mock we just set status.)
         mock_supabase.get_zone_by_id.return_value = make_zone_row(
             id=zone_id, status="CONSUMED",
         ).model_copy(update={"consumed_at": NOW})
@@ -956,6 +952,35 @@ class TestZonePromotionOnSetupActivation:
         tracker.update_setup_status(setup.id, "ACTIVE")
 
         mock_supabase.update_zone_status.assert_not_called()
+
+    def test_promotes_flipped_zone_to_active(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        # PR #38: a setup placed on a FLIPPED zone (SnD Flip trade)
+        # transitions the zone FLIPPED → ACTIVE — same hook as
+        # CONFIRMED → ACTIVE, just a different source status.
+        zone_id = uuid4()
+        setup = make_setup(status="PENDING")
+        setup_active = make_setup(
+            id=setup.id, status="ACTIVE", activated_at=NOW,
+        ).model_copy(update={"zone_id": zone_id})
+
+        mock_supabase.get_setup_by_id.return_value = setup
+        mock_supabase.update_setup.return_value = setup_active
+        mock_supabase.get_zone_by_id.return_value = make_zone_row(
+            id=zone_id, status="FLIPPED",
+        ).model_copy(update={
+            "violated_at": NOW,
+            "flipped_at": NOW,
+            "flipped_direction": "SELL",
+        })
+
+        tracker.update_setup_status(setup.id, "ACTIVE")
+
+        # Promotion fires for FLIPPED zones now (PR #38).
+        mock_supabase.update_zone_status.assert_called_once_with(
+            zone_id, "ACTIVE",
+        )
 
     def test_non_pending_to_active_transition_does_not_promote(
         self, tracker: PositionTracker, mock_supabase: MagicMock,

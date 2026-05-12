@@ -278,7 +278,15 @@ class PositionTracker:
         return updated
 
     def _maybe_promote_zone_to_active(self, zone_id: UUID) -> None:
-        """Move the parent zone CONFIRMED → ACTIVE; no-op if already ACTIVE.
+        """Move the parent zone to ACTIVE; no-op if already there or past it.
+
+        Two source statuses are valid:
+          * CONFIRMED → ACTIVE  — the normal first-touch flow.
+          * FLIPPED   → ACTIVE  — the SnD Flip trade path (PR #38).
+                                  ``flipped_direction`` is preserved on
+                                  the row by migration 008 + the
+                                  explicit-null handling in
+                                  ``update_zone_status``.
 
         Best-effort: a failure here shouldn't roll back the successful
         setup update, so we log + swallow. The zone will get fixed up
@@ -291,15 +299,18 @@ class PositionTracker:
                     f"zone {zone_id} not found while promoting to ACTIVE"
                 )
                 return
-            if zone.status != "CONFIRMED":
+            if zone.status not in ("CONFIRMED", "FLIPPED"):
                 # Already ACTIVE (concurrent setup activation) or past
-                # ACTIVE (CONSUMED/VIOLATED/FLIPPED) — leave it.
+                # ACTIVE (CONSUMED/VIOLATED) — leave it.
                 return
+            prior_status = zone.status
             self._supabase.update_zone_status(zone_id, "ACTIVE")
-            logger.info(f"zone {zone_id} transitioned: CONFIRMED → ACTIVE")
+            logger.info(
+                f"zone {zone_id} transitioned: {prior_status} → ACTIVE"
+            )
         except Exception:
             logger.exception(
-                f"zone promotion CONFIRMED → ACTIVE failed for {zone_id}"
+                f"zone promotion → ACTIVE failed for {zone_id}"
             )
 
     def _cascade_cancel_waiting(self, setup_id: UUID | str) -> None:

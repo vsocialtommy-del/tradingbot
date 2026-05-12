@@ -72,12 +72,21 @@ _VALID_ZONE_TRANSITIONS: dict[ZoneStatus, frozenset[ZoneStatus]] = {
     "ACTIVE":    frozenset({"CONSUMED", "VIOLATED"}),
     "CONSUMED":  frozenset({"VIOLATED"}),
     "VIOLATED":  frozenset({"FLIPPED"}),
-    "FLIPPED":   frozenset(),  # terminal
+    # PR #38 (SnD Flip trading): FLIPPED is no longer terminal. A
+    # freshly-flipped zone can be traded in ``flipped_direction``;
+    # placing a setup transitions FLIPPED → ACTIVE. The subsequent
+    # ACTIVE → CONSUMED path is unchanged.
+    "FLIPPED":   frozenset({"ACTIVE"}),
 }
 
 
-TERMINAL_ZONE_STATUSES: frozenset[ZoneStatus] = frozenset({"FLIPPED"})
-"""Zones in this status never transition again."""
+TERMINAL_ZONE_STATUSES: frozenset[ZoneStatus] = frozenset()
+"""Zones in this status never transition again.
+
+Empty since PR #38: every persisted status has at least one outgoing
+edge. A zone that's been flipped, traded, and consumed CAN in theory
+re-flip (CONSUMED → VIOLATED → FLIPPED), though this is rare in
+practice."""
 
 
 SKIP_NEW_SETUP_STATUSES: frozenset[ZoneStatus] = frozenset(
@@ -165,6 +174,51 @@ def check_violation(
     if zone.direction == "BUY":
         return bar_close < zone.bottom
     return bar_close > zone.top
+
+
+def flipped_zone_body_broken_since_flip(
+    zone_top: float,
+    zone_bottom: float,
+    flipped_direction: Direction,
+    flipped_at: pd.Timestamp,
+    df: pd.DataFrame,
+) -> bool:
+    """True iff any bar after ``flipped_at`` body-closed past the wrong side.
+
+    Pre-trade safety net for the FLIPPED → ACTIVE path (PR #38):
+    symmetric to :func:`bot.strategy.strong_point._zone_body_broken_since_formation`,
+    but keyed off ``flipped_at`` instead of pattern formation. Once a
+    zone has been flipped, any subsequent body close past the wrong
+    side of the (new) direction kills the trade opportunity — price
+    has invalidated the flip premise.
+
+    For a BUY-direction flipped zone (originally SELL): reject if any
+    bar's ``close < zone.bottom``. SELL mirror: reject if any
+    ``close > zone.top``. Wick-only pokes don't count (same body-close
+    convention as :func:`check_violation`).
+
+    Returns ``False`` when there are no bars after ``flipped_at`` —
+    a freshly-flipped zone with no follow-through bars yet is
+    tradeable. The lookup is strict ``time > flipped_at`` so the flip
+    bar itself isn't re-checked.
+    """
+    times = df.index
+    start_idx: int | None = None
+    for i, t in enumerate(times):
+        if t > flipped_at:
+            start_idx = i
+            break
+    if start_idx is None:
+        return False
+
+    closes = df["close"].to_numpy()
+    for i in range(start_idx, len(df)):
+        bar_close = float(closes[i])
+        if flipped_direction == "BUY" and bar_close < zone_bottom:
+            return True
+        if flipped_direction == "SELL" and bar_close > zone_top:
+            return True
+    return False
 
 
 def check_flip(
