@@ -121,8 +121,12 @@ def run_strategy_pipeline(
             zone = mark_zone(pattern, df)
             refined = refine_zone(zone, df, refinement_cfg)
             vz = validate_strong_point(refined, df, sp_cfg)
-            if vz.is_strong_point:
-                validated.append(vz)
+            # Return every validated zone (tradeable or not). The caller
+            # decides what to do with each — main.py persists the
+            # is_tradeable=True subset and only attempts placement on
+            # is_strong_point=True. Non-tradeable zones are still useful
+            # for downstream callers (debug / backtest diagnostics).
+            validated.append(vz)
         except Exception:
             logger.exception(
                 "strategy pipeline: per-pattern error; skipping and continuing"
@@ -130,7 +134,10 @@ def run_strategy_pipeline(
             continue
 
     logger.debug(
-        "strategy pipeline: {} patterns → {} tradeable zones",
+        "strategy pipeline: {} patterns → {} validated zones "
+        "({} tradeable, {} strong point)",
         len(patterns), len(validated),
+        sum(1 for v in validated if v.refined_zone.is_tradeable),
+        sum(1 for v in validated if v.is_strong_point),
     )
     return validated

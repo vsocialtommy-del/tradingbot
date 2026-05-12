@@ -1387,3 +1387,237 @@ class TestLoosenedRulesEntry:
         b.run_iteration(NOW)
 
         assert peak.call_args.kwargs["lookback_bars"] == 123
+
+
+# --------------------------------------------------------------------------- #
+# Zone persistence (PR #36 follow-up: log_zone hoisted out of
+# _try_place_setup, idempotency cache, startup hydration).
+# --------------------------------------------------------------------------- #
+
+
+def _make_non_tradeable_validated(direction: str = "BUY") -> _ValidatedZone:
+    """ValidatedZone with refined.is_tradeable=False (size-filter reject)."""
+    base = _make_validated_for_persistence(_PT.RBR if direction == "BUY" else _PT.DBD)
+    rejected_refined = _RefinedZone(
+        direction=base.refined_zone.direction,
+        top=base.refined_zone.top,
+        bottom=base.refined_zone.bottom,
+        formed_at=base.refined_zone.formed_at,
+        source_pattern=base.refined_zone.source_pattern,
+        is_tradeable=False,
+        rejection_reason="ZONE_TOO_NARROW",
+        original_zone=base.refined_zone.original_zone,
+    )
+    return _ValidatedZone(
+        direction=base.direction, top=base.top, bottom=base.bottom,
+        formed_at=base.formed_at, source_pattern=base.source_pattern,
+        refined_zone=rejected_refined,
+        is_strong_point=False,
+        validation_failures=["NOT_TRADEABLE"],
+        broken_swing=None, broken_at=None, sl_anchor_swing=None,
+    )
+
+
+class TestZonePersistence:
+    def test_tradeable_zone_persisted_with_status_confirmed(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        mocker.patch("bot.main.place_layered_orders").return_value = (
+            mocker.MagicMock(
+                status="PLACED", setup_id=uuid4(),
+                layer_1_ticket=11111, sl_price=1882.5, tp1_price=1907.5,
+                error_messages=[],
+            )
+        )
+
+        b.run_iteration(NOW)
+
+        # log_zone fired exactly once, with status defaulted to CONFIRMED.
+        mock_supabase.log_zone.assert_called_once()
+        zi = mock_supabase.log_zone.call_args.args[0]
+        assert zi.status == "CONFIRMED"
+        assert zi.direction == zone.direction
+
+    def test_non_tradeable_zone_not_persisted(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Pipeline now emits non-tradeable zones too; main.py persists
+        # only the tradeable subset.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        rejected = _make_non_tradeable_validated()
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[rejected])
+
+        b.run_iteration(NOW)
+
+        mock_supabase.log_zone.assert_not_called()
+
+    def test_same_zone_persisted_once_across_iterations(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        mocker.patch("bot.main.place_layered_orders").return_value = (
+            mocker.MagicMock(
+                status="PLACED", setup_id=uuid4(),
+                layer_1_ticket=11111, sl_price=1882.5, tp1_price=1907.5,
+                error_messages=[],
+            )
+        )
+
+        # Three iterations, each with a fresh M5 bar advance so the
+        # strategy pipeline runs every time.
+        for i in range(3):
+            b.state.last_m5_bar_time = None  # force "new bar"
+            b.run_iteration(NOW + timedelta(seconds=i))
+
+        # Pipeline ran 3 times but the same zone gets logged only once.
+        assert mock_supabase.log_zone.call_count == 1
+
+    def test_try_place_setup_no_longer_calls_log_zone(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Regression guard: the call moved upstream into
+        # _persist_zone_if_new. _try_place_setup must not log_zone
+        # again (would race the cache + create duplicates).
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        mocker.patch("bot.main.place_layered_orders").return_value = (
+            mocker.MagicMock(
+                status="PLACED", setup_id=uuid4(),
+                layer_1_ticket=11111, sl_price=1882.5, tp1_price=1907.5,
+                error_messages=[],
+            )
+        )
+
+        b.run_iteration(NOW)
+
+        # Exactly one log_zone call (from _persist_zone_if_new), not two.
+        assert mock_supabase.log_zone.call_count == 1
+
+    def test_initialize_hydrates_cache_from_db(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        # Pre-populate the DB with a zone that matches the one the
+        # pipeline will emit later.
+        zone = _make_validated_for_persistence(_PT.RBR)
+        existing_id = uuid4()
+        existing = _make_zone_row(
+            direction=zone.direction,
+            top=float(zone.top),
+            bottom=float(zone.bottom),
+            status="CONFIRMED",
+        )
+        # Override the auto-generated id so we can verify it's the one
+        # used downstream.
+        existing = existing.model_copy(update={"id": existing_id})
+        mock_supabase.get_zones_by_status.return_value = [existing]
+
+        # initialize() runs reconcile_with_mt5 and then hydrates.
+        b.initialize()
+
+        # Cache now contains the existing zone — re-detecting it
+        # should NOT trigger a new log_zone call.
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        mocker.patch("bot.main.place_layered_orders").return_value = (
+            mocker.MagicMock(
+                status="PLACED", setup_id=uuid4(),
+                layer_1_ticket=11111, sl_price=1882.5, tp1_price=1907.5,
+                error_messages=[],
+            )
+        )
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        b.run_iteration(NOW)
+
+        mock_supabase.log_zone.assert_not_called()
+
+    def test_lifecycle_scanner_sees_persisted_zones(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # End-to-end coupling test: pipeline persists a zone, then the
+        # NEXT iteration's lifecycle pass loads it and (with a touching
+        # bar) transitions it to CONSUMED.
+        b, mgrs = bot
+        b.state.last_config_refresh = NOW
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        new_zone_id = uuid4()
+        mock_supabase.log_zone.return_value = {"id": str(new_zone_id)}
+
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        mocker.patch("bot.main.place_layered_orders").return_value = (
+            mocker.MagicMock(
+                status="PLACED", setup_id=uuid4(),
+                layer_1_ticket=11111, sl_price=1882.5, tp1_price=1907.5,
+                error_messages=[],
+            )
+        )
+
+        # Iteration 1: pipeline persists the zone.
+        b.state.last_m5_bar_time = None
+        b.run_iteration(NOW)
+        mock_supabase.log_zone.assert_called_once()
+
+        # Iteration 2: lifecycle scanner now sees the zone in DB and a
+        # bar that wicks into it consumes it.
+        persisted = _make_zone_row(
+            direction=zone.direction,
+            top=float(zone.top), bottom=float(zone.bottom),
+            status="CONFIRMED",
+        ).model_copy(update={"id": new_zone_id})
+        mock_supabase.get_zones_by_status.return_value = [persisted]
+
+        # OHLC with last bar's low inside the zone.
+        last_time = "2026-05-08T12:05:00Z"
+        times = pd.date_range(end=last_time, periods=30, freq="5min", tz="UTC")
+        opens = [1910.0] * 30
+        highs = [1911.0] * 30
+        lows = [1909.0] * 30
+        closes = [1910.0] * 30
+        lows[-1] = 1900.2  # wicks into zone [1900.0, 1900.5]
+        df_touch = pd.DataFrame(
+            {"open": opens, "high": highs, "low": lows, "close": closes,
+             "volume": [100] * 30},
+            index=times,
+        )
+        mgrs["ohlc_provider"].get.return_value = df_touch
+
+        b.state.last_m5_bar_time = None
+        b.run_iteration(NOW + timedelta(seconds=1))
+
+        # Zone now transitioned to CONSUMED.
+        consumed_calls = [
+            c for c in mock_supabase.update_zone_status.call_args_list
+            if c.args[1] == "CONSUMED"
+        ]
+        assert len(consumed_calls) == 1
+        assert consumed_calls[0].args[0] == new_zone_id
