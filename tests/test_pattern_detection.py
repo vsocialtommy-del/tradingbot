@@ -471,6 +471,48 @@ class TestDetectPatternsTopLevel:
 
 
 # --------------------------------------------------------------------------- #
+# Large dataframe — verify pipeline scales to the 1000-bar OHLC window
+# (default since the 2026-05 lookback bump).
+# --------------------------------------------------------------------------- #
+
+
+class TestLargeDataframe:
+    def test_detect_patterns_runs_on_1000_bars(self) -> None:
+        # Mixed regime: quiet prelude + 10 RBR-shaped blocks. The
+        # detector should chew through 1000 bars without error and
+        # return a list. We don't assert a specific pattern count
+        # (the exact number depends on impulse ATR thresholds against
+        # the synthetic noise) — the contract under test is
+        # "1000-bar dataframe doesn't break detection".
+        opens, highs, lows, closes = quiet_prelude(100.0, n=20)
+        price = 100.0
+        for _ in range(10):
+            o, h, l, c = make_strong_bar("RALLY", price, body=5.0)
+            opens.append(o); highs.append(h); lows.append(l); closes.append(c)
+            price = c
+            # Quiet base
+            for _ in range(3):
+                opens.append(price); closes.append(price)
+                highs.append(price + 0.1); lows.append(price - 0.1)
+        # Pad with quiet bars to reach 1000 total.
+        target = 1000
+        while len(opens) < target:
+            opens.append(price); closes.append(price)
+            highs.append(price + 0.1); lows.append(price - 0.1)
+        df = make_ohlc(opens, highs, lows, closes)
+        assert len(df) == target
+
+        patterns = detect_patterns(df)
+        assert isinstance(patterns, list)
+        # Defensive: every returned Pattern should reference indices
+        # inside the df bounds.
+        for p in patterns:
+            assert 0 <= p.base.start_index <= p.base.end_index < target
+            assert 0 <= p.impulse_before.end_index < target
+            assert 0 <= p.impulse_after.end_index < target
+
+
+# --------------------------------------------------------------------------- #
 # Config defaults
 # --------------------------------------------------------------------------- #
 
