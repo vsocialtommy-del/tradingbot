@@ -1,11 +1,14 @@
-"""TP1 target — nearest local peak / low to the entry price.
+"""TP target — nearest local peak / low to a reference price.
 
-The loosened entry flow (May 2026 refinement) replaces the previous
-BOS_LEVEL / FIXED_DISTANCE TP1 sources with a recent-structure search:
+Per-layer TPs (PR #41): each of the three layers in a setup has its
+own TP, and the next TP is the nearest local peak/low above the
+previous one. The same helper used for TP1 (anchor = Layer 1 entry)
+also computes TP2 (anchor = TP1) and TP3 (anchor = TP2). For SELL
+the chain runs downward instead.
 
-* BUY:  TP1 = lowest-priced **local high** above ``entry_price``
+* BUY:  next TP = lowest-priced **local high** above the reference
   within the last ``lookback_bars``.
-* SELL: TP1 = highest-priced **local low** below ``entry_price``.
+* SELL: next TP = highest-priced **local low** below the reference.
 
 "Local high" = a bar whose ``high`` is strictly greater than both
 neighbours' ``high`` (1-bar swing on highs). Local low: mirror on
@@ -13,14 +16,15 @@ neighbours' ``high`` (1-bar swing on highs). Local low: mirror on
 shoulder yet.
 
 If no qualifying peak exists in the lookback window the function
-returns ``None`` and the caller (``main._try_place_setup``) skips
-the zone. This is the "no TP1 target → no trade" gate.
+returns ``None``. Behaviour at the caller:
 
-Why pure-logic + caller-decides
--------------------------------
-Computing TP1 in the strategy layer (not inside ``order_manager``)
-lets us reject "no peak available" zones before any DB write or
-broker call — same shape as the SL-distance gate.
+* At setup creation: TP1 → None means skip the setup entirely. TP2 /
+  TP3 → None means the corresponding layer fires with no TP and
+  rides the cascading SL until manually closed or stopped out
+  (option α / Q-B decision from the PR-41 design).
+* At runtime (TP recompute when next TP slot is NULL): ``tp_manager``
+  attempts recomputation when the previous layer's TP fires, and
+  persists whatever the helper returns.
 """
 
 from __future__ import annotations

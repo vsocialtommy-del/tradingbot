@@ -8,7 +8,7 @@ trigger price.
 
 **TP1 refinement (May 2026, loosened-rules PR):** TP1 is now computed
 in the strategy/orchestrator layer (see
-:mod:`bot.strategy.tp1_target`) and passed in as the ``tp1_price``
+:mod:`bot.strategy.tp_target`) and passed in as the ``tp1_price``
 argument. The previous BOS_LEVEL / FIXED_DISTANCE machinery is gone
 along with the break-and-close Strong Point gate that produced
 ``broken_swing``. The caller is expected to have already decided
@@ -121,6 +121,8 @@ def place_layered_orders(
     sl_price: float,
     tp1_price: float,
     *,
+    tp2_price: float | None = None,
+    tp3_price: float | None = None,
     mt5: MT5Connector,
     supabase: SupabaseLogger,
     tracker: PositionTracker,
@@ -131,16 +133,21 @@ def place_layered_orders(
     Layers 2 and 3 are NOT sent to the broker. ``entry_trigger`` fires
     them as market orders when the live tick reaches their trigger price.
 
+    Per-layer TPs (PR #41): ``tp1_price`` is required; ``tp2_price`` /
+    ``tp3_price`` are best-effort at creation. NULL slots are
+    recomputed by ``tp_manager`` against current bars when the
+    previous layer's TP fires.
+
     On a successful PLACED outcome (Layer 1 filled + no gap-through),
     the setup is transitioned PENDING → ACTIVE via ``tracker``. This
-    is the activation hook ``entry_trigger`` and ``tp1_manager`` both
+    is the activation hook ``entry_trigger`` and ``tp_manager`` both
     rely on — without it (the pre-2026-05 state), Layers 2/3 never
-    fire and TP1 management never runs. SKIPPED / FAILED outcomes do
+    fire and TP management never runs. SKIPPED / FAILED outcomes do
     NOT promote the setup; it stays PENDING (and the cascade-cancel
     path eventually marks it SKIPPED).
 
     ``tp1_price`` is supplied by the caller (see
-    :mod:`bot.strategy.tp1_target`). Pre-checks reject obviously
+    :mod:`bot.strategy.tp_target`). Pre-checks reject obviously
     insane values (zero, wrong side of entry) but do not enforce a
     minimum distance or R:R ratio.
     """
@@ -176,6 +183,12 @@ def place_layered_orders(
             planned_layer3_price=Decimal(str(layer_3_price)),
             planned_sl_price=Decimal(str(sl_price)),
             planned_tp1_price=Decimal(str(tp1_price)),
+            planned_tp2_price=(
+                Decimal(str(tp2_price)) if tp2_price is not None else None
+            ),
+            planned_tp3_price=(
+                Decimal(str(tp3_price)) if tp3_price is not None else None
+            ),
             status="PENDING",
         ))
         setup_id = UUID(str(setup_row["id"]))

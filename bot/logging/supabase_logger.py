@@ -86,7 +86,12 @@ TradeStatus = Literal[
     "WAITING", "FILLED", "PARTIALLY_CLOSED", "CLOSED", "CANCELLED"
 ]
 OrderType = Literal["MARKET", "LIMIT"]
-CloseReason = Literal["TP1", "SL_HIT", "BE_HIT", "MANUAL_CLOSE", "NEWS_CLOSE"]
+CloseReason = Literal[
+    # Per-layer TPs (PR #41; see migration 009).
+    "TP1", "TP2", "TP3",
+    # Stop / external closes.
+    "SL_HIT", "BE_HIT", "MANUAL_CLOSE", "NEWS_CLOSE",
+]
 LogLevel = Literal["DEBUG", "INFO", "WARN", "ERROR"]
 ImpactLevel = Literal["HIGH", "MEDIUM", "LOW"]
 
@@ -121,7 +126,15 @@ class ZoneInput(_ModelBase):
 
 
 class SetupInput(_ModelBase):
-    """Insert payload for ``setups``."""
+    """Insert payload for ``setups``.
+
+    ``planned_tp2_price`` / ``planned_tp3_price`` (PR #41 / migration
+    009) are best-effort at creation: TP1 is required, TP2 / TP3 are
+    populated when the lookback yields peaks above the previous TP
+    and stay NULL otherwise. NULL slots are recomputed by
+    ``tp_manager`` when the previous layer's TP hits, against the
+    then-current bars.
+    """
 
     zone_id: UUID
     direction: Direction
@@ -131,6 +144,8 @@ class SetupInput(_ModelBase):
     planned_layer3_price: Decimal
     planned_sl_price: Decimal
     planned_tp1_price: Decimal
+    planned_tp2_price: Decimal | None = None
+    planned_tp3_price: Decimal | None = None
     status: SetupStatus
     skip_reason: str | None = None
 
@@ -242,6 +257,8 @@ class Setup(_ReadModelBase):
     planned_layer3_price: Decimal
     planned_sl_price: Decimal
     planned_tp1_price: Decimal
+    planned_tp2_price: Decimal | None = None
+    planned_tp3_price: Decimal | None = None
     status: SetupStatus
     skip_reason: str | None = None
     activated_at: datetime | None = None

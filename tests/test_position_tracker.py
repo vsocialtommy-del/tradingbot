@@ -1015,3 +1015,168 @@ class TestZonePromotionOnSetupActivation:
         # No exception should escape.
         result = tracker.update_setup_status(setup.id, "ACTIVE")
         assert result.status == "ACTIVE"
+
+
+# --------------------------------------------------------------------------- #
+# Setup completion hook (PR #41) — when every trade for a setup is terminal,
+# transition the setup ACTIVE → CLOSED.
+# --------------------------------------------------------------------------- #
+
+
+class TestSetupCompletionHook:
+    def test_last_trade_closing_transitions_setup_to_closed(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        # Two trades on the setup: L1 already CLOSED, L2 transitioning
+        # CLOSED now → setup should also transition.
+        setup_id = uuid4()
+        l1_closed = make_trade(setup_id=setup_id, status="CLOSED",
+                               mt5_ticket=11111)
+        l2 = make_trade(setup_id=setup_id, status="FILLED",
+                        mt5_ticket=22222)
+        l2_closed = make_trade(
+            id=l2.id, setup_id=setup_id, status="CLOSED", mt5_ticket=22222,
+        )
+        # update_trade_status reads the current trade by id, validates,
+        # patches, then the hook re-fetches all trades for the setup.
+        mock_supabase.get_trade_by_id.return_value = l2
+        mock_supabase.update_trade.return_value = l2_closed
+        mock_supabase.get_trades_for_setup.return_value = [l1_closed, l2_closed]
+        setup_active = make_setup(id=setup_id, status="ACTIVE")
+        setup_closed = make_setup(id=setup_id, status="CLOSED",
+                                  closed_at=NOW)
+        # ``_check_setup_complete`` calls get_setup_by_id → update_setup
+        # via update_setup_status. The update path itself uses
+        # get_setup_by_id again. Return ACTIVE both times then CLOSED.
+        mock_supabase.get_setup_by_id.side_effect = [
+            setup_active,  # _check_setup_complete read
+            setup_active,  # update_setup_status read
+        ]
+        mock_supabase.update_setup.return_value = setup_closed
+
+        tracker.update_trade_status(
+            l2.id, "CLOSED", close_reason="TP3",
+        )
+
+        # Setup was transitioned to CLOSED.
+        update_calls = mock_supabase.update_setup.call_args_list
+        closing_calls = [
+            c for c in update_calls if c.kwargs.get("status") == "CLOSED"
+        ]
+        assert len(closing_calls) == 1
+
+    def test_non_terminal_trade_in_setup_does_not_close_setup(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        # L1 closes but L2 still FILLED → setup stays ACTIVE.
+        setup_id = uuid4()
+        l1 = make_trade(setup_id=setup_id, status="FILLED",
+                        mt5_ticket=11111)
+        l1_closed = make_trade(
+            id=l1.id, setup_id=setup_id, status="CLOSED", mt5_ticket=11111,
+        )
+        l2 = make_trade(setup_id=setup_id, status="FILLED",
+                        mt5_ticket=22222)
+        mock_supabase.get_trade_by_id.return_value = l1
+        mock_supabase.update_trade.return_value = l1_closed
+        mock_supabase.get_trades_for_setup.return_value = [l1_closed, l2]
+
+        tracker.update_trade_status(
+            l1.id, "CLOSED", close_reason="TP1",
+        )
+
+        # No setup → CLOSED transition because L2 is still FILLED.
+        closing_calls = [
+            c for c in mock_supabase.update_setup.call_args_list
+            if c.kwargs.get("status") == "CLOSED"
+        ]
+        assert len(closing_calls) == 0
+
+    def test_cancellation_also_triggers_completion_check(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        # WAITING trade cancelled → if it's the last non-terminal one,
+        # setup completes. This is the path entry_trigger cancellation
+        # / cascade-cancel takes when WAITING layers are killed.
+        setup_id = uuid4()
+        l1_closed = make_trade(setup_id=setup_id, status="CLOSED",
+                               mt5_ticket=11111)
+        l2 = make_trade(setup_id=setup_id, status="WAITING",
+                        mt5_ticket=None)
+        l2_cancelled = make_trade(
+            id=l2.id, setup_id=setup_id, status="CANCELLED",
+            mt5_ticket=None,
+        )
+        mock_supabase.get_trade_by_id.return_value = l2
+        mock_supabase.update_trade.return_value = l2_cancelled
+        mock_supabase.get_trades_for_setup.return_value = [
+            l1_closed, l2_cancelled,
+        ]
+        setup_active = make_setup(id=setup_id, status="ACTIVE")
+        setup_closed = make_setup(id=setup_id, status="CLOSED",
+                                  closed_at=NOW)
+        mock_supabase.get_setup_by_id.side_effect = [
+            setup_active, setup_active,
+        ]
+        mock_supabase.update_setup.return_value = setup_closed
+
+        tracker.update_trade_status(l2.id, "CANCELLED")
+
+        closing_calls = [
+            c for c in mock_supabase.update_setup.call_args_list
+            if c.kwargs.get("status") == "CLOSED"
+        ]
+        assert len(closing_calls) == 1
+
+    def test_already_terminal_setup_no_op(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        # Edge case: setup already CLOSED (rare race). Hook should
+        # not attempt a redundant transition.
+        setup_id = uuid4()
+        l1 = make_trade(setup_id=setup_id, status="FILLED",
+                        mt5_ticket=11111)
+        l1_closed = make_trade(
+            id=l1.id, setup_id=setup_id, status="CLOSED", mt5_ticket=11111,
+        )
+        mock_supabase.get_trade_by_id.return_value = l1
+        mock_supabase.update_trade.return_value = l1_closed
+        mock_supabase.get_trades_for_setup.return_value = [l1_closed]
+        setup_closed_already = make_setup(
+            id=setup_id, status="CLOSED", closed_at=NOW,
+        )
+        mock_supabase.get_setup_by_id.return_value = setup_closed_already
+
+        tracker.update_trade_status(l1.id, "CLOSED", close_reason="TP1")
+
+        # No spurious update_setup CLOSED call.
+        closing_calls = [
+            c for c in mock_supabase.update_setup.call_args_list
+            if c.kwargs.get("status") == "CLOSED"
+        ]
+        assert len(closing_calls) == 0
+
+    def test_tp1_hit_legacy_setup_not_force_closed(
+        self, tracker: PositionTracker, mock_supabase: MagicMock,
+    ) -> None:
+        # Legacy PR-35-era setups in TP1_HIT shouldn't be auto-closed
+        # by the new hook; let them stay in their historical state.
+        setup_id = uuid4()
+        l1 = make_trade(setup_id=setup_id, status="PARTIALLY_CLOSED",
+                        mt5_ticket=11111)
+        l1_closed = make_trade(
+            id=l1.id, setup_id=setup_id, status="CLOSED", mt5_ticket=11111,
+        )
+        mock_supabase.get_trade_by_id.return_value = l1
+        mock_supabase.update_trade.return_value = l1_closed
+        mock_supabase.get_trades_for_setup.return_value = [l1_closed]
+        setup_tp1_hit = make_setup(id=setup_id, status="TP1_HIT")
+        mock_supabase.get_setup_by_id.return_value = setup_tp1_hit
+
+        tracker.update_trade_status(l1.id, "CLOSED", close_reason="TP1")
+
+        closing_calls = [
+            c for c in mock_supabase.update_setup.call_args_list
+            if c.kwargs.get("status") == "CLOSED"
+        ]
+        assert len(closing_calls) == 0

@@ -11,7 +11,7 @@ before letting a setup fire. It also pinned SL to a structural swing
 The user has loosened both rules: trade on the **first retest** of any
 fresh size-filter-passing zone, with SL pinned to the zone bound
 itself plus a fixed buffer. The TP1 target moves out of this module
-into :mod:`bot.strategy.tp1_target` (nearest local peak/low).
+into :mod:`bot.strategy.tp_target` (nearest local peak/low).
 
 What this module now does
 -------------------------
@@ -34,7 +34,7 @@ What this module does NOT do
 - It does not consume :class:`~bot.strategy.structure.Swing` lists
   any more — the BoS target / SL anchor logic is gone.
 - It does not compute TP1 — that lives in
-  :mod:`bot.strategy.tp1_target` so the orchestrator can decide
+  :mod:`bot.strategy.tp_target` so the orchestrator can decide
   whether a fresh zone has a tradeable TP1 before committing to
   order placement.
 

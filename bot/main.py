@@ -87,7 +87,7 @@ from bot.execution.order_manager import (
 )
 from bot.execution.position_tracker import PositionTracker
 from bot.exits.sl_manager import SLManager, SLManagerConfig
-from bot.exits.tp1_manager import TP1Manager
+from bot.exits.tp_manager import TPManager
 from bot.filters.news_filter import NewsFilter, NewsFilterConfig
 from bot.logging.supabase_logger import (
     Setup,
@@ -117,7 +117,7 @@ from bot.strategy.pipeline import (
     StrategyPipelineConfig,
     run_strategy_pipeline,
 )
-from bot.strategy.tp1_target import find_nearest_local_peak
+from bot.strategy.tp_target import find_nearest_local_peak
 from bot.strategy.zone_marking import Zone as _ZoneShape
 from bot.strategy.zone_refinement import RefinedZone as _RefinedZone
 from bot.strategy.zone_lifecycle import (
@@ -226,7 +226,7 @@ class Bot:
         # Managers.
         self.position_tracker = PositionTracker(mt5, supabase)
         self.ohlc_provider = OHLCProvider(mt5)
-        self.tp1_manager = TP1Manager(mt5, supabase, self.position_tracker)
+        self.tp_manager = TPManager(mt5, supabase, self.position_tracker)
         self.sl_manager = SLManager(
             mt5, supabase, config=self.sl_manager_config,
         )
@@ -379,7 +379,7 @@ class Bot:
             logger.exception("main loop: get_current_price failed")
             return
 
-        # 3. Per-tick: entry triggers + TP1 checks.
+        # 3. Per-tick: entry triggers + per-layer TP checks.
         try:
             fired = self.entry_trigger.check_live(bid, ask)
             self.state.fired_layer_count += len(fired)
@@ -388,25 +388,26 @@ class Bot:
 
         for setup in self._safe_get_active_setups():
             if setup.status != "ACTIVE":
-                continue  # PENDING needs Layer 1 to fill first; TP1_HIT is past
+                # PENDING: Layer 1 not yet filled. TP1_HIT: legacy state
+                # from the pre-PR-41 cascade — no new transitions to it,
+                # but old rows still need skipping.
+                continue
             try:
-                tp1_result = self.tp1_manager.check(setup, bid, ask)
-                if tp1_result.triggered:
-                    self.state.tp1_count += 1
-                    logger.info(
-                        f"TP1 fired: setup={setup.id} closed_lots="
-                        f"{tp1_result.closed_lots} new_sl="
-                        f"{tp1_result.new_sl_price}"
-                    )
-                    if tp1_result.sl_modify_pending:
-                        logger.error(
-                            f"TP1 SL→BE pending retry on setup {setup.id} "
-                            f"(modify_order failed)"
-                        )
+                closures = self.tp_manager.check(setup, bid, ask)
             except Exception:
                 logger.exception(
-                    f"main loop: tp1_manager.check failed for setup {setup.id}"
+                    f"main loop: tp_manager.check failed for setup {setup.id}"
                 )
+                continue
+            for close in closures:
+                self.state.tp1_count += 1
+                logger.info(
+                    f"TP{close.layer_number} fired: setup={close.setup_id} "
+                    f"close_price={close.close_price} "
+                    f"cascaded_sl={close.cascaded_sl}"
+                )
+                if close.needs_next_tp_recompute:
+                    self._maybe_recompute_next_tp(setup, close.layer_number)
 
         # 4. Detect externally-closed positions (cadenced).
         if self._should_detect_closed(now):
@@ -928,24 +929,41 @@ class Bot:
             )
             return False
 
-        # 2. TP1 — nearest local peak/low to Layer 1's entry. Skip the
-        # zone entirely if no qualifying peak exists in the lookback
-        # window (no tradeable TP1 → no setup).
+        # 2. TP chain (PR #41): TP1 from L1 entry, TP2 from TP1, TP3
+        # from TP2. TP1 is required — skip the setup if no peak. TP2
+        # / TP3 are best-effort; NULLs are recomputed by tp_manager
+        # at the previous layer's TP hit. Q-B decision: a layer with
+        # no TP rides on the cascaded SL until external close.
+        lookback = self.strategy_pipeline_config.tp1_local_peak_lookback_bars
         tp1_price = find_nearest_local_peak(
             ohlc_df,
             entry_price=entry_price,
             direction=zone.direction,
-            lookback_bars=self.strategy_pipeline_config.tp1_local_peak_lookback_bars,
+            lookback_bars=lookback,
         )
         if tp1_price is None:
             logger.info(
                 f"new setup skipped: no local "
                 f"{'peak' if zone.direction == 'BUY' else 'low'} "
-                f"within {self.strategy_pipeline_config.tp1_local_peak_lookback_bars} "
+                f"within {lookback} "
                 f"bars {'above' if zone.direction == 'BUY' else 'below'} "
                 f"entry {entry_price:.2f}"
             )
             return False
+        tp2_price = find_nearest_local_peak(
+            ohlc_df,
+            entry_price=tp1_price,
+            direction=zone.direction,
+            lookback_bars=lookback,
+        )
+        tp3_price = (
+            find_nearest_local_peak(
+                ohlc_df,
+                entry_price=tp2_price,
+                direction=zone.direction,
+                lookback_bars=lookback,
+            ) if tp2_price is not None else None
+        )
 
         # 3. Lot size.
         try:
@@ -973,6 +991,8 @@ class Bot:
                 lot_size=lot_result.lot_size,
                 sl_price=sl_price,
                 tp1_price=tp1_price,
+                tp2_price=tp2_price,
+                tp3_price=tp3_price,
                 mt5=self.mt5,
                 supabase=self.supabase,
                 tracker=self.position_tracker,
@@ -1001,6 +1021,73 @@ class Bot:
             f"errors={result.error_messages}"
         )
         return False
+
+    # ------------------------------------------------------------------ #
+    # Per-layer TP recompute (PR #41, Q-C: only when NULL)
+    # ------------------------------------------------------------------ #
+
+    def _maybe_recompute_next_tp(
+        self, setup: Setup, closed_layer_number: int,
+    ) -> None:
+        """Recompute ``planned_tp{N+1}_price`` if NULL on the setup row.
+
+        Called by the main loop after ``tp_manager`` reports a layer
+        close with ``needs_next_tp_recompute=True``. Reference price
+        for the search is the **just-closed layer's TP**, so the new
+        peak is guaranteed to be strictly above (BUY) / below (SELL)
+        the previous one. If no peak exists in the current df, the
+        slot stays NULL and the corresponding layer rides on the
+        cascaded SL until external close (Q-B decision).
+        """
+        if closed_layer_number >= 3:
+            return  # no TP4
+
+        next_layer = closed_layer_number + 1
+        # Reference = the layer that just closed at its TP price.
+        if closed_layer_number == 1:
+            reference = float(setup.planned_tp1_price)
+        elif closed_layer_number == 2:
+            if setup.planned_tp2_price is None:
+                # Defensive: TP2 was the layer that fired, so it
+                # should be set. Nothing to recompute against.
+                return
+            reference = float(setup.planned_tp2_price)
+        else:  # closed_layer_number == 3 (handled above)
+            return
+
+        df: pd.DataFrame | None = getattr(self, "_latest_ohlc", None)
+        if df is None or len(df) == 0:
+            logger.warning(
+                f"tp recompute: no OHLC available for setup {setup.id}"
+            )
+            return
+
+        new_tp = find_nearest_local_peak(
+            df,
+            entry_price=reference,
+            direction=setup.direction,
+            lookback_bars=self.strategy_pipeline_config.tp1_local_peak_lookback_bars,
+        )
+        if new_tp is None:
+            logger.info(
+                f"tp recompute: no local "
+                f"{'peak' if setup.direction == 'BUY' else 'low'} "
+                f"above reference {reference:.2f} for setup {setup.id} "
+                f"layer {next_layer} — layer rides cascaded SL"
+            )
+            return
+
+        field = f"planned_tp{next_layer}_price"
+        try:
+            self.supabase.update_setup(setup.id, **{field: Decimal(str(new_tp))})
+            logger.info(
+                f"tp recompute: setup={setup.id} {field}={new_tp:.2f} "
+                f"(reference={reference:.2f})"
+            )
+        except Exception:
+            logger.exception(
+                f"tp recompute: persist failed for setup {setup.id} {field}"
+            )
 
     # ------------------------------------------------------------------ #
     # Heartbeat / observability

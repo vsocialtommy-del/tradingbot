@@ -381,7 +381,69 @@ class PositionTracker:
         logger.info(
             f"trade {trade_id} transitioned: {current.status} → {new_status}"
         )
+
+        # PR #41: when a trade reaches a terminal status, check whether
+        # its setup is now complete (all trades terminal) — if so,
+        # transition the setup to CLOSED. Replaces the old per-layer
+        # TP1_HIT cascade; per-layer TP fires close their own trade row
+        # and rely on this hook to retire the setup once everything
+        # has settled.
+        if new_status in ("CLOSED", "CANCELLED"):
+            self._check_setup_complete(updated.setup_id)
+
         return updated
+
+    def _check_setup_complete(self, setup_id: UUID) -> None:
+        """If every trade for ``setup_id`` is terminal, transition the
+        setup to CLOSED.
+
+        Terminal = ``CLOSED`` or ``CANCELLED``. WAITING / FILLED /
+        PARTIALLY_CLOSED keep the setup alive — there's still
+        something on the broker or pending. Best-effort: a Supabase
+        blip just leaves the setup in its current state; next trade
+        terminal transition will re-check.
+        """
+        try:
+            trades = self._supabase.get_trades_for_setup(setup_id)
+        except Exception:
+            logger.exception(
+                f"setup completion check: get_trades_for_setup failed "
+                f"for {setup_id}"
+            )
+            return
+        if not trades:
+            return  # defensive: a setup without trades isn't "complete"
+        if not all(t.status in ("CLOSED", "CANCELLED") for t in trades):
+            return
+
+        # Re-fetch the setup to check its current status; the
+        # update_setup_status helper will validate the transition and
+        # no-op if we're already terminal.
+        try:
+            current = self._supabase.get_setup_by_id(setup_id)
+        except Exception:
+            logger.exception(
+                f"setup completion check: get_setup_by_id failed for {setup_id}"
+            )
+            return
+        if current is None:
+            logger.warning(
+                f"setup completion check: setup {setup_id} not found"
+            )
+            return
+        if current.status in TERMINAL_SETUP_STATUSES:
+            return
+        # Skip TP1_HIT-derived setups too — legacy PR-35-era rows that
+        # already passed through the old cascade; let them stay there.
+        if current.status == "TP1_HIT":
+            return
+        try:
+            self.update_setup_status(setup_id, "CLOSED")
+        except StateTransitionError:
+            logger.exception(
+                f"setup completion check: transition to CLOSED failed for "
+                f"{setup_id} (from {current.status})"
+            )
 
     # ---- detection (Supabase ←→ MT5 sync) ----------------------------------
 
