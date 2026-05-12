@@ -111,6 +111,7 @@ from bot.strategy.pipeline import (
     StrategyPipelineConfig,
     run_strategy_pipeline,
 )
+from bot.strategy.tp1_target import find_nearest_local_peak
 from bot.strategy.zone_lifecycle import (
     SKIP_NEW_SETUP_STATUSES,
     ZoneRef,
@@ -672,13 +673,7 @@ class Bot:
             )
             return False
 
-        # 1. SL — pinned to the strategy-layer sl_anchor_swing.
-        if zone.sl_anchor_swing is None:
-            logger.warning(
-                "new setup skipped: zone has no sl_anchor_swing — "
-                "Strong Point validation should have set this"
-            )
-            return False
+        # 1. SL — zone-bound formula (loosened-rules PR).
         sp_cfg = StrongPointConfig(
             sl_buffer_points=self.sl_manager_config.sl_buffer_points,
         )
@@ -697,7 +692,26 @@ class Bot:
             )
             return False
 
-        # 2. Lot size.
+        # 2. TP1 — nearest local peak/low to Layer 1's entry. Skip the
+        # zone entirely if no qualifying peak exists in the lookback
+        # window (no tradeable TP1 → no setup).
+        tp1_price = find_nearest_local_peak(
+            ohlc_df,
+            entry_price=entry_price,
+            direction=zone.direction,
+            lookback_bars=self.strategy_pipeline_config.tp1_local_peak_lookback_bars,
+        )
+        if tp1_price is None:
+            logger.info(
+                f"new setup skipped: no local "
+                f"{'peak' if zone.direction == 'BUY' else 'low'} "
+                f"within {self.strategy_pipeline_config.tp1_local_peak_lookback_bars} "
+                f"bars {'above' if zone.direction == 'BUY' else 'below'} "
+                f"entry {entry_price:.2f}"
+            )
+            return False
+
+        # 3. Lot size.
         try:
             balance = self.mt5.get_balance()
         except Exception:
@@ -715,7 +729,7 @@ class Bot:
             )
             return False
 
-        # 3. Persist the zone (so the setup can FK to it).
+        # 4. Persist the zone (so the setup can FK to it).
         try:
             zone_row = self.supabase.log_zone(_zone_to_input(zone))
             zone_id = UUID(str(zone_row["id"]))
@@ -723,12 +737,13 @@ class Bot:
             logger.exception("new setup: log_zone failed; skipping zone")
             return False
 
-        # 4. Place orders.
+        # 5. Place orders.
         try:
             result = place_layered_orders(
                 zone, zone_id,
                 lot_size=lot_result.lot_size,
                 sl_price=sl_price,
+                tp1_price=tp1_price,
                 mt5=self.mt5, supabase=self.supabase,
                 config=self.order_manager_config,
             )
