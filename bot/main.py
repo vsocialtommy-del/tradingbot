@@ -708,6 +708,7 @@ class Bot:
             ("pipeline", self._pending_pipeline_zones),
             ("flipped",  self._pending_flipped_zones),
         ):
+            is_flipped_retrade = source_label == "flipped"
             # Iterate over a copy so we can mutate the underlying list.
             remaining: list[tuple[ValidatedZone, UUID]] = []
             for zone, zid in queue:
@@ -722,7 +723,11 @@ class Bot:
                     remaining.append((zone, zid))
                     remaining.extend(queue[queue.index((zone, zid)) + 1:])
                     break
-                if self._try_place_setup(zone, df, zid, bid=bid, ask=ask):
+                if self._try_place_setup(
+                    zone, df, zid,
+                    bid=bid, ask=ask,
+                    is_flipped_retrade=is_flipped_retrade,
+                ):
                     active_count += 1
                     self.state.placed_setup_count += 1
                     logger.info(
@@ -916,6 +921,7 @@ class Bot:
         self, zone: ValidatedZone, ohlc_df: pd.DataFrame, zone_id: UUID,
         *,
         bid: float, ask: float,
+        is_flipped_retrade: bool = False,
     ) -> bool:
         """Compute SL + TP1 + lot size, validate, place orders.
 
@@ -927,13 +933,26 @@ class Bot:
         price-vs-zone gate to skip setups when price hasn't reached
         the planned Layer 1 entry yet. (Bug 2 fix.)
 
+        ``is_flipped_retrade`` flags the SnD Flip side path (PR #45):
+        the candidate comes from a status='FLIPPED' zone whose
+        ``flipped_direction`` is being traded. Dedup is skipped for
+        these because the dedup re-trade guard reliably trips on the
+        previously-violated counter-direction zone at the same price
+        band (which is what the original demand/supply broke to form),
+        even though that's not the same physical zone. The flipped
+        path has its own safety guard
+        (``flipped_zone_body_broken_since_flip``) plus the FLIPPED →
+        ACTIVE transition that pops the zone off the flipped queue
+        after placement.
+
         Returns True iff ``order_manager.place_layered_orders`` reported
         ``PLACED`` (not FAILED, not SKIPPED-via-gap).
         """
         # 0. Dedup — skip if a CONSUMED/VIOLATED/FLIPPED zone with
         # overlapping bounds already exists. Re-arming a CONSUMED zone
-        # is explicitly disallowed (design decision Q3).
-        if self._zone_already_used(zone):
+        # is explicitly disallowed (design decision Q3). Skipped for
+        # flipped retrades — see ``is_flipped_retrade`` above.
+        if not is_flipped_retrade and self._zone_already_used(zone):
             logger.info(
                 f"new setup skipped: zone {zone.direction} "
                 f"{zone.bottom:.2f}-{zone.top:.2f} overlaps an existing "
