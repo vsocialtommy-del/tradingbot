@@ -1,13 +1,18 @@
 """Tests for ``bot.exits.tp_manager`` — per-layer TPs with cascading SL.
 
-Covers (PR #41):
+PR #41 introduced per-layer TP detection + cascading SL on remaining
+layers. PR #43 corrected the WAITING-layer cascade (was: patch
+sl_price; now: cancel with CASCADE_CANCELLED) after the production
+"invalid stops" broker rejection bug.
+
+Covers:
 * Each layer's TP fires independently → close that layer's ticket.
-* Cascading SL: remaining FILLED layers get ``modify_order``; remaining
-  WAITING layers get ``trades.sl_price`` patched.
-* WAITING trades stay alive after TP1/TP2 (Q-A decision).
+* Cascading SL on remaining FILLED layers: broker ``modify_order``.
+* Cascading CANCEL on remaining WAITING layers: PR #43 fix
+  (close_reason=CASCADE_CANCELLED).
 * ``needs_next_tp_recompute`` flag set iff next layer's TP slot is NULL.
 * Trigger semantics (BUY: bid >= TP; SELL: ask <= TP) inclusive boundary.
-* Layer with NULL TP rides on cascaded SL — no close fires (Q-B).
+* Layer with NULL TP rides on cascaded SL — no close fires (PR-41 Q-B).
 * The position_tracker setup-completion hook (PR #41) is exercised
   separately in test_position_tracker.
 """
@@ -247,14 +252,20 @@ class TestPerLayerClose:
         assert r.error is None
         # Broker close called on L1's specific ticket only.
         mock_mt5.close_position.assert_called_once_with(11111)
-        # Trade row marked CLOSED via the tracker (which fires the
-        # setup-completion hook).
-        mock_tracker.update_trade_status.assert_called_once()
-        call = mock_tracker.update_trade_status.call_args
-        assert call.args[0] == l1.id
-        assert call.args[1] == "CLOSED"
-        assert call.kwargs["close_reason"] == "TP1"
-        assert call.kwargs["exit_price"] == 1910.0
+        # tracker.update_trade_status fires THREE times: once to
+        # mark L1 CLOSED, then twice to cancel L2 and L3 (PR #43:
+        # WAITING layers cascade-cancel rather than SL-patch).
+        calls_by_trade = {
+            c.args[0]: c for c in mock_tracker.update_trade_status.call_args_list
+        }
+        assert calls_by_trade[l1.id].args[1] == "CLOSED"
+        assert calls_by_trade[l1.id].kwargs["close_reason"] == "TP1"
+        assert calls_by_trade[l2.id].args[1] == "CANCELLED"
+        assert calls_by_trade[l2.id].kwargs["close_reason"] == "CASCADE_CANCELLED"
+        assert calls_by_trade[l3.id].args[1] == "CANCELLED"
+        assert calls_by_trade[l3.id].kwargs["close_reason"] == "CASCADE_CANCELLED"
+        # L1's CLOSED carries the exit_price from the BUY-side bid.
+        assert calls_by_trade[l1.id].kwargs["exit_price"] == 1910.0
 
     def test_sell_layer_1_uses_ask_as_close_price(
         self, manager: TPManager, mock_supabase: MagicMock,
@@ -314,10 +325,15 @@ class TestCascadingSL:
         assert len(update_calls) == 1
         assert update_calls[0].kwargs["sl_price"] == Decimal("1900.0")
 
-    def test_waiting_remaining_layer_gets_row_update_only(
+    def test_waiting_remaining_layer_gets_cancelled(
         self, manager: TPManager,
         mock_mt5: MagicMock, mock_supabase: MagicMock,
+        mock_tracker: MagicMock,
     ) -> None:
+        # PR #43 fix: WAITING layers are CANCELLED on cascade, not
+        # SL-patched. The pre-#43 behaviour produced "invalid stops"
+        # broker rejections (BUY market with SL above entry) when
+        # entry_trigger eventually fired the WAITING layer.
         s = make_setup()
         l1 = make_trade(
             setup_id=s.id, layer_number=1,
@@ -332,16 +348,26 @@ class TestCascadingSL:
 
         manager.check(s, bid=1910.0, ask=1910.1)
 
-        # No modify_order for WAITING — there's no broker ticket yet.
+        # No modify_order for WAITING — there's no broker ticket and
+        # we wouldn't accept the SL anyway.
         mock_mt5.modify_order.assert_not_called()
-        # But L3's row gets the new sl_price so entry_trigger uses it
-        # when it eventually fires.
-        update_calls = [
+        # L3 gets cancelled with the new close_reason. The cancel
+        # goes through position_tracker.update_trade_status (not the
+        # raw supabase.update_trade) so the setup-completion hook
+        # fires too.
+        cancel_calls = [
+            c for c in mock_tracker.update_trade_status.call_args_list
+            if c.args[0] == l3.id
+        ]
+        assert len(cancel_calls) == 1
+        assert cancel_calls[0].args[1] == "CANCELLED"
+        assert cancel_calls[0].kwargs["close_reason"] == "CASCADE_CANCELLED"
+        # And no spurious sl_price patch on the WAITING row.
+        sl_patches = [
             c for c in mock_supabase.update_trade.call_args_list
             if c.args[0] == l3.id
         ]
-        assert len(update_calls) == 1
-        assert update_calls[0].kwargs["sl_price"] == Decimal("1900.0")
+        assert sl_patches == []
 
     def test_cascade_uses_fallback_when_entry_price_null(
         self, manager: TPManager,
@@ -498,3 +524,174 @@ class TestCloseFailureSurfacesError:
         assert "close_position failed" in results[0].error
         mock_tracker.update_trade_status.assert_not_called()
         mock_mt5.modify_order.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# PR #43 regression — WAITING cascade-cancel scenarios (the production
+# "invalid stops" bug fix).
+# --------------------------------------------------------------------------- #
+
+
+class TestCascadeCancelScenarios:
+    """The three layer-fill states from the PR-43 spec, each verified
+    end-to-end through tp_manager.check on TP1 hit:
+
+      A. Only L1 filled         → L2/L3 WAITING get CANCELLED.
+      B. L1 + L2 filled         → L2 SL modify_order; L3 WAITING CANCELLED.
+      C. All 3 filled           → L2 + L3 SL modify_order; no cancellations.
+    """
+
+    def test_a_only_l1_filled_cancels_both_waiting(
+        self, manager: TPManager,
+        mock_mt5: MagicMock, mock_supabase: MagicMock, mock_tracker: MagicMock,
+    ) -> None:
+        s = make_setup()
+        l1 = make_trade(
+            setup_id=s.id, layer_number=1,
+            mt5_ticket=11111, entry_price=Decimal("1900.00"),
+        )
+        l2 = make_trade(setup_id=s.id, layer_number=2, status="WAITING",
+                        mt5_ticket=None, entry_price=None)
+        l3 = make_trade(setup_id=s.id, layer_number=3, status="WAITING",
+                        mt5_ticket=None, entry_price=None)
+        mock_supabase.get_trades_for_setup.return_value = [l1, l2, l3]
+
+        manager.check(s, bid=1910.0, ask=1910.1)
+
+        # No modify_order anywhere — both remaining are WAITING.
+        mock_mt5.modify_order.assert_not_called()
+        # Both L2 + L3 cancelled with the cascade reason.
+        cancellations = {
+            c.args[0]: c.kwargs.get("close_reason")
+            for c in mock_tracker.update_trade_status.call_args_list
+            if c.args[1] == "CANCELLED"
+        }
+        assert cancellations == {
+            l2.id: "CASCADE_CANCELLED",
+            l3.id: "CASCADE_CANCELLED",
+        }
+
+    def test_b_l1_l2_filled_modifies_l2_cancels_l3(
+        self, manager: TPManager,
+        mock_mt5: MagicMock, mock_supabase: MagicMock, mock_tracker: MagicMock,
+    ) -> None:
+        s = make_setup()
+        l1 = make_trade(
+            setup_id=s.id, layer_number=1,
+            mt5_ticket=11111, entry_price=Decimal("1900.00"),
+        )
+        l2 = make_trade(
+            setup_id=s.id, layer_number=2,
+            mt5_ticket=22222, entry_price=Decimal("1897.50"),
+        )
+        l3 = make_trade(setup_id=s.id, layer_number=3, status="WAITING",
+                        mt5_ticket=None, entry_price=None)
+        mock_supabase.get_trades_for_setup.return_value = [l1, l2, l3]
+
+        manager.check(s, bid=1910.0, ask=1910.1)
+
+        # L2 (FILLED) gets the broker SL modify.
+        mock_mt5.modify_order.assert_called_once_with(22222, sl=1900.0)
+        # L3 (WAITING) gets cancelled, NOT SL-patched.
+        cancellations = [
+            c for c in mock_tracker.update_trade_status.call_args_list
+            if c.args[1] == "CANCELLED"
+        ]
+        assert len(cancellations) == 1
+        assert cancellations[0].args[0] == l3.id
+        assert cancellations[0].kwargs["close_reason"] == "CASCADE_CANCELLED"
+
+    def test_c_all_three_filled_no_cancellations(
+        self, manager: TPManager,
+        mock_mt5: MagicMock, mock_supabase: MagicMock, mock_tracker: MagicMock,
+    ) -> None:
+        s = make_setup()
+        l1 = make_trade(
+            setup_id=s.id, layer_number=1,
+            mt5_ticket=11111, entry_price=Decimal("1900.00"),
+        )
+        l2 = make_trade(
+            setup_id=s.id, layer_number=2,
+            mt5_ticket=22222, entry_price=Decimal("1897.50"),
+        )
+        l3 = make_trade(
+            setup_id=s.id, layer_number=3,
+            mt5_ticket=33333, entry_price=Decimal("1895.00"),
+        )
+        mock_supabase.get_trades_for_setup.return_value = [l1, l2, l3]
+
+        manager.check(s, bid=1910.0, ask=1910.1)
+
+        # Both remaining FILLED tickets get modify_order to L1's entry.
+        modify_calls = sorted(
+            c.args[0] for c in mock_mt5.modify_order.call_args_list
+        )
+        assert modify_calls == [22222, 33333]
+        # No CANCELLED tracker calls — no WAITING layers to cancel.
+        cancellations = [
+            c for c in mock_tracker.update_trade_status.call_args_list
+            if c.args[1] == "CANCELLED"
+        ]
+        assert cancellations == []
+
+    def test_no_invalid_stops_path_for_waiting_after_tp1(
+        self, manager: TPManager,
+        mock_mt5: MagicMock, mock_supabase: MagicMock,
+    ) -> None:
+        # Direct regression for the production retcode-10016 bug: a
+        # WAITING layer must NEVER receive a sl_price patch via
+        # update_trade after a previous TP fired. (entry_trigger
+        # later places its market order using trade.sl_price, and a
+        # cascaded SL on the wrong side of entry triggers the broker
+        # rejection loop.)
+        s = make_setup()
+        l1 = make_trade(
+            setup_id=s.id, layer_number=1,
+            mt5_ticket=11111, entry_price=Decimal("1900.00"),
+        )
+        l2 = make_trade(setup_id=s.id, layer_number=2, status="WAITING",
+                        mt5_ticket=None, entry_price=None,
+                        sl_price=Decimal("1882.50"))
+        mock_supabase.get_trades_for_setup.return_value = [l1, l2]
+
+        manager.check(s, bid=1910.0, ask=1910.1)
+
+        # update_trade with sl_price never touches the WAITING row.
+        sl_patches = [
+            c for c in mock_supabase.update_trade.call_args_list
+            if c.args[0] == l2.id and "sl_price" in c.kwargs
+        ]
+        assert sl_patches == []
+
+    def test_setup_completion_after_only_l1_filled_then_tp1(
+        self, manager: TPManager,
+        mock_supabase: MagicMock, mock_tracker: MagicMock,
+    ) -> None:
+        # End-to-end PR-43 scenario A: setup with only L1 filled
+        # transitions through TP1 and ends up CLOSED. Verifies the
+        # cancellations propagate to position_tracker (which fires
+        # the setup-completion hook) — the path that actually retires
+        # the previously-stuck setups.
+        s = make_setup()
+        l1 = make_trade(
+            setup_id=s.id, layer_number=1,
+            mt5_ticket=11111, entry_price=Decimal("1900.00"),
+        )
+        l2 = make_trade(setup_id=s.id, layer_number=2, status="WAITING",
+                        mt5_ticket=None, entry_price=None)
+        l3 = make_trade(setup_id=s.id, layer_number=3, status="WAITING",
+                        mt5_ticket=None, entry_price=None)
+        mock_supabase.get_trades_for_setup.return_value = [l1, l2, l3]
+
+        manager.check(s, bid=1910.0, ask=1910.1)
+
+        # Three update_trade_status calls in total: one CLOSED + two
+        # CANCELLED. The setup-completion hook in position_tracker
+        # runs against each — when the LAST cancellation lands, the
+        # setup will transition to CLOSED. (We don't re-assert the
+        # hook fires here; that's covered by
+        # test_position_tracker::TestSetupCompletionHook.)
+        statuses = [
+            c.args[1] for c in mock_tracker.update_trade_status.call_args_list
+        ]
+        assert sorted(statuses) == ["CANCELLED", "CANCELLED", "CLOSED"]

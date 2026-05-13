@@ -1,27 +1,35 @@
-"""Per-layer take-profit with cascading SL protection (PR #41).
+"""Per-layer take-profit with cascading SL protection (PR #41 + #43).
 
 Replaces the pre-PR-41 ``tp1_manager``, which closed 50 % of every
 filled layer and moved all SLs to break-even. That model didn't work
-at 0.01 lots — the broker rejects partial closes below the lot step,
-and the fallback "move all SLs to BE" reduced every trade to
-break-even-or-stop. Replaced with:
+at 0.01 lots — the broker rejects partial closes below the lot step.
+Replaced with per-layer logic:
 
 * Each layer has its own TP price (``setups.planned_tp{1,2,3}_price``).
 * When layer N's TP price is crossed by the live tick, the layer's
   full position closes (no partial). ``close_reason='TP{N}'``.
-* SL on every remaining FILLED layer is cascaded to the closed
-  layer's entry price. ``modify_order`` per ticket. SL on every
-  remaining WAITING layer is updated in the trade row
-  (``trades.sl_price``) so that ``entry_trigger._fire_layer`` uses
-  the cascaded value when it eventually fires.
-* WAITING layers are **not** cancelled (Q-A decision: lets the
-  cascaded SL do its job if price retraces).
+* On each TP fire, every **remaining FILLED** layer's SL is
+  cascaded via ``modify_order(ticket, sl=closed_layer.entry_price)``
+  — broker accepts the "wrong-side" SL on an open position (it
+  becomes a trailing-stop-style move).
+* On each TP fire, every **remaining WAITING** layer is **CANCELLED**
+  with ``close_reason='CASCADE_CANCELLED'``. PR #43 fix: the
+  pre-#43 path patched ``sl_price`` on WAITING rows so
+  ``entry_trigger`` would carry the cascaded SL on the eventual
+  market order; broker rejects that as 'invalid stops' (BUY market
+  requires SL < entry; cascaded SL sits ABOVE the new layer's
+  entry). Symptom in production: infinite retry loop, log
+  explosion, setup stuck ACTIVE forever. Cancelling the layer is
+  the correct broker-respecting behaviour; we lose the theoretical
+  retracement-catch-trade and accept that.
 * The setup itself stays ``ACTIVE`` while any trade is FILLED or
   WAITING. ``position_tracker._check_setup_complete`` (PR #41 hook)
-  transitions it to ``CLOSED`` once every trade row is terminal.
+  transitions it to ``CLOSED`` once every trade row is terminal —
+  works the same whether trades reach terminal via TP, SL, or
+  cascade-cancel.
 
-TP recompute (Q-C decision: only when NULL)
--------------------------------------------
+TP recompute (PR #41 Q-C: only when NULL)
+-----------------------------------------
 This module never recomputes TPs. When a layer closes and the next
 TP slot is NULL on the setup row, the orchestrator
 (``main._maybe_recompute_next_tp``) calls
@@ -35,8 +43,8 @@ State written
   ``close_reason='TP{N}'``, ``exit_price=bid/ask``.
 * Each remaining FILLED layer: broker ``modify_order(ticket, sl=…)``
   and the row's ``sl_price`` patched.
-* Each remaining WAITING layer: ``sl_price`` patched only (no broker
-  call — there's no ticket yet).
+* Each remaining WAITING layer: ``status: WAITING → CANCELLED``,
+  ``close_reason='CASCADE_CANCELLED'`` (PR #43).
 * Setup status: nothing here. The completion hook in
   ``position_tracker.update_trade_status`` flips it to ``CLOSED``
   when the last trade row goes terminal.
@@ -288,11 +296,28 @@ class TPManager:
         *,
         new_sl: float,
     ) -> list[str]:
-        """Apply ``new_sl`` to every remaining trade.
+        """Resolve every remaining trade after a previous layer's TP fired.
 
         * FILLED → broker ``modify_order(ticket, sl=new_sl)`` AND
-          update ``trades.sl_price``.
-        * WAITING → update ``trades.sl_price`` only.
+          update ``trades.sl_price``. The broker accepts a "wrong-side"
+          SL on an open position (it acts like a trailing stop), so
+          this is safe.
+        * WAITING → **CANCEL** the trade with
+          ``close_reason='CASCADE_CANCELLED'``. This is the PR-#43 fix
+          for the production "invalid stops" bug:
+
+            For a BUY market order, MT5 requires SL < entry. After
+            TP1 fires, the cascaded SL (= L1's entry) sits ABOVE
+            Layer 2 / Layer 3 entries → broker rejects the market
+            order with retcode 10016 when entry_trigger eventually
+            fires the WAITING layer. Symptom: infinite retry loop,
+            log explosion, setup stuck ACTIVE forever.
+
+            The pre-#43 design assumed a price retracement after TP1
+            could re-fill L2/L3 as "catch trades" with cascaded-SL
+            protection. Broker rules don't permit that, so we just
+            cancel the WAITING layers instead.
+
         * Terminal (CLOSED/CANCELLED) → no-op.
 
         Per-trade failures are logged + appended to the error list
@@ -305,7 +330,7 @@ class TPManager:
                 if err is not None:
                     errors.append(err)
             elif trade.status == "WAITING":
-                err = self._cascade_waiting(trade, new_sl)
+                err = self._cancel_waiting_layer(trade)
                 if err is not None:
                     errors.append(err)
         return errors
@@ -350,15 +375,29 @@ class TPManager:
             return msg
         return None
 
-    def _cascade_waiting(self, trade: Trade, new_sl: float) -> str | None:
+    def _cancel_waiting_layer(self, trade: Trade) -> str | None:
+        """Cancel a WAITING layer after a previous layer's TP fires.
+
+        The pre-#43 path patched ``trades.sl_price`` to the cascaded
+        value, expecting ``entry_trigger`` to use the new SL when the
+        layer eventually fired. That produced "invalid stops" broker
+        rejections (BUY market with SL above entry) — see
+        :meth:`_cascade_sl_to_remaining` docstring for the full
+        story. We just cancel the layer here. The
+        ``position_tracker`` setup-completion hook (PR #41) catches
+        the CANCELLED transition and retires the setup once the
+        whole cohort is terminal.
+        """
         try:
-            self._supabase.update_trade(
-                trade.id, sl_price=Decimal(str(new_sl)),
+            self._tracker.update_trade_status(
+                trade.id,
+                "CANCELLED",
+                close_reason="CASCADE_CANCELLED",
             )
         except Exception as e:
             msg = (
-                f"sl_price row update failed for WAITING layer "
-                f"{trade.layer_number}: {e}"
+                f"WAITING layer {trade.layer_number} cancellation "
+                f"failed after previous TP cascade: {e}"
             )
             logger.exception(f"tp_manager: {msg}")
             return msg
