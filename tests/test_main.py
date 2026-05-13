@@ -1256,6 +1256,149 @@ class TestDedupSkip:
 
 
 # --------------------------------------------------------------------------- #
+# PR #45: dedup skipped for SnD Flip retrades.
+#
+# A flipped zone trades in its ``flipped_direction``, which is by S&D
+# construction the same direction as the supply/demand that was broken
+# to form the original zone. That broken counter-direction zone is
+# usually still in the DB at status=VIOLATED at the exact same price
+# band, so the dedup pre-flight reliably trips on it and blocks the
+# flipped retrade. The flipped path has its own re-trade guards
+# (status='FLIPPED' filter on load, ``flipped_zone_body_broken_since_flip``,
+# FLIPPED → ACTIVE on placement) so we skip dedup for that branch.
+# --------------------------------------------------------------------------- #
+
+
+class TestFlippedRetradeDedupSkip:
+    def test_flipped_retrade_skips_dedup_against_counter_direction_zone(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mock_mt5: MagicMock,
+        mocker: MockerFixture,
+    ) -> None:
+        # Reproduces the production case: zone 77fceff6 (BUY DBR
+        # FLIPPED to SELL at 4704.32-4711.47). A previously-VIOLATED
+        # SELL supply sits in the DB at the same price band — that's
+        # the row dedup picks up. With PR #45 the flipped retrade
+        # proceeds past dedup and places.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        # Price already at zone.bottom so the SELL gate fires
+        # immediately on the same iteration (per-tick placement).
+        mock_mt5.get_current_price.return_value = {
+            "bid": 4704.31, "ask": 4704.32, "time": NOW, "time_msc": 0,
+        }
+
+        fz = _make_flipped_zone_row(
+            original_direction="BUY", flipped_direction="SELL",
+            top=4711.47, bottom=4704.32,
+            flipped_at=NOW - timedelta(hours=1),
+        )
+        # The dedup blocker: the supply that was broken when the
+        # original BUY demand formed at this band is still in the DB.
+        prior_supply_violated = _make_zone_row(
+            direction="SELL",  # same direction as the flipped retrade
+            top=4711.47, bottom=4704.32,
+            status="VIOLATED",
+            violated_at=NOW - timedelta(hours=2),
+        )
+
+        def fake_get(statuses):
+            if "FLIPPED" in statuses and len(statuses) == 1:
+                return [fz]
+            return [prior_supply_violated]
+
+        mock_supabase.get_zones_by_status.side_effect = fake_get
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        mocker.patch(
+            "bot.main.find_nearest_local_peak", return_value=4690.0,
+        )
+        place = mocker.patch("bot.main.place_layered_orders")
+        place.return_value = mocker.MagicMock(
+            status="PLACED", setup_id=uuid4(),
+            layer_1_ticket=11111, sl_price=4728.97, tp1_price=4690.0,
+            error_messages=[],
+        )
+
+        b.run_iteration(NOW)
+
+        # Placement fires — dedup did NOT block the flipped retrade.
+        place.assert_called_once()
+        assert b._pending_flipped_zones == []
+
+    def test_pipeline_path_still_blocked_by_dedup(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mock_mt5: MagicMock,
+        mocker: MockerFixture,
+    ) -> None:
+        # Pipeline (fresh-detection) path is unchanged: a CONSUMED
+        # same-direction zone at the same band still blocks placement.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        # Price already at zone so the gate isn't the reason we skip.
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1900.5, "ask": 1900.6, "time": NOW, "time_msc": 0,
+        }
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        existing_consumed = _make_zone_row(
+            direction="BUY",  # same direction as the candidate
+            top=1900.5, bottom=1900.0,
+            status="CONSUMED", consumed_at=NOW - timedelta(hours=1),
+        )
+
+        def fake_get(statuses):
+            # No FLIPPED zones to load; the dedup lookup gets the
+            # CONSUMED row.
+            if "FLIPPED" in statuses and len(statuses) == 1:
+                return []
+            return [existing_consumed]
+
+        mock_supabase.get_zones_by_status.side_effect = fake_get
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        b.run_iteration(NOW)
+
+        place.assert_not_called()
+
+    def test_try_place_pending_passes_flag_per_queue(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        # Direct assertion on the call site: pipeline-queue entries
+        # get is_flipped_retrade=False; flipped-queue entries get
+        # is_flipped_retrade=True.
+        b, _ = bot
+        b._latest_ohlc = make_ohlc()
+
+        pipeline_zone = _make_validated_for_persistence(_PT.RBR)
+        flipped_zone = _make_validated_for_persistence(_PT.RBR)
+        pipeline_id, flipped_id = uuid4(), uuid4()
+        b._pending_pipeline_zones = [(pipeline_zone, pipeline_id)]
+        b._pending_flipped_zones = [(flipped_zone, flipped_id)]
+
+        # Stub the placement so it doesn't drain the queues; we only
+        # care about the call-site kwargs.
+        try_place = mocker.patch.object(
+            b, "_try_place_setup", return_value=False,
+        )
+
+        b._try_place_pending(bid=1900.0, ask=1900.1)
+
+        calls = try_place.call_args_list
+        assert len(calls) == 2
+        # First call: pipeline queue.
+        assert calls[0].args[2] == pipeline_id
+        assert calls[0].kwargs["is_flipped_retrade"] is False
+        # Second call: flipped queue.
+        assert calls[1].args[2] == flipped_id
+        assert calls[1].kwargs["is_flipped_retrade"] is True
+
+
+# --------------------------------------------------------------------------- #
 # Loosened-rules entry flow (May 2026)
 # Test the new TP1 path + zone-bound SL flow that lives in _try_place_setup.
 # --------------------------------------------------------------------------- #
