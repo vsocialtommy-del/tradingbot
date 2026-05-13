@@ -158,16 +158,6 @@ class TestDetectImpulses:
         assert len(impulses) == 1
         assert impulses[0].direction == "DROP"
 
-    def test_wick_heavy_candle_is_not_impulse(self) -> None:
-        # Body 0.5, wick 5.0 → body/range = 0.5/10.5 ≈ 0.05 << 0.6.
-        opens, highs, lows, closes = quiet_prelude(100.0)
-        opens.append(100.0)
-        closes.append(100.5)
-        highs.append(105.5)
-        lows.append(99.5)
-        df = make_ohlc(opens, highs, lows, closes)
-        assert detect_impulses(df) == []
-
     def test_small_body_in_low_vol_not_impulse(self) -> None:
         # All bars have ATR ≈ 0.5. A bar with body 0.3 fails the
         # body ≥ 1.0 × ATR check even with good body/range ratio.
@@ -521,7 +511,9 @@ class TestLargeDataframe:
 class TestPatternConfigDefaults:
     def test_defaults(self) -> None:
         c = PatternConfig()
-        assert c.impulse_body_to_range_ratio_min == 0.6
+        # PR #46 disabled the body/range filter (was 0.6). The 0.6
+        # strict mode is preserved in ``TestStrictModeBaseline``.
+        assert c.impulse_body_to_range_ratio_min == 0.0
         # PR #44 loosened from 1.0 → 0.7. The strict mode is
         # preserved as a regression baseline in
         # ``TestStrictModeBaseline``.
@@ -537,24 +529,27 @@ class TestPatternConfigDefaults:
 
 
 # --------------------------------------------------------------------------- #
-# PR #44 — strict-mode baseline (regression record)
+# Strict-mode baseline (regression record across PR #44 + PR #46)
 #
-# The pre-PR-44 defaults (impulse ATR multiple = 1.0, base ratio = 0.6)
-# rejected zones the user trades manually. The new loose defaults (0.7,
-# 1.0) catch them. The strict-mode behaviour is preserved below as a
-# regression record — any future return to strict thresholds should
-# still hit the same rejections.
+# Pre-PR-44 defaults: impulse ATR multiple = 1.0, base ratio = 0.6.
+# Pre-PR-46 defaults: impulse body/range ratio = 0.6.
+# All three rejected zones the user trades manually. The new loose
+# defaults (0.7 ATR, 1.0 base ratio, 0.0 body/range) catch them. The
+# strict-mode behaviour is preserved below as a regression record —
+# any future return to strict thresholds should still hit the same
+# rejections.
 # --------------------------------------------------------------------------- #
 
 
 _STRICT = PatternConfig(
+    impulse_body_to_range_ratio_min=0.6,
     impulse_atr_multiple_min=1.0,
     base_range_to_impulse_ratio_max=0.6,
 )
 
 
 class TestStrictModeBaseline:
-    """Pre-PR-44 strict behaviour — opt-in via explicit ``PatternConfig``."""
+    """Pre-loosening strict behaviour — opt-in via explicit ``PatternConfig``."""
 
     def test_strict_rejects_base_at_0_8_ratio(self) -> None:
         # Same fixture as the (now relaxed) loose-mode counterpart:
@@ -581,6 +576,18 @@ class TestStrictModeBaseline:
         # wicks so the body/range ratio still passes.
         opens.append(100.0); closes.append(100.8)
         highs.append(100.8); lows.append(100.0)
+        df = make_ohlc(opens, highs, lows, closes)
+        assert detect_impulses(df, _STRICT) == []
+
+    def test_strict_rejects_wick_heavy_candle(self) -> None:
+        # PR #46: the loose default (0.0) accepts wick-heavy candles
+        # as long as they pass the ATR check. Strict 0.6 still
+        # rejects. Body 0.5, range 6.0 → ratio 0.083 << 0.6.
+        opens, highs, lows, closes = quiet_prelude(100.0)
+        opens.append(100.0)
+        closes.append(100.5)
+        highs.append(105.5)
+        lows.append(99.5)
         df = make_ohlc(opens, highs, lows, closes)
         assert detect_impulses(df, _STRICT) == []
 
@@ -650,3 +657,69 @@ class TestUserMissedZoneRegression:
         patterns = detect_patterns(df, _STRICT)
         dbrs = [p for p in patterns if p.pattern_type == PatternType.DBR]
         assert dbrs == []
+
+
+# --------------------------------------------------------------------------- #
+# PR #46 — regression for the user's wick-heavy missed-zone scenario.
+#
+# A SELL/RBD shape where the rally-up impulse_before has a wick-heavy
+# candle (body/range = 0.5, below the strict 0.6 threshold). The rally
+# body still passes the ATR multiple, so it IS a meaningful move — the
+# old body/range filter rejected it as "indecision" even though it
+# wasn't. Loose default (0.0) accepts; strict 0.6 rejects.
+# --------------------------------------------------------------------------- #
+
+
+class TestUserMissedZoneBodyRatio:
+    """The wick-heavy rally-up the user reported on 2026-05-13. The
+    rally bar has a real body but also long wicks (impulse direction
+    plus shadows on both sides); the 0.6 body/range filter rejected it
+    even though the body was ~3 × ATR — a clear "conviction" move by
+    the ATR yardstick.
+    """
+
+    @staticmethod
+    def _build_wick_heavy_rbd_df() -> "pd.DataFrame":
+        """RBD with a wick-heavy rally bar (body/range = 0.5).
+
+        ATR ≈ 0.9 from the prelude. Rally bar: body 3 (100→103) with
+        wicks 1.5 on each side → range 6, body/range = 0.5. Drop bar:
+        body 3 (103→100) with tight wicks → range 3.4, body/range = 0.88.
+        Base = 2 quiet bars at ~103.
+        """
+        opens, highs, lows, closes = quiet_prelude(100.0, n=20, body=0.5)
+        # RALLY impulse (wick-heavy): 100 → 103, body 3, wicks 1.5 each
+        opens.append(100.0); closes.append(103.0)
+        highs.append(104.5); lows.append(98.5)
+        # Base bar 1: small body at the rally top
+        opens.append(103.0); closes.append(103.2)
+        highs.append(103.3); lows.append(102.9)
+        # Base bar 2: small body
+        opens.append(103.2); closes.append(103.0)
+        highs.append(103.3); lows.append(102.9)
+        # DROP impulse (clean): 103 → 100, body 3, tight wicks
+        opens.append(103.0); closes.append(100.0)
+        highs.append(103.2); lows.append(99.8)
+        return make_ohlc(opens, highs, lows, closes)
+
+    def test_rbd_with_wick_heavy_rally_detected(self) -> None:
+        # With the PR-46 default (body/range = 0.0), the wick-heavy
+        # rally bar qualifies as an impulse and detect_patterns
+        # returns the RBD.
+        df = self._build_wick_heavy_rbd_df()
+        patterns = detect_patterns(df)
+        rbds = [p for p in patterns if p.pattern_type == PatternType.RBD]
+        assert rbds, (
+            "PR #46 regression: expected at least one RBD, "
+            f"got patterns={[p.pattern_type.value for p in patterns]}"
+        )
+        assert all(p.direction == "SELL" for p in rbds)
+
+    def test_strict_mode_rejects_wick_heavy_rally(self) -> None:
+        # Inverse: pre-PR-46 strict 0.6 rejects the wick-heavy rally
+        # → no impulse_before → no pattern. Confirms PR #46 is doing
+        # real work.
+        df = self._build_wick_heavy_rbd_df()
+        patterns = detect_patterns(df, _STRICT)
+        rbds = [p for p in patterns if p.pattern_type == PatternType.RBD]
+        assert rbds == []

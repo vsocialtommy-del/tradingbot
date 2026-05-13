@@ -64,11 +64,13 @@ from bot.strategy.zone_refinement import (
 class StrategyPipelineConfig:
     """Aggregate of all per-stage tunables. Defaults mirror per-module defaults."""
 
-    # Pattern detection (S&D). Two defaults loosened in PR #44 to
-    # catch zones the strict thresholds rejected; see
-    # ``bot.strategy.pattern_detection.PatternConfig`` for the
-    # full rationale + the TestStrictModeBaseline regression class.
-    impulse_body_to_range_ratio_min: float = 0.6
+    # Pattern detection (S&D). Three defaults loosened across PR #44
+    # (impulse_atr_multiple_min, base_range_to_impulse_ratio_max) and
+    # PR #46 (impulse_body_to_range_ratio_min) to catch zones the
+    # strict thresholds rejected; see
+    # ``bot.strategy.pattern_detection.PatternConfig`` for the full
+    # rationale + the TestStrictModeBaseline regression class.
+    impulse_body_to_range_ratio_min: float = 0.0  # PR #46: 0.6 → 0.0
     impulse_atr_multiple_min: float = 0.7  # PR #44: 1.0 → 0.7
     atr_period: int = 14
     max_impulse_run_candles: int = 5

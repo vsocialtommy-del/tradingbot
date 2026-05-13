@@ -37,7 +37,12 @@ Strength criteria
 An **impulse candle** requires BOTH:
 
 1. ``body / total_range ≥ impulse_body_to_range_ratio_min`` (default
-   0.6) — filters wick-heavy candles.
+   0.0 — disabled). Pre-PR-46 this defaulted to 0.6 (filter out
+   wick-heavy candles). PR #46 disables the filter by default
+   because real impulses in XAUUSD M5 frequently include long wicks
+   yet still trade through with conviction; the ATR multiple below
+   is the surviving "is this a strong candle" guard. Operators can
+   re-enable by setting the field explicitly.
 2. ``body_size ≥ impulse_atr_multiple_min × ATR(atr_period)``
    (default 0.7 × ATR(14), loosened from 1.0 in PR #44) — filters
    small candles in low vol while still accepting impulses that
@@ -64,6 +69,18 @@ that scored just outside the strict thresholds. The new defaults
 that the body-break safety check and downstream gates should
 catch. Strict-mode is preserved in ``test_pattern_detection.py
 ::TestStrictModeBaseline`` as a regression record.
+
+PR-46 rationale
+---------------
+The body/range ratio (0.6) was still rejecting visually-clean
+zones whose impulses had legitimate-size bodies but also
+meaningful wicks (e.g. a 4-pt body on a 10-pt range = 40% — the
+candle clearly moved 4 pts in one direction but the wicks fail
+the 0.6 gate). The user observed real missed entries from this
+filter even after PR #44. The ATR multiple (0.7) is preserved as
+the primary "strong candle" gate; a candle with body ≥ 0.7 × ATR
+is by definition a meaningful move regardless of wick proportion.
+Strict 0.6 mode is preserved in ``TestStrictModeBaseline``.
 
 Multi-candle impulses
 ---------------------
@@ -196,14 +213,19 @@ class PatternConfig:
     """
 
     # Impulse strength
-    impulse_body_to_range_ratio_min: float = 0.6
-    """Body ≥ 60% of total range. Filters wick-heavy candles."""
+    impulse_body_to_range_ratio_min: float = 0.0
+    """Body / total_range threshold. PR #46: defaulted to 0.0
+    (disabled) — the previous 0.6 default rejected visually-clean
+    zones with wick-heavy impulse candles. The ATR multiple below
+    is the surviving "is this a meaningful move" guard. Operators
+    can re-enable by setting an explicit non-zero value."""
     impulse_atr_multiple_min: float = 0.7
     """Body ≥ 0.7 × ATR(14). Loosened from 1.0 (PR #44) to catch
     zones where impulses are roughly ATR-sized rather than strictly
     above. The pre-PR-44 1.0 default rejected real zones the user
     trades manually (e.g. the 4685-4691 DBR with ~$3-4 impulse
-    bodies against ATR≈$4)."""
+    bodies against ATR≈$4). After PR #46 this is the sole impulse-
+    strength gate (the body/range ratio is disabled by default)."""
     atr_period: int = 14
     max_impulse_run_candles: int = 5
     """Cap on consecutive strong same-direction candles in one impulse."""
