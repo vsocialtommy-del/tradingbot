@@ -309,7 +309,8 @@ class TestConfig:
 
     def test_default_config_values(self) -> None:
         c = StrategyPipelineConfig()
-        assert c.impulse_body_to_range_ratio_min == 0.6
+        # PR #46 disabled this filter (was 0.6).
+        assert c.impulse_body_to_range_ratio_min == 0.0
         # PR #44 loosened from 1.0.
         assert c.impulse_atr_multiple_min == 0.7
         assert c.atr_period == 14
