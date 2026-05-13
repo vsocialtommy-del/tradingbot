@@ -39,23 +39,31 @@ An **impulse candle** requires BOTH:
 1. ``body / total_range ≥ impulse_body_to_range_ratio_min`` (default
    0.6) — filters wick-heavy candles.
 2. ``body_size ≥ impulse_atr_multiple_min × ATR(atr_period)``
-   (default 1.0 × ATR(14)) — filters small candles in low vol.
+   (default 0.7 × ATR(14), loosened from 1.0 in PR #44) — filters
+   small candles in low vol while still accepting impulses that
+   are roughly ATR-sized.
 
 A **tight base** requires BOTH:
 
 1. Total base range (``max(high) - min(low)``, **wick-inclusive**)
    ≤ ``base_range_to_impulse_ratio_max`` × mean of the two adjacent
-   impulses' ranges (default 0.6).
+   impulses' ranges (default 1.0, loosened from 0.6 in PR #44). A
+   base may now span roughly as wide as the impulses around it.
 2. Largest base candle body (``max |close - open|``, body-only)
    ≤ ``base_max_body_to_impulse_body_ratio`` × the larger of the two
-   adjacent impulses' largest bodies (default 0.4).
+   adjacent impulses' largest bodies (default 0.4 — unchanged).
 
 Both criteria must hold; either fails, the gap isn't a base.
 
-The wick-inclusive range in criterion 1 means bases with long
-rejection tails register as "wider" than the pre-wicks body-only
-definition; the 0.6 default may need re-tuning against demo data —
-flagged as a known calibration target.
+PR-44 rationale
+---------------
+The strict pre-#44 defaults (1.0 × ATR, 0.6 base ratio) rejected
+zones the user trades manually — visually clean S&D structures
+that scored just outside the strict thresholds. The new defaults
+(0.7, 1.0) lift detection rate at the cost of some false positives
+that the body-break safety check and downstream gates should
+catch. Strict-mode is preserved in ``test_pattern_detection.py
+::TestStrictModeBaseline`` as a regression record.
 
 Multi-candle impulses
 ---------------------
@@ -190,8 +198,12 @@ class PatternConfig:
     # Impulse strength
     impulse_body_to_range_ratio_min: float = 0.6
     """Body ≥ 60% of total range. Filters wick-heavy candles."""
-    impulse_atr_multiple_min: float = 1.0
-    """Body ≥ 1.0 × ATR(14). Filters small candles in low vol."""
+    impulse_atr_multiple_min: float = 0.7
+    """Body ≥ 0.7 × ATR(14). Loosened from 1.0 (PR #44) to catch
+    zones where impulses are roughly ATR-sized rather than strictly
+    above. The pre-PR-44 1.0 default rejected real zones the user
+    trades manually (e.g. the 4685-4691 DBR with ~$3-4 impulse
+    bodies against ATR≈$4)."""
     atr_period: int = 14
     max_impulse_run_candles: int = 5
     """Cap on consecutive strong same-direction candles in one impulse."""
@@ -199,10 +211,15 @@ class PatternConfig:
     # Base shape
     min_base_candles: int = 1
     max_base_candles: int = 5
-    base_range_to_impulse_ratio_max: float = 0.6
-    """Total base range ≤ this × mean(impulse_before.range, impulse_after.range)."""
+    base_range_to_impulse_ratio_max: float = 1.0
+    """Total base range ≤ this × mean(impulse_before.range,
+    impulse_after.range). Loosened from 0.6 (PR #44) to allow bases
+    that span roughly as wide as the surrounding impulses — that
+    captures real zones the visual eye reads as tight even when the
+    strict 0.6 ratio rejects them."""
     base_max_body_to_impulse_body_ratio: float = 0.4
-    """No single base body ≥ this × largest impulse body."""
+    """No single base body ≥ this × largest impulse body. Unchanged
+    — this guards against a 'mini-impulse' candle inside the base."""
 
     # Pattern lookback (within-window cutoff at the caller)
     lookback_bars: int = 50

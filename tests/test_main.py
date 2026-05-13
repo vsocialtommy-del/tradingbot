@@ -2178,3 +2178,218 @@ class TestPriceVsZoneGate:
         place.assert_called_once()
         # Sanity: the SELL direction propagates through.
         assert place.call_args.args[0].direction == "SELL"
+
+
+# --------------------------------------------------------------------------- #
+# PR #44 — per-tick placement
+# Detection runs on M5 close and populates ``self._pending_*``; the
+# per-tick ``_try_place_pending`` fires placement when price reaches
+# a zone, regardless of M5 close. Solves the mid-bar-wick race.
+# --------------------------------------------------------------------------- #
+
+
+class TestPerTickPlacement:
+    def test_pending_list_populated_on_m5_close_without_placement(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # First tick: M5 close fires, pipeline returns one zone.
+        # Price is well above the zone → gate defers, zone goes onto
+        # the pending list. No placement attempt this iteration.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1925.0, "ask": 1925.1, "time": NOW, "time_msc": 0,
+        }
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        b.run_iteration(NOW)
+
+        place.assert_not_called()
+        # Zone now sitting on the queue for future tick evaluation.
+        assert len(b._pending_pipeline_zones) == 1
+
+    def test_subsequent_tick_with_price_at_zone_fires_placement(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Iteration 1: detection populates pending; price above zone.
+        # Iteration 2: same M5 bar still — price wicks down to zone
+        # top → gate passes → placement fires. No new M5 close.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1925.0, "ask": 1925.1, "time": NOW, "time_msc": 0,
+        }
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        place = mocker.patch("bot.main.place_layered_orders")
+        place.return_value = mocker.MagicMock(
+            status="PLACED", setup_id=uuid4(),
+            layer_1_ticket=11111, sl_price=1882.5, tp1_price=1907.5,
+            error_messages=[],
+        )
+
+        # Iter 1 — detection only.
+        b.run_iteration(NOW)
+        place.assert_not_called()
+        assert len(b._pending_pipeline_zones) == 1
+
+        # Iter 2 — same M5 bar (last_m5_bar_time stays set so the
+        # M5-close gate is False; only per-tick placement runs).
+        # Tick now puts bid AT zone.top.
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1900.5, "ask": 1900.6, "time": NOW, "time_msc": 0,
+        }
+        b.run_iteration(NOW + timedelta(seconds=1))
+
+        place.assert_called_once()
+        # Successful placement pops the zone off the queue.
+        assert b._pending_pipeline_zones == []
+
+    def test_pending_zone_survives_across_ticks_until_placed(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Many ticks with price stubbornly above the zone — pending
+        # entry persists. No placement, no spurious DB writes.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1925.0, "ask": 1925.1, "time": NOW, "time_msc": 0,
+        }
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        for i in range(5):
+            b.run_iteration(NOW + timedelta(seconds=i))
+
+        place.assert_not_called()
+        # The zone is still on the queue after 5 ticks.
+        assert len(b._pending_pipeline_zones) == 1
+
+    def test_pending_list_refreshes_on_next_m5_close(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mock_supabase: MagicMock,
+        mocker: MockerFixture,
+    ) -> None:
+        # An M5 close re-runs detection and rebuilds the pending
+        # list from scratch. Same zone detected on both closes → one
+        # entry on the queue (idempotency via the persistence cache).
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1925.0, "ask": 1925.1, "time": NOW, "time_msc": 0,
+        }
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        mocker.patch("bot.main.place_layered_orders")
+
+        # First M5 close: pending = 1.
+        b.run_iteration(NOW)
+        assert len(b._pending_pipeline_zones) == 1
+
+        # Force a "new M5 bar" by advancing the fixture's last_time
+        # and resetting the bot's bar-tracking state.
+        next_bar_df = make_ohlc(n=30, last_time="2026-05-08T12:05:00Z")
+        bot[1]["ohlc_provider"].get.return_value = next_bar_df
+        b.state.last_m5_bar_time = None  # treat next call as a new bar
+        b.run_iteration(NOW + timedelta(minutes=5))
+
+        # Same physical zone → idempotency cache hit → one entry.
+        assert len(b._pending_pipeline_zones) == 1
+
+    def test_flipped_candidate_fires_on_tick_when_price_reaches_zone(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mock_mt5: MagicMock,
+        mocker: MockerFixture,
+    ) -> None:
+        # Flipped-zone path also rides the pending queue.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        # Price starts away from the zone.
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1849.9, "ask": 1850.0, "time": NOW, "time_msc": 0,
+        }
+
+        fz = _make_flipped_zone_row(
+            original_direction="BUY", flipped_direction="SELL",
+            top=1905.0, bottom=1900.0,
+            flipped_at=NOW - timedelta(hours=1),
+        )
+        mock_supabase.get_zones_by_status.side_effect = (
+            lambda statuses: [fz] if "FLIPPED" in statuses else []
+        )
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1890.0)
+        place = mocker.patch("bot.main.place_layered_orders")
+        place.return_value = mocker.MagicMock(
+            status="PLACED", setup_id=uuid4(),
+            layer_1_ticket=11111, sl_price=1922.5, tp1_price=1890.0,
+            error_messages=[],
+        )
+
+        # Iter 1: detection populates flipped queue; price below
+        # zone → gate defers.
+        b.run_iteration(NOW)
+        place.assert_not_called()
+        assert len(b._pending_flipped_zones) == 1
+
+        # Iter 2: price rises to zone.bottom → fires.
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1899.9, "ask": 1900.0, "time": NOW, "time_msc": 0,
+        }
+        b.run_iteration(NOW + timedelta(seconds=1))
+
+        place.assert_called_once()
+        assert b._pending_flipped_zones == []
+
+    def test_dedup_still_blocks_placement_on_pending_zone(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mock_supabase: MagicMock,
+        mocker: MockerFixture,
+    ) -> None:
+        # A pending zone whose bounds overlap an existing CONSUMED
+        # zone in the same direction stays in the queue but never
+        # fires — dedup blocks every attempt.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        # Price already at zone (so the gate wouldn't otherwise defer).
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1900.5, "ask": 1900.6, "time": NOW, "time_msc": 0,
+        }
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        existing_consumed = _make_zone_row(
+            direction="BUY", top=1900.5, bottom=1900.0,
+            status="CONSUMED", consumed_at=NOW,
+        )
+        mock_supabase.get_zones_by_status.return_value = [existing_consumed]
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        b.run_iteration(NOW)
+
+        place.assert_not_called()
+        # Pending list keeps the zone — dedup is run inside
+        # _try_place_setup which returned False; it'll keep retrying
+        # on subsequent ticks (cheap; cache absorbs the Supabase hit).
+        assert len(b._pending_pipeline_zones) == 1
