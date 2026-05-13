@@ -91,6 +91,10 @@ CloseReason = Literal[
     "TP1", "TP2", "TP3",
     # Stop / external closes.
     "SL_HIT", "BE_HIT", "MANUAL_CLOSE", "NEWS_CLOSE",
+    # PR #43 / migration 011: a WAITING layer cancelled because a
+    # previous layer's TP fired (cascade close on the parent setup).
+    # Distinguishes the cascade path from MANUAL_CLOSE for analytics.
+    "CASCADE_CANCELLED",
 ]
 LogLevel = Literal["DEBUG", "INFO", "WARN", "ERROR"]
 ImpactLevel = Literal["HIGH", "MEDIUM", "LOW"]
