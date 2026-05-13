@@ -310,12 +310,14 @@ class TestConfig:
     def test_default_config_values(self) -> None:
         c = StrategyPipelineConfig()
         assert c.impulse_body_to_range_ratio_min == 0.6
-        assert c.impulse_atr_multiple_min == 1.0
+        # PR #44 loosened from 1.0.
+        assert c.impulse_atr_multiple_min == 0.7
         assert c.atr_period == 14
         assert c.max_impulse_run_candles == 5
         assert c.min_base_candles == 1
         assert c.max_base_candles == 5
-        assert c.base_range_to_impulse_ratio_max == 0.6
+        # PR #44 loosened from 0.6.
+        assert c.base_range_to_impulse_ratio_max == 1.0
         assert c.base_max_body_to_impulse_body_ratio == 0.4
         assert c.zone_min_size_points == 5.0
         assert c.zone_max_size_points == 80.0

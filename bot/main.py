@@ -252,6 +252,15 @@ class Bot:
             tuple[str, float, float, str], UUID
         ] = {}
 
+        # PR #44: pending zones awaiting their first price retest.
+        # Populated on M5 close by ``_detect_new_zones``; iterated on
+        # every tick by ``_try_place_pending``. Entries pop on
+        # successful placement; otherwise survive until the next M5
+        # close refreshes the list (whatever the new pipeline output
+        # plus current FLIPPED rows produce).
+        self._pending_pipeline_zones: list[tuple[ValidatedZone, UUID]] = []
+        self._pending_flipped_zones:  list[tuple[ValidatedZone, UUID]] = []
+
     # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #
@@ -439,7 +448,19 @@ class Bot:
                     f"new setups blocked: news → {news_check.block_reason}"
                 )
             elif self._has_new_m5_close(now):
-                self._maybe_run_strategy(now, bid=bid, ask=ask)
+                self._detect_new_zones(now)
+
+        # 5b. Per-tick placement check (PR #44). Runs AFTER M5-close
+        # detection so the same iteration that detects a zone can
+        # also place a setup on it if price is already at the zone.
+        # On subsequent ticks (1 Hz) this still runs, catching mid-
+        # bar wicks before the next M5 close's lifecycle scan
+        # consumes the zone.
+        if not self._is_paused(now):
+            try:
+                self._try_place_pending(bid=bid, ask=ask)
+            except Exception:
+                logger.exception("main loop: _try_place_pending raised")
 
         # 6. Reconcile (cadenced).
         if self._should_reconcile(now):
@@ -577,15 +598,18 @@ class Bot:
             return True
         return False
 
-    def _maybe_run_strategy(
-        self, now: datetime, *, bid: float, ask: float,
-    ) -> None:
-        """Run the per-bar zone lifecycle pass + strategy pipeline.
+    def _detect_new_zones(self, now: datetime) -> None:
+        """M5-close detection pass: lifecycle scan + pattern detection
+        + persistence + pending-list refresh.
 
-        ``bid`` / ``ask`` are the current tick prices threaded from the
-        outer loop. Used by the price-vs-zone gate in
-        :meth:`_try_place_setup` to skip placement when price hasn't
-        reached the planned Layer 1 entry yet.
+        Per PR #44, placement does **not** happen here. Instead the
+        candidates are stored on ``self._pending_pipeline_zones`` /
+        ``self._pending_flipped_zones`` and the per-tick
+        :meth:`_try_place_pending` decides when to fire them. That
+        change means a wick into a zone fires placement immediately
+        (1 Hz latency) instead of waiting for the next M5 close —
+        which used to race against the lifecycle scanner's
+        consumption check and lose every time.
         """
         df: pd.DataFrame | None = getattr(self, "_latest_ohlc", None)
         if df is None:
@@ -607,18 +631,11 @@ class Bot:
             logger.exception("main loop: strategy pipeline raised")
             return
 
-        # Note: we don't early-return on empty ``zones`` any more.
-        # The FLIPPED-zone trade side path (PR #38) runs even when the
-        # pipeline returns no fresh patterns — a freshly-flipped zone
-        # in the DB is itself a tradeable opportunity.
-
-        # Persist every tradeable zone to Supabase BEFORE deciding whether
-        # to place a setup. Each zone gets exactly one row, regardless of
-        # how many times it's re-detected in subsequent pipeline runs
-        # (idempotency via ``_persisted_zone_keys`` cache). This populates
-        # the data trail the lifecycle scanner and dedup pre-flight rely
-        # on, even for zones we never end up trading (no TP1 / SL invalid
-        # / lot=0 / exposure cap / news block).
+        # Persist every tradeable zone to Supabase. Each zone gets
+        # exactly one row, regardless of how many times it's
+        # re-detected in subsequent pipeline runs (idempotency via
+        # ``_persisted_zone_keys`` cache). This populates the data
+        # trail the lifecycle scanner and dedup pre-flight rely on.
         zone_ids: dict[int, UUID] = {}
         for zone in zones:
             if not zone.refined_zone.is_tradeable:
@@ -627,23 +644,14 @@ class Bot:
             if zid is not None:
                 zone_ids[id(zone)] = zid
 
-        # SnD Flip side path (PR #38): load FLIPPED zones from DB and
-        # synthesise tradeable views in their ``flipped_direction``.
-        # Sits parallel to the pipeline-output zones; both go through
-        # the same exposure-capped placement loop below.
+        # SnD Flip side path (PR #38): load FLIPPED zones from DB.
         flipped_candidates = self._load_flipped_candidates(df)
 
-        # Exposure cap.
-        try:
-            active_setups = self.position_tracker.get_active_setups()
-        except Exception:
-            logger.exception("main loop: get_active_setups failed")
-            return
-        active_count = count_active_setups(active_setups)
-
-        # Build the combined placement queue. Tuples of (zone_view,
-        # zone_id, source_label) — source_label is for logging only.
-        placement_queue: list[tuple[ValidatedZone, UUID, str]] = []
+        # Refresh the per-tick placement queues. Each tuple is
+        # (zone_view, zone_id). ``_try_place_pending`` pops entries
+        # on successful placement; what remains rolls into the next
+        # M5 close where this method runs again and rebuilds.
+        new_pipeline_pending: list[tuple[ValidatedZone, UUID]] = []
         for zone in zones:
             if not zone.is_strong_point:
                 # Body-broken zones persisted but not traded; lifecycle
@@ -656,28 +664,80 @@ class Bot:
                     f"({zone.direction} {zone.bottom:.2f}-{zone.top:.2f})"
                 )
                 continue
-            placement_queue.append((zone, zid, "pipeline"))
-        for fz_view, fz_id in flipped_candidates:
-            placement_queue.append((fz_view, fz_id, "flipped"))
+            new_pipeline_pending.append((zone, zid))
 
-        for zone, zid, source in placement_queue:
-            exp = check_exposure(
-                active_count=active_count,
-                max_simultaneous=self.config.max_simultaneous_setups,
-                with_candidate=True,
+        self._pending_pipeline_zones = new_pipeline_pending
+        self._pending_flipped_zones = list(flipped_candidates)
+        if self._pending_pipeline_zones or self._pending_flipped_zones:
+            logger.debug(
+                f"M5 close: pending placement queue refreshed — "
+                f"{len(self._pending_pipeline_zones)} pipeline, "
+                f"{len(self._pending_flipped_zones)} flipped"
             )
-            if not exp.can_open_new:
-                logger.info(
-                    f"new setups blocked by exposure cap "
-                    f"({exp.current_count}/{exp.max_allowed})"
+
+    def _try_place_pending(self, *, bid: float, ask: float) -> None:
+        """Per-tick placement check (PR #44).
+
+        Iterates the pending pipeline + flipped queues against the
+        current tick. For each entry, runs the existing
+        :meth:`_try_place_setup` — its price-vs-zone gate (PR #40)
+        decides whether to actually fire. Successful placements pop
+        from the queue so the next tick doesn't re-attempt.
+
+        Heavy strategy work (pattern detection, persistence,
+        lifecycle scan) stays on M5 close in
+        :meth:`_detect_new_zones` — only the cheap "is price at this
+        zone yet?" check runs here.
+        """
+        if not self._pending_pipeline_zones and not self._pending_flipped_zones:
+            return
+
+        df: pd.DataFrame | None = getattr(self, "_latest_ohlc", None)
+        if df is None:
+            return
+
+        # Exposure cap.
+        try:
+            active_setups = self.position_tracker.get_active_setups()
+        except Exception:
+            logger.exception("main loop: get_active_setups failed")
+            return
+        active_count = count_active_setups(active_setups)
+
+        for source_label, queue in (
+            ("pipeline", self._pending_pipeline_zones),
+            ("flipped",  self._pending_flipped_zones),
+        ):
+            # Iterate over a copy so we can mutate the underlying list.
+            remaining: list[tuple[ValidatedZone, UUID]] = []
+            for zone, zid in queue:
+                exp = check_exposure(
+                    active_count=active_count,
+                    max_simultaneous=self.config.max_simultaneous_setups,
+                    with_candidate=True,
                 )
-                break
-            if self._try_place_setup(zone, df, zid, bid=bid, ask=ask):
-                active_count += 1
-                self.state.placed_setup_count += 1
-                logger.info(
-                    f"setup placed from source={source} zone_id={zid}"
-                )
+                if not exp.can_open_new:
+                    # Out of exposure — leave this and everything
+                    # after in the queue for a future tick.
+                    remaining.append((zone, zid))
+                    remaining.extend(queue[queue.index((zone, zid)) + 1:])
+                    break
+                if self._try_place_setup(zone, df, zid, bid=bid, ask=ask):
+                    active_count += 1
+                    self.state.placed_setup_count += 1
+                    logger.info(
+                        f"setup placed from source={source_label} "
+                        f"zone_id={zid}"
+                    )
+                    # Don't keep this entry on the queue.
+                    continue
+                # Placement didn't fire (gate deferred, dedup blocked,
+                # SL/TP/lot rejected). Keep on the queue for next tick.
+                remaining.append((zone, zid))
+            if source_label == "pipeline":
+                self._pending_pipeline_zones = remaining
+            else:
+                self._pending_flipped_zones = remaining
 
     def _persist_zone_if_new(self, zone: ValidatedZone) -> UUID | None:
         """Insert the zone row (status=CONFIRMED) if not already cached.

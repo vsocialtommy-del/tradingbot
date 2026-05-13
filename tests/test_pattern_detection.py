@@ -333,12 +333,14 @@ class TestDetectBases:
         assert len(impulses) == 2
         assert detect_bases(df, impulses) == []
 
-    def test_base_too_wide_relative_to_impulse_rejected(self) -> None:
-        # Base range = 4.0, impulses range = 5.0 → 4.0 > 0.6 * 5.0 = 3.0 → reject.
+    def test_base_within_loosened_ratio_accepted(self) -> None:
+        # PR #44 loosened ``base_range_to_impulse_ratio_max`` 0.6 → 1.0.
+        # The same shape that used to fail (base range 4.0 vs impulse
+        # range 5.0 — ratio 0.8) now passes. The strict-mode rejection
+        # is preserved in :class:`TestStrictModeBaseline` below.
         opens, highs, lows, closes = quiet_prelude(100.0)
         o, h, l, c = make_strong_bar("RALLY", 100.0, body=5.0)
         opens.append(o); highs.append(h); lows.append(l); closes.append(c)
-        # Wide base — closes drift from 105 to 109 (range 4.0).
         for c_price in (105.0, 107.0, 109.0):
             opens.append(c_price); closes.append(c_price)
             highs.append(c_price + 0.1); lows.append(c_price - 0.1)
@@ -347,7 +349,7 @@ class TestDetectBases:
         df = make_ohlc(opens, highs, lows, closes)
         impulses = detect_impulses(df)
         bases = detect_bases(df, impulses)
-        assert bases == []
+        assert len(bases) == 1
 
     # Note: the "big body in base" criterion is hard to test in
     # isolation because a base bar with body ≥ 0.4× the impulse body
@@ -357,8 +359,7 @@ class TestDetectBases:
     # impulses. The criterion still acts as an extra safety in the
     # ``_tight_enough`` helper for unusual cases (e.g. a low-ATR
     # session with a sudden mid-range bar) but doesn't make for a
-    # clean black-box test. Exercised implicitly via the
-    # ``test_base_too_wide_relative_to_impulse_rejected`` scenario.
+    # clean black-box test.
 
 
 # --------------------------------------------------------------------------- #
@@ -521,11 +522,131 @@ class TestPatternConfigDefaults:
     def test_defaults(self) -> None:
         c = PatternConfig()
         assert c.impulse_body_to_range_ratio_min == 0.6
-        assert c.impulse_atr_multiple_min == 1.0
+        # PR #44 loosened from 1.0 → 0.7. The strict mode is
+        # preserved as a regression baseline in
+        # ``TestStrictModeBaseline``.
+        assert c.impulse_atr_multiple_min == 0.7
         assert c.atr_period == 14
         assert c.max_impulse_run_candles == 5
         assert c.min_base_candles == 1
         assert c.max_base_candles == 5
-        assert c.base_range_to_impulse_ratio_max == 0.6
+        # PR #44 loosened from 0.6 → 1.0.
+        assert c.base_range_to_impulse_ratio_max == 1.0
         assert c.base_max_body_to_impulse_body_ratio == 0.4
         assert c.lookback_bars == 50
+
+
+# --------------------------------------------------------------------------- #
+# PR #44 — strict-mode baseline (regression record)
+#
+# The pre-PR-44 defaults (impulse ATR multiple = 1.0, base ratio = 0.6)
+# rejected zones the user trades manually. The new loose defaults (0.7,
+# 1.0) catch them. The strict-mode behaviour is preserved below as a
+# regression record — any future return to strict thresholds should
+# still hit the same rejections.
+# --------------------------------------------------------------------------- #
+
+
+_STRICT = PatternConfig(
+    impulse_atr_multiple_min=1.0,
+    base_range_to_impulse_ratio_max=0.6,
+)
+
+
+class TestStrictModeBaseline:
+    """Pre-PR-44 strict behaviour — opt-in via explicit ``PatternConfig``."""
+
+    def test_strict_rejects_base_at_0_8_ratio(self) -> None:
+        # Same fixture as the (now relaxed) loose-mode counterpart:
+        # base range 4.0 / impulse range 5.0 → ratio 0.8. Strict 0.6
+        # threshold rejects; loose 1.0 accepts (see above).
+        opens, highs, lows, closes = quiet_prelude(100.0)
+        o, h, l, c = make_strong_bar("RALLY", 100.0, body=5.0)
+        opens.append(o); highs.append(h); lows.append(l); closes.append(c)
+        for c_price in (105.0, 107.0, 109.0):
+            opens.append(c_price); closes.append(c_price)
+            highs.append(c_price + 0.1); lows.append(c_price - 0.1)
+        o, h, l, c = make_strong_bar("RALLY", 109.0, body=5.0)
+        opens.append(o); highs.append(h); lows.append(l); closes.append(c)
+        df = make_ohlc(opens, highs, lows, closes)
+        impulses = detect_impulses(df, _STRICT)
+        bases = detect_bases(df, impulses, _STRICT)
+        assert bases == []
+
+    def test_strict_rejects_sub_atr_impulse(self) -> None:
+        # Body ~0.8 × ATR ≈ falls below the strict 1.0 × ATR floor;
+        # would pass the new 0.7 × ATR loose floor.
+        opens, highs, lows, closes = quiet_prelude(100.0, body=1.0)
+        # Bar with body 0.8 (just under ATR ≈ 1.0) but with tight
+        # wicks so the body/range ratio still passes.
+        opens.append(100.0); closes.append(100.8)
+        highs.append(100.8); lows.append(100.0)
+        df = make_ohlc(opens, highs, lows, closes)
+        assert detect_impulses(df, _STRICT) == []
+
+
+# --------------------------------------------------------------------------- #
+# PR #44 — regression for the user's missed-zone scenario (DBR at
+# ~4685-4691 with ~$3-4 impulse bodies). The strict defaults rejected
+# this; the loose defaults should now detect it.
+# --------------------------------------------------------------------------- #
+
+
+class TestUserMissedZoneRegression:
+    """The 4685-4691 DBR the user reported as visually obvious but
+    bot-invisible (image annotated 2026-05-13). Synthesised here as
+    an isolated DBR pattern that mirrors the structure: ~$3-4 impulse
+    bodies against an ATR of similar magnitude, base range ~$5.88
+    against impulse range ~$3-4 (ratio ~1.6 — outside both old AND
+    new defaults; we use a slightly tighter fixture so the new
+    defaults still detect it).
+    """
+
+    @staticmethod
+    def _build_user_zone_df() -> "pd.DataFrame":
+        """The shared fixture: DBR with base ratio in the 0.6–1.0 band.
+
+        ATR ≈ 0.9 from the prelude. Impulses have $3.5 bodies and
+        ~$3.9 ranges (high(start)−low(end) for the DROP; mirror for
+        the RALLY). Base range max(high)−min(low) ≈ $2.8 → ratio
+        2.8 / 3.9 ≈ 0.72 — outside the strict 0.6 cap, inside the
+        loose 1.0 cap.
+        """
+        opens, highs, lows, closes = quiet_prelude(100.0, n=20, body=0.5)
+        # DROP impulse: 100 → 96.5, body 3.5, tight wicks
+        opens.append(100.0); closes.append(96.5)
+        highs.append(100.2); lows.append(96.3)
+        # Base bar 1: small body 0.5, wider wick range 2.0
+        opens.append(96.5); closes.append(97.0)
+        highs.append(98.0); lows.append(96.0)
+        # Base bar 2: tiny body 0.2, range 2.8 (so the base envelope
+        # ends up max=98.8, min=96.0 → 2.8 total)
+        opens.append(97.0); closes.append(96.8)
+        highs.append(98.8); lows.append(96.0)
+        # RALLY impulse: 96.8 → 100.3, body 3.5
+        opens.append(96.8); closes.append(100.3)
+        highs.append(100.5); lows.append(96.6)
+        return make_ohlc(opens, highs, lows, closes)
+
+    def test_dbr_with_loosened_base_ratio_detected(self) -> None:
+        # With the new PR-44 defaults (base ratio cap 1.0), the
+        # base/impulse ratio of ~0.72 passes and detect_patterns
+        # returns the DBR.
+        df = self._build_user_zone_df()
+        patterns = detect_patterns(df)
+        dbrs = [p for p in patterns if p.pattern_type == PatternType.DBR]
+        assert dbrs, (
+            "user-missed-zone regression: expected at least one DBR, "
+            f"got patterns={[p.pattern_type.value for p in patterns]}"
+        )
+        assert all(p.direction == "BUY" for p in dbrs)
+
+    def test_strict_mode_rejects_same_shape(self) -> None:
+        # Inverse: with the pre-PR-44 strict defaults the ratio 0.72
+        # fails the 0.6 cap → no base → no pattern. Confirms the
+        # loose defaults are doing real work, not just matching
+        # pre-existing behaviour.
+        df = self._build_user_zone_df()
+        patterns = detect_patterns(df, _STRICT)
+        dbrs = [p for p in patterns if p.pattern_type == PatternType.DBR]
+        assert dbrs == []
