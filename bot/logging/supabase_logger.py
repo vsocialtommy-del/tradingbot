@@ -379,35 +379,28 @@ class SupabaseLogger:
     ) -> Zone:
         """Patch a zone to ``status`` and stamp the matching timestamps.
 
-        The DB CHECK (migration 007 + relaxation in migration 008)
-        enforces:
-          * status='CONSUMED' / 'VIOLATED' / 'FLIPPED' carry their
-            timestamps NOT NULL.
-          * status='CONFIRMED' / 'ACTIVE' have all lifecycle
-            timestamps NULL.
-          * status='FLIPPED' requires ``flipped_direction`` NOT NULL.
-            Migration 008 lets ``flipped_direction`` stay populated on
-            any later status — preserves the "this zone was once
-            flipped" indicator across FLIPPED → ACTIVE → CONSUMED.
+        The DB CHECK enforces (post-migration-010):
+          * ``status='CONSUMED'`` / ``'VIOLATED'`` / ``'FLIPPED'`` each
+            require their headline timestamp NOT NULL.
+          * ``status='FLIPPED'`` additionally requires
+            ``flipped_direction`` NOT NULL (separate narrower CHECK).
+          * ``status='ACTIVE'`` has **no** timestamp restrictions —
+            preserves the full audit trail for zones that came via
+            the SnD Flip path (FLIPPED → ACTIVE keeps ``violated_at``,
+            ``flipped_at``, ``flipped_direction`` populated).
+          * ``status='CONFIRMED'`` requires all three timestamps NULL
+            (fresh-state invariant).
 
-        FLIPPED → ACTIVE specifically needs to clear ``violated_at``
-        and ``flipped_at`` to satisfy the consistency CHECK, while
-        leaving ``flipped_direction`` intact. We do that here by
-        emitting explicit NULLs (bypassing the None-stripping in
-        :func:`_serialize_update_payload`).
+        Pre-migration-010 behaviour: this method emitted explicit
+        NULLs for ``violated_at`` and ``flipped_at`` on the ACTIVE
+        transition to satisfy the strict CHECK. That destroyed the
+        flip history on the row. After migration 010 the CHECK
+        permits the timestamps to persist, so we simply leave them
+        alone — only ``status`` gets patched on ACTIVE.
         """
         now = datetime.now(tz=timezone.utc)
         fields: dict[str, Any] = {"status": status}
-        explicit_nulls: list[str] = []
-        if status == "ACTIVE":
-            # Source may be CONFIRMED (clean) or FLIPPED (history to
-            # clear). For CONFIRMED these are already NULL, so the
-            # explicit NULL is a no-op. For FLIPPED → ACTIVE, this
-            # is the path that lets the transition pass the CHECK.
-            # ``flipped_direction`` is NOT cleared (preserved per
-            # migration 008).
-            explicit_nulls.extend(["violated_at", "flipped_at"])
-        elif status == "CONSUMED":
+        if status == "CONSUMED":
             fields["consumed_at"] = now
         elif status == "VIOLATED":
             fields["violated_at"] = now
@@ -419,9 +412,11 @@ class SupabaseLogger:
                 )
             fields["flipped_at"] = now
             fields["flipped_direction"] = flipped_direction
+        # status == "ACTIVE": nothing to add. The existing
+        # violated_at / flipped_at / flipped_direction values on the
+        # row stay as historical markers — migration 010 makes that
+        # legal under the CHECK.
         payload = _serialize_update_payload(fields)
-        for col in explicit_nulls:
-            payload[col] = None
         result = (
             self._client.table("zones")
             .update(payload)

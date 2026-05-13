@@ -232,13 +232,17 @@ class TestUpdateZoneStatus:
         with pytest.raises(ValueError, match="flipped_direction is required"):
             logger.update_zone_status(uuid4(), "FLIPPED")
 
-    def test_to_active_clears_flip_timestamps(self) -> None:
-        # PR #38: FLIPPED → ACTIVE must explicitly clear violated_at +
-        # flipped_at to satisfy the consistency CHECK (ACTIVE requires
-        # those NULL). CONFIRMED → ACTIVE sends the same explicit-NULL
-        # payload — harmless no-op since they were already NULL.
-        # ``flipped_direction`` is NOT cleared (preserved across
-        # transitions per migration 008).
+    def test_to_active_preserves_history(self) -> None:
+        # PR-42 / migration 010: ACTIVE no longer requires
+        # ``violated_at`` / ``flipped_at`` NULL. The update payload
+        # must NOT include them — leaving the row's existing values
+        # intact preserves the audit trail for zones that came via
+        # FLIPPED → ACTIVE (Y the relaxed CHECK).
+        #
+        # Pre-migration-010 behaviour: this method emitted explicit
+        # NULLs to clear the timestamps; that destroyed the flip
+        # history on the row and (in production) actually failed the
+        # CHECK in some races.
         logger, client = _make_logger_with_mock_client()
         zone_id = uuid4()
         returned = {
@@ -255,12 +259,15 @@ class TestUpdateZoneStatus:
         logger.update_zone_status(zone_id, "ACTIVE")
 
         payload = update.call_args.args[0]
-        assert payload["status"] == "ACTIVE"
-        assert payload["violated_at"] is None
-        assert payload["flipped_at"] is None
-        # flipped_direction MUST be absent from the payload — we don't
-        # touch it, so a previously-set value survives the update.
-        assert "flipped_direction" not in payload
+        # The only field we touch is status.
+        assert payload == {"status": "ACTIVE"}
+        # Defensive: none of the history fields are in the payload —
+        # if any were, the row's existing values would get overwritten.
+        for col in (
+            "violated_at", "flipped_at", "flipped_direction",
+            "consumed_at",
+        ):
+            assert col not in payload
 
     def test_zone_not_found_raises(self) -> None:
         logger, client = _make_logger_with_mock_client()
