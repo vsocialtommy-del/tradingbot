@@ -88,6 +88,7 @@ from bot.execution.order_manager import (
 from bot.execution.position_tracker import PositionTracker
 from bot.exits.sl_manager import SLManager, SLManagerConfig
 from bot.exits.tp_manager import TPManager
+from bot.exits.zone_exit_manager import ZoneExitManager
 from bot.filters.news_filter import NewsFilter, NewsFilterConfig
 from bot.logging.supabase_logger import (
     Setup,
@@ -227,6 +228,9 @@ class Bot:
         self.position_tracker = PositionTracker(mt5, supabase)
         self.ohlc_provider = OHLCProvider(mt5)
         self.tp_manager = TPManager(mt5, supabase, self.position_tracker)
+        self.zone_exit_manager = ZoneExitManager(
+            mt5, supabase, self.position_tracker,
+        )
         self.sl_manager = SLManager(
             mt5, supabase, config=self.sl_manager_config,
         )
@@ -449,6 +453,12 @@ class Bot:
                 )
             elif self._has_new_m5_close(now):
                 self._detect_new_zones(now)
+                # PR #47: zone-exit BE on the same M5 close. Runs AFTER
+                # detection so freshly-CONSUMED zones (this bar's
+                # lifecycle pass inside _detect_new_zones) are already
+                # accounted for. Setups still ACTIVE here are the ones
+                # whose body-close-out-of-zone should fire.
+                self._run_zone_exit_pass(bid=bid, ask=ask)
 
         # 5b. Per-tick placement check (PR #44). Runs AFTER M5-close
         # detection so the same iteration that detects a zone can
@@ -673,6 +683,53 @@ class Bot:
                 f"M5 close: pending placement queue refreshed — "
                 f"{len(self._pending_pipeline_zones)} pipeline, "
                 f"{len(self._pending_flipped_zones)} flipped"
+            )
+
+    def _run_zone_exit_pass(self, *, bid: float, ask: float) -> None:
+        """PR #47: per-setup body-close-out-of-zone BE trigger.
+
+        Runs on every M5 close. For each ACTIVE setup, the manager
+        checks whether the just-closed bar's close price has confirmed
+        direction (BUY: close > L1 / zone.top; SELL: close < L1 /
+        zone.bottom). On fire:
+
+        * Close the shallowest still-FILLED layer at the current
+          bid/ask (``close_reason='ZONE_EXIT'``).
+        * Modify SL to entry on every remaining FILLED layer.
+        * Cancel every still-WAITING layer
+          (``close_reason='ZONE_EXIT_CANCELLED'``).
+
+        Special case: if only one layer is FILLED, BE-only (no close).
+        Idempotent — the manager detects an already-BE'd setup from
+        live trade state, so re-firing on subsequent closes is a no-op.
+        """
+        df: pd.DataFrame | None = getattr(self, "_latest_ohlc", None)
+        if df is None or len(df) == 0:
+            return
+        last_close = float(df.iloc[-1]["close"])
+
+        for setup in self._safe_get_active_setups():
+            if setup.status != "ACTIVE":
+                continue
+            try:
+                result = self.zone_exit_manager.check(
+                    setup, last_close=last_close, bid=bid, ask=ask,
+                )
+            except Exception:
+                logger.exception(
+                    f"main loop: zone_exit_manager.check failed for "
+                    f"setup {setup.id}"
+                )
+                continue
+            if result is None:
+                continue
+            logger.info(
+                f"ZONE_EXIT fired: setup={result.setup_id} "
+                f"close={result.close_price} "
+                f"closed_layer={result.closed_layer} "
+                f"be_layers={result.be_layer_count} "
+                f"cancelled_waiting={result.cancelled_waiting_count}"
+                + (f" error={result.error}" if result.error else "")
             )
 
     def _try_place_pending(self, *, bid: float, ask: float) -> None:
