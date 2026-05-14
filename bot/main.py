@@ -121,6 +121,7 @@ from bot.strategy.pipeline import (
 from bot.strategy.tp_target import find_nearest_local_peak
 from bot.strategy.zone_marking import Zone as _ZoneShape
 from bot.strategy.zone_refinement import RefinedZone as _RefinedZone
+from bot.strategy.zone_visibility import count_bodies_through_zone
 from bot.strategy.zone_lifecycle import (
     SKIP_NEW_SETUP_STATUSES,
     ZoneRef,
@@ -460,6 +461,18 @@ class Bot:
                 # whose body-close-out-of-zone should fire.
                 self._run_zone_exit_pass(bid=bid, ask=ask)
 
+        # 5a. PR #48: per-tick zone-death pass — cancel WAITING layers
+        # on active setups whose zones have been obscured (≥1 candle
+        # bodied through since formation). Runs every tick, but the
+        # underlying body-cross count only changes on M5 close (the
+        # df we use is the post-M5-close snapshot), so per-tick is
+        # cheap repeated work that catches state changes promptly.
+        if not self._is_paused(now):
+            try:
+                self._run_zone_death_pass()
+            except Exception:
+                logger.exception("main loop: _run_zone_death_pass raised")
+
         # 5b. Per-tick placement check (PR #44). Runs AFTER M5-close
         # detection so the same iteration that detects a zone can
         # also place a setup on it if price is already at the zone.
@@ -730,6 +743,101 @@ class Bot:
                 f"be_layers={result.be_layer_count} "
                 f"cancelled_waiting={result.cancelled_waiting_count}"
                 + (f" error={result.error}" if result.error else "")
+            )
+
+    def _run_zone_death_pass(self) -> None:
+        """PR #48: per-tick zone-visibility check for ACTIVE setups.
+
+        Scans every ACTIVE setup. For each, resolves its zone bounds
+        + formation timestamp and runs the visibility count. If 1+
+        candles have bodied through the zone since formation, the
+        zone is dead — cancel every still-WAITING layer with
+        ``close_reason='ZONE_DEAD_CANCELLED'``.
+
+        FILLED layers are left untouched here. They have their own
+        protection paths:
+        * PR #47's zone-exit BE fires on body-close out of zone
+          (M5 close), closing the shallowest filled layer and BE'ing
+          the rest.
+        * Their original SL still protects against runaway losses.
+        * TP1/TP2/TP3 still fire if reached.
+
+        The visibility check is read-only on Supabase except for the
+        cancellation update_trade_status calls; the body-cross count
+        is a pure function on the in-memory df.
+        """
+        df: pd.DataFrame | None = getattr(self, "_latest_ohlc", None)
+        if df is None or len(df) == 0:
+            return
+
+        for setup in self._safe_get_active_setups():
+            if setup.status != "ACTIVE":
+                continue
+
+            # Resolve the zone for this setup. zone_id is the FK on
+            # the setup row; the zone carries the canonical
+            # top/bottom/formed_at the visibility check needs. If the
+            # read fails (transient Supabase issue), skip this setup
+            # — next tick re-evaluates.
+            try:
+                zone_row = self.supabase.get_zone_by_id(setup.zone_id)
+            except Exception:
+                logger.exception(
+                    f"zone-death pass: get_zone_by_id failed for "
+                    f"setup={setup.id} zone={setup.zone_id}"
+                )
+                continue
+            if zone_row is None:
+                logger.warning(
+                    f"zone-death pass: zone {setup.zone_id} not found "
+                    f"for setup {setup.id}; skipping"
+                )
+                continue
+
+            bodies = count_bodies_through_zone(
+                df,
+                zone_top=float(zone_row.top),
+                zone_bottom=float(zone_row.bottom),
+                since_time=pd.Timestamp(zone_row.formed_at),
+            )
+            if bodies < 1:
+                continue  # zone still visible — nothing to do
+
+            # Zone is obscured. Cancel all WAITING layers on this setup.
+            try:
+                trades = self.supabase.get_trades_for_setup(setup.id)
+            except Exception:
+                logger.exception(
+                    f"zone-death pass: get_trades_for_setup failed for "
+                    f"setup={setup.id}"
+                )
+                continue
+            waiting = [t for t in trades if t.status == "WAITING"]
+            if not waiting:
+                continue  # nothing to cancel; FILLED layers protected
+                          # by other paths
+
+            for trade in waiting:
+                try:
+                    self.position_tracker.update_trade_status(
+                        trade.id,
+                        "CANCELLED",
+                        close_reason="ZONE_DEAD_CANCELLED",
+                    )
+                except Exception:
+                    logger.exception(
+                        f"zone-death pass: WAITING layer "
+                        f"{trade.layer_number} cancel failed "
+                        f"for setup {setup.id}"
+                    )
+                    continue
+            logger.info(
+                f"ZONE_DEAD_CANCELLED: setup={setup.id} "
+                f"zone={zone_row.direction} "
+                f"{float(zone_row.bottom):.2f}-{float(zone_row.top):.2f} "
+                f"({bodies} bodies through since "
+                f"formed_at={zone_row.formed_at}); "
+                f"cancelled {len(waiting)} WAITING layer(s)"
             )
 
     def _try_place_pending(self, *, bid: float, ask: float) -> None:
@@ -1016,6 +1124,29 @@ class Bot:
                 f"CONSUMED/VIOLATED/FLIPPED zone"
             )
             return False
+
+        # 0a. PR #48: zone-visibility gate (pipeline path only).
+        # Refuse to place a fresh setup if any candle since formation
+        # has bodied through the zone — the zone has been obscured /
+        # is no longer respected by price. The flipped path keeps its
+        # own existing safety guard
+        # (``flipped_zone_body_broken_since_flip``) so we skip this
+        # check for flipped retrades.
+        if not is_flipped_retrade:
+            bodies = count_bodies_through_zone(
+                ohlc_df,
+                zone_top=zone.top,
+                zone_bottom=zone.bottom,
+                since_time=pd.Timestamp(zone.formed_at),
+            )
+            if bodies >= 1:
+                logger.info(
+                    f"new setup skipped: zone {zone.direction} "
+                    f"{zone.bottom:.2f}-{zone.top:.2f} is obscured "
+                    f"({bodies} candle(s) bodied through since "
+                    f"formed_at={zone.formed_at})"
+                )
+                return False
 
         # 0b. Price-vs-zone gate (Bug 2 fix). Don't place Layer 1 as a
         # market order if current price hasn't reached the zone yet —

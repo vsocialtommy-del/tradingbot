@@ -102,6 +102,12 @@ CloseReason = Literal[
     # further retest fills unwanted.
     "ZONE_EXIT",
     "ZONE_EXIT_CANCELLED",
+    # PR #48 / migration 013: a WAITING layer cancelled because the
+    # parent zone has been visibly obscured (2+ candles have bodied
+    # through it since formation). The zone is dead — no point
+    # waiting for deeper retest fills on a zone the market is no
+    # longer respecting.
+    "ZONE_DEAD_CANCELLED",
 ]
 LogLevel = Literal["DEBUG", "INFO", "WARN", "ERROR"]
 ImpactLevel = Literal["HIGH", "MEDIUM", "LOW"]

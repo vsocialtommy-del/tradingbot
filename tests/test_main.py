@@ -2536,3 +2536,342 @@ class TestPerTickPlacement:
         # _try_place_setup which returned False; it'll keep retrying
         # on subsequent ticks (cheap; cache absorbs the Supabase hit).
         assert len(b._pending_pipeline_zones) == 1
+
+
+# --------------------------------------------------------------------------- #
+# PR #48: zone-visibility gate + WAITING-layer cancellation on dead zones.
+#
+# Pipeline placement gate refuses to place a fresh setup on a zone where
+# 1+ candles have bodied through since formation. _run_zone_death_pass
+# cancels WAITING layers on existing setups whose zones have died.
+# FILLED layers are untouched (they have their own protection paths).
+# --------------------------------------------------------------------------- #
+
+
+def _make_ohlc_with_post_formation_bodies_through_zone(
+    *,
+    zone_top: float,
+    zone_bottom: float,
+    formed_at_iso: str,
+    n_bodies_through: int,
+) -> pd.DataFrame:
+    """Build a 30-bar M5 df where `n_bodies_through` post-formation
+    candles have bodies overlapping the zone.
+
+    Bars BEFORE formed_at are flat outside the zone (don't count).
+    Bars AFTER formed_at have their open/close inside the zone.
+    """
+    formed_at = pd.Timestamp(formed_at_iso)
+    n = 30
+    times = pd.date_range(end=formed_at_iso, periods=n, freq="5min", tz="UTC")
+    # Move the df forward so half is BEFORE formed_at and half after.
+    # Simpler: build pre-formation flat bars, then append post-formation
+    # body-through bars after formed_at.
+    pre_times = pd.date_range(
+        end=formed_at, periods=n - n_bodies_through, freq="5min", tz="UTC",
+    )
+    post_times = pd.date_range(
+        start=formed_at + pd.Timedelta(minutes=5),
+        periods=n_bodies_through, freq="5min", tz="UTC",
+    )
+    all_times = pre_times.union(post_times)
+    n_pre = len(pre_times)
+
+    rows = []
+    for _ in range(n_pre):
+        rows.append((
+            zone_top + 5.0, zone_top + 6.0,
+            zone_top + 4.0, zone_top + 5.0,
+        ))
+    # Post-formation: each body spans inside the zone.
+    body_mid = (zone_top + zone_bottom) / 2.0
+    for _ in range(n_bodies_through):
+        rows.append((
+            zone_top - 0.1, zone_top + 0.5,
+            zone_bottom - 0.5, body_mid,
+        ))
+
+    return pd.DataFrame(
+        {
+            "open":  [r[0] for r in rows],
+            "high":  [r[1] for r in rows],
+            "low":   [r[2] for r in rows],
+            "close": [r[3] for r in rows],
+            "volume": [100] * len(rows),
+        },
+        index=all_times,
+    )
+
+
+class TestZoneVisibilityGate:
+    """PR #48: pipeline placement is blocked when the zone has been
+    obscured (1+ post-formation candle bodied through)."""
+
+    def test_dead_zone_blocks_placement(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        # Build OHLC where 2 bars after the zone's formed_at have
+        # bodies inside the zone (1900.0 - 1900.5). Zone formed_at
+        # is "2026-05-08T12:00:00Z" per _make_validated_for_persistence.
+        # We need the df's last_time to be NOW (12:00) and the bar
+        # AT NOW is the just-closed M5 bar (after formed_at).
+        # Easier: construct fresh df with post-formation body-throughs.
+        df_with_bodies = _make_ohlc_with_post_formation_bodies_through_zone(
+            zone_top=1900.5, zone_bottom=1900.0,
+            formed_at_iso="2026-05-08T11:30:00Z",
+            n_bodies_through=2,
+        )
+        # Override the formed_at on the zone to be BEFORE the body bars.
+        ts = pd.Timestamp("2026-05-08T11:30:00Z")
+        zone = _ValidatedZone(
+            direction=zone.direction, top=1900.5, bottom=1900.0,
+            formed_at=ts,
+            source_pattern=zone.source_pattern,
+            refined_zone=zone.refined_zone,
+            is_strong_point=True, validation_failures=[],
+            broken_swing=None, broken_at=None, sl_anchor_swing=None,
+        )
+
+        bot[1]["ohlc_provider"].get.return_value = df_with_bodies
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        place = mocker.patch("bot.main.place_layered_orders")
+
+        b.run_iteration(NOW)
+
+        # Visibility gate fires → no placement.
+        place.assert_not_called()
+
+    def test_visible_zone_proceeds_to_placement(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+
+        # Default zone + default OHLC = no post-formation bodies through.
+        # Placement should proceed past the visibility gate.
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        place = mocker.patch("bot.main.place_layered_orders")
+        place.return_value = mocker.MagicMock(
+            status="PLACED", setup_id=uuid4(),
+            layer_1_ticket=11111, sl_price=1882.5, tp1_price=1907.5,
+            error_messages=[],
+        )
+
+        b.run_iteration(NOW)
+
+        # No bodies through → gate passes → placement fires.
+        place.assert_called_once()
+
+    def test_flipped_retrade_not_affected_by_visibility_gate(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mock_mt5: MagicMock,
+        mocker: MockerFixture,
+    ) -> None:
+        # PR #48's visibility gate is for the PIPELINE path only.
+        # Flipped retrades (is_flipped_retrade=True) skip the gate —
+        # the flipped path has its own existing safety guard
+        # (flipped_zone_body_broken_since_flip).
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        # Price at zone.bottom so the SELL gate fires.
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1899.9, "ask": 1900.0, "time": NOW, "time_msc": 0,
+        }
+
+        fz = _make_flipped_zone_row(
+            original_direction="BUY", flipped_direction="SELL",
+            top=1900.5, bottom=1900.0,
+            flipped_at=NOW - timedelta(hours=1),
+        )
+        mock_supabase.get_zones_by_status.side_effect = (
+            lambda statuses: [fz] if "FLIPPED" in statuses else []
+        )
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1890.0)
+        place = mocker.patch("bot.main.place_layered_orders")
+        place.return_value = mocker.MagicMock(
+            status="PLACED", setup_id=uuid4(),
+            layer_1_ticket=11111, sl_price=1918.0, tp1_price=1890.0,
+            error_messages=[],
+        )
+
+        b.run_iteration(NOW)
+
+        # Flipped path placed despite default OHLC (zone bodies don't
+        # apply to the flipped path's gate logic).
+        place.assert_called_once()
+
+
+def _make_setup_with_zone_id(
+    *, zone_id: UUID, direction: str = "BUY",
+) -> Setup:
+    """Setup with an explicit zone_id (make_setup auto-generates one)."""
+    return Setup(
+        id=uuid4(),
+        zone_id=zone_id,
+        direction=direction,  # type: ignore[arg-type]
+        entry_mode="STRONG_POINT_FIRST_TOUCH",
+        planned_layer1_price=Decimal("1900"),
+        planned_layer2_price=Decimal("1897.5"),
+        planned_layer3_price=Decimal("1895"),
+        planned_sl_price=Decimal("1880"),
+        planned_tp1_price=Decimal("1907"),
+        status="ACTIVE",
+        skip_reason=None,
+        activated_at=NOW, closed_at=None,
+        created_at=NOW, updated_at=NOW,
+    )
+
+
+def _make_trade_for_death_pass(
+    *,
+    setup_id: UUID, layer_number: int, status: str,
+    entry_price: Decimal | None = None,
+    mt5_ticket: int | None = None,
+):
+    from bot.logging.supabase_logger import Trade
+    return Trade(
+        id=uuid4(),
+        setup_id=setup_id,
+        layer_number=layer_number,
+        direction="BUY",  # type: ignore[arg-type]
+        order_type="MARKET" if layer_number == 1 else "LIMIT",
+        mt5_ticket=mt5_ticket,
+        entry_price=entry_price,
+        exit_price=None,
+        lot_size=Decimal("0.01"),
+        sl_price=Decimal("1882.50"),
+        tp_price=None,
+        status=status,  # type: ignore[arg-type]
+        pnl=None,
+        commission=Decimal("0"),
+        swap=Decimal("0"),
+        close_reason=None,
+        filled_at=NOW if status == "FILLED" else None,
+        closed_at=None,
+        created_at=NOW, updated_at=NOW,
+    )
+
+
+class TestZoneDeathPass:
+    """PR #48: per-tick _run_zone_death_pass cancels WAITING layers
+    on ACTIVE setups whose zones have died."""
+
+    def test_cancels_waiting_when_zone_obscured(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mock_mt5: MagicMock,
+        mocker: MockerFixture,
+    ) -> None:
+        b, mgrs = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = pd.Timestamp(NOW)  # no new M5 close
+
+        # Setup is ACTIVE with L1 FILLED and L2/L3 WAITING.
+        zone_id = uuid4()
+        setup = _make_setup_with_zone_id(zone_id=zone_id, direction="BUY")
+        mgrs["position_tracker"].get_active_setups.return_value = [setup]
+
+        # Zone row, formed 30 min ago.
+        zone_row = _make_zone_row(
+            direction="BUY", top=1900.5, bottom=1900.0,
+            status="ACTIVE",
+        ).model_copy(update={
+            "id": zone_id,
+            "formed_at": NOW - timedelta(minutes=30),
+        })
+        mock_supabase.get_zone_by_id.return_value = zone_row
+
+        # Trades: L1 FILLED, L2 + L3 WAITING.
+        l1 = _make_trade_for_death_pass(
+            setup_id=setup.id, layer_number=1, status="FILLED",
+            entry_price=Decimal("1900.50"), mt5_ticket=11111,
+        )
+        l2 = _make_trade_for_death_pass(
+            setup_id=setup.id, layer_number=2, status="WAITING",
+        )
+        l3 = _make_trade_for_death_pass(
+            setup_id=setup.id, layer_number=3, status="WAITING",
+        )
+        mock_supabase.get_trades_for_setup.return_value = [l1, l2, l3]
+
+        # OHLC: 2 bars after zone formed_at body through.
+        df = _make_ohlc_with_post_formation_bodies_through_zone(
+            zone_top=1900.5, zone_bottom=1900.0,
+            formed_at_iso=(NOW - timedelta(minutes=30)).isoformat(),
+            n_bodies_through=2,
+        )
+        mgrs["ohlc_provider"].get.return_value = df
+        b._latest_ohlc = df
+
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1895.0, "ask": 1895.1, "time": NOW, "time_msc": 0,
+        }
+
+        b.run_iteration(NOW + timedelta(seconds=1))
+
+        # Both WAITING layers cancelled with ZONE_DEAD_CANCELLED.
+        cancel_calls = [
+            c for c in mgrs["position_tracker"].update_trade_status.call_args_list
+            if c.kwargs.get("close_reason") == "ZONE_DEAD_CANCELLED"
+        ]
+        cancelled_ids = {c.args[0] for c in cancel_calls}
+        assert l2.id in cancelled_ids
+        assert l3.id in cancelled_ids
+        # L1 (FILLED) NOT cancelled.
+        assert l1.id not in cancelled_ids
+
+    def test_visible_zone_no_action(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mock_mt5: MagicMock,
+        mocker: MockerFixture,
+    ) -> None:
+        # Same setup but zone is still visible — no body-throughs.
+        b, mgrs = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = pd.Timestamp(NOW)
+
+        zone_id = uuid4()
+        setup = _make_setup_with_zone_id(zone_id=zone_id, direction="BUY")
+        mgrs["position_tracker"].get_active_setups.return_value = [setup]
+
+        zone_row = _make_zone_row(
+            direction="BUY", top=1900.5, bottom=1900.0,
+            status="ACTIVE",
+        ).model_copy(update={
+            "id": zone_id,
+            "formed_at": NOW - timedelta(minutes=30),
+        })
+        mock_supabase.get_zone_by_id.return_value = zone_row
+
+        # OHLC with NO post-formation body-throughs.
+        df = _make_ohlc_with_post_formation_bodies_through_zone(
+            zone_top=1900.5, zone_bottom=1900.0,
+            formed_at_iso=(NOW - timedelta(minutes=30)).isoformat(),
+            n_bodies_through=0,
+        )
+        mgrs["ohlc_provider"].get.return_value = df
+        b._latest_ohlc = df
+
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1905.0, "ask": 1905.1, "time": NOW, "time_msc": 0,
+        }
+
+        b.run_iteration(NOW + timedelta(seconds=1))
+
+        cancel_calls = [
+            c for c in mgrs["position_tracker"].update_trade_status.call_args_list
+            if c.kwargs.get("close_reason") == "ZONE_DEAD_CANCELLED"
+        ]
+        assert cancel_calls == []
