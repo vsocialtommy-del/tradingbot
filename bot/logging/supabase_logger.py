@@ -95,6 +95,13 @@ CloseReason = Literal[
     # previous layer's TP fired (cascade close on the parent setup).
     # Distinguishes the cascade path from MANUAL_CLOSE for analytics.
     "CASCADE_CANCELLED",
+    # PR #47 / migration 012: body-close-out-of-zone confirmation on
+    # an M5 bar after entry. ZONE_EXIT = the shallowest FILLED layer
+    # was closed at the trigger. ZONE_EXIT_CANCELLED = a WAITING
+    # layer was cancelled because the zone-exit confirmation makes
+    # further retest fills unwanted.
+    "ZONE_EXIT",
+    "ZONE_EXIT_CANCELLED",
 ]
 LogLevel = Literal["DEBUG", "INFO", "WARN", "ERROR"]
 ImpactLevel = Literal["HIGH", "MEDIUM", "LOW"]
