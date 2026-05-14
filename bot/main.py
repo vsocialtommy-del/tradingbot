@@ -65,6 +65,7 @@ Design decisions called out in the PR
 
 from __future__ import annotations
 
+import os
 import signal
 import time
 from dataclasses import dataclass, field
@@ -122,6 +123,7 @@ from bot.strategy.tp_target import find_nearest_local_peak
 from bot.strategy.zone_marking import Zone as _ZoneShape
 from bot.strategy.zone_refinement import RefinedZone as _RefinedZone
 from bot.strategy.zone_visibility import count_bodies_through_zone
+from bot.visualization.zone_snapshot import ZoneSnapshotWriter
 from bot.strategy.zone_lifecycle import (
     SKIP_NEW_SETUP_STATUSES,
     ZoneRef,
@@ -231,6 +233,12 @@ class Bot:
         self.tp_manager = TPManager(mt5, supabase, self.position_tracker)
         self.zone_exit_manager = ZoneExitManager(
             mt5, supabase, self.position_tracker,
+        )
+        # PR #49: zone visualization on the MT5 chart via a CSV
+        # sidecar file the MQL5 EA reads. No-op if MT5_FILES_DIR is
+        # unset (e.g. dev machines without MT5).
+        self.zone_snapshot_writer = ZoneSnapshotWriter(
+            os.environ.get("MT5_FILES_DIR"),
         )
         self.sl_manager = SLManager(
             mt5, supabase, config=self.sl_manager_config,
@@ -697,6 +705,42 @@ class Bot:
                 f"{len(self._pending_pipeline_zones)} pipeline, "
                 f"{len(self._pending_flipped_zones)} flipped"
             )
+
+        # PR #49: refresh MT5 chart visualization snapshot. No-op if
+        # MT5_FILES_DIR isn't set. Wrapped in try/except — viz failure
+        # must NEVER affect the trading loop.
+        if self.zone_snapshot_writer.enabled:
+            try:
+                self._refresh_chart_zone_snapshot(df)
+            except Exception:
+                logger.exception(
+                    "zone snapshot write raised; visualization will "
+                    "be stale until the next M5 close"
+                )
+
+    def _refresh_chart_zone_snapshot(self, df: pd.DataFrame) -> None:
+        """Pull renderable zones from Supabase + push to the CSV file.
+
+        Renderable = CONFIRMED / ACTIVE / FLIPPED (CONSUMED / VIOLATED
+        are dead and would clutter the chart). Distance, age, and
+        visibility filters are applied inside the writer.
+        """
+        try:
+            zones = self.supabase.get_zones_by_status(
+                ["CONFIRMED", "ACTIVE", "FLIPPED"],
+            )
+        except Exception:
+            logger.warning(
+                "zone snapshot: get_zones_by_status failed; skipping "
+                "this refresh"
+            )
+            return
+        if len(df) == 0:
+            return
+        current_price = float(df.iloc[-1]["close"])
+        self.zone_snapshot_writer.write(
+            zones, current_price=current_price, df=df,
+        )
 
     def _run_zone_exit_pass(self, *, bid: float, ask: float) -> None:
         """PR #47: per-setup body-close-out-of-zone BE trigger.
