@@ -89,6 +89,7 @@ from bot.execution.order_manager import (
 from bot.execution.position_tracker import PositionTracker
 from bot.exits.sl_manager import SLManager, SLManagerConfig
 from bot.exits.tp_manager import TPManager
+from bot.exits.trailing_stop_manager import TrailingStopManager
 from bot.exits.zone_exit_manager import ZoneExitManager
 from bot.filters.news_filter import NewsFilter, NewsFilterConfig
 from bot.logging.supabase_logger import (
@@ -232,6 +233,9 @@ class Bot:
         self.ohlc_provider = OHLCProvider(mt5)
         self.tp_manager = TPManager(mt5, supabase, self.position_tracker)
         self.zone_exit_manager = ZoneExitManager(
+            mt5, supabase, self.position_tracker,
+        )
+        self.trailing_stop_manager = TrailingStopManager(
             mt5, supabase, self.position_tracker,
         )
         # PR #49: zone visualization on the MT5 chart via a CSV
@@ -468,6 +472,12 @@ class Bot:
                 # accounted for. Setups still ACTIVE here are the ones
                 # whose body-close-out-of-zone should fire.
                 self._run_zone_exit_pass(bid=bid, ask=ask)
+                # Trailing-stop pass: locks in progressive profit on
+                # L1-only setups. Runs AFTER zone-exit so the
+                # comparison is against the (possibly just-BE'd) SL,
+                # and only tightens further when the 30 % activation
+                # threshold is reached.
+                self._run_trailing_stop_pass(bid=bid, ask=ask)
 
         # 5a. PR #48: per-tick zone-death pass — cancel WAITING layers
         # on active setups whose zones have been obscured (≥1 candle
@@ -786,6 +796,46 @@ class Bot:
                 f"closed_layer={result.closed_layer} "
                 f"be_layers={result.be_layer_count} "
                 f"cancelled_waiting={result.cancelled_waiting_count}"
+                + (f" error={result.error}" if result.error else "")
+            )
+
+    def _run_trailing_stop_pass(self, *, bid: float, ask: float) -> None:
+        """Trailing-stop SL on L1-only setups.
+
+        Runs on every M5 close right after the zone-exit pass. For
+        each ACTIVE setup where Layer 1 is the ONLY filled layer, the
+        manager checks whether current profit has crossed the
+        activation threshold (default 30 % of distance to TP1) and,
+        if so, tightens the SL to lock in a fraction of the profit
+        (default 50 %). Multi-layer setups are skipped here — the
+        TP-cascade (PR #41) and zone-exit (PR #47) own those.
+
+        The manager is idempotent and monotonic: re-firing on a
+        setup whose SL is already at-or-better than the trailing
+        calc produces no broker call. If profit retraces, the SL
+        does NOT move back — only ever tightens.
+        """
+        for setup in self._safe_get_active_setups():
+            if setup.status != "ACTIVE":
+                continue
+            try:
+                result = self.trailing_stop_manager.check(
+                    setup, bid=bid, ask=ask,
+                )
+            except Exception:
+                logger.exception(
+                    f"main loop: trailing_stop_manager.check failed for "
+                    f"setup {setup.id}"
+                )
+                continue
+            if result is None:
+                continue
+            logger.info(
+                f"TRAILING_STOP moved: setup={result.setup_id} "
+                f"trade={result.trade_id} "
+                f"old_sl={result.old_sl} new_sl={result.new_sl} "
+                f"price={result.current_price} "
+                f"profit={result.current_profit:.2f}"
                 + (f" error={result.error}" if result.error else "")
             )
 
