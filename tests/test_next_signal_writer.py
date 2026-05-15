@@ -56,8 +56,16 @@ def make_zone(
     top: float = 4691.0,
     bottom: float = 4685.0,
     formed_at: datetime | None = None,
+    flipped_at: datetime | None = None,
     pattern_type: str = "RBR",
 ) -> Zone:
+    # If a test asks for a FLIPPED zone without an explicit flipped_at,
+    # default to one hour ago — the DB CHECK enforces NOT NULL on
+    # FLIPPED rows, so reading a FLIPPED row with flipped_at=NULL can't
+    # happen in production; the helper mirrors that invariant.
+    resolved_flipped_at = flipped_at
+    if status == "FLIPPED" and resolved_flipped_at is None:
+        resolved_flipped_at = NOW - timedelta(hours=1)
     return Zone(
         id=zone_id or uuid4(),
         symbol="XAUUSD",
@@ -73,7 +81,7 @@ def make_zone(
         status=status,  # type: ignore[arg-type]
         consumed_at=None,
         violated_at=None,
-        flipped_at=None,
+        flipped_at=resolved_flipped_at,
         flipped_direction=flipped_direction,  # type: ignore[arg-type]
         created_at=NOW - timedelta(hours=2),
         updated_at=NOW,
@@ -182,7 +190,7 @@ class TestPickClosestZone:
             direction="BUY",
             zones=[far, near],
             bid=4700.0, ask=4700.1, now=NOW,
-            max_distance_points=50.0, max_age_days=7,
+            df=make_df(), max_distance_points=50.0, max_age_days=7,
         )
         assert result is near
 
@@ -192,7 +200,7 @@ class TestPickClosestZone:
             direction="BUY",
             zones=[sell],
             bid=4700.0, ask=4700.1, now=NOW,
-            max_distance_points=50.0, max_age_days=7,
+            df=make_df(), max_distance_points=50.0, max_age_days=7,
         )
         assert result is None
 
@@ -205,7 +213,7 @@ class TestPickClosestZone:
             direction="BUY",
             zones=[z],
             bid=4700.0, ask=4700.1, now=NOW,
-            max_distance_points=50.0, max_age_days=7,
+            df=make_df(), max_distance_points=50.0, max_age_days=7,
         )
         assert result is None
 
@@ -218,7 +226,7 @@ class TestPickClosestZone:
             direction="BUY",
             zones=[z],
             bid=4700.0, ask=4700.1, now=NOW,
-            max_distance_points=50.0, max_age_days=7,
+            df=make_df(), max_distance_points=50.0, max_age_days=7,
         )
         assert result is None
 
@@ -233,7 +241,7 @@ class TestPickClosestZone:
             direction="BUY",
             zones=[flipped],
             bid=4700.0, ask=4700.1, now=NOW,
-            max_distance_points=50.0, max_age_days=7,
+            df=make_df(), max_distance_points=50.0, max_age_days=7,
         )
         assert result is flipped
 
@@ -243,7 +251,7 @@ class TestPickClosestZone:
             direction="BUY",
             zones=[far],
             bid=4700.0, ask=4700.1, now=NOW,
-            max_distance_points=50.0, max_age_days=7,
+            df=make_df(), max_distance_points=50.0, max_age_days=7,
         )
         assert result is None
 
@@ -256,7 +264,7 @@ class TestPickClosestZone:
             direction="BUY",
             zones=[old],
             bid=4700.0, ask=4700.1, now=NOW,
-            max_distance_points=50.0, max_age_days=7,
+            df=make_df(), max_distance_points=50.0, max_age_days=7,
         )
         assert result is None
 
@@ -267,7 +275,7 @@ class TestPickClosestZone:
             direction="BUY",
             zones=[z],
             bid=4688.0, ask=4688.1, now=NOW,
-            max_distance_points=50.0, max_age_days=7,
+            df=make_df(), max_distance_points=50.0, max_age_days=7,
         )
         assert result is None
 
@@ -279,7 +287,7 @@ class TestPickClosestZone:
             direction="SELL",
             zones=[far, near],
             bid=4699.9, ask=4700.0, now=NOW,
-            max_distance_points=50.0, max_age_days=7,
+            df=make_df(), max_distance_points=50.0, max_age_days=7,
         )
         assert result is near
 
@@ -494,3 +502,212 @@ class TestConfig:
         )
         # SL = zone_bottom - 10.0 = 4684 - 10 = 4674
         assert float(signal.sl_price) == pytest.approx(4674.0)
+
+
+# --------------------------------------------------------------------------- #
+# PR #53: alive-zones-only filter
+# --------------------------------------------------------------------------- #
+
+
+class TestAliveZonesOnly:
+    """Dashboard should show only zones the bot would actually trade —
+    no ACTIVE zones (already filled), no body-broken FLIPPED zones
+    (flip premise dead)."""
+
+    def test_supabase_query_excludes_active_status(
+        self, writer: NextSignalWriter, mock_supabase: MagicMock,
+    ) -> None:
+        # The bot would deduplicate against ACTIVE zones, so the
+        # writer must not pull them in the first place.
+        mock_supabase.get_zones_by_status.return_value = []
+        df = make_df()
+        writer.write(df, bid=4700.0, ask=4700.1, now=NOW)
+
+        mock_supabase.get_zones_by_status.assert_called_once_with(
+            ["CONFIRMED", "FLIPPED"],
+        )
+
+    def test_active_zone_filtered_out_defensively(self) -> None:
+        # Even if Supabase happens to return an ACTIVE row (race or
+        # bug), the in-memory filter rejects it.
+        active = make_zone(
+            direction="BUY", status="ACTIVE",
+            top=4690.0, bottom=4684.0,
+        )
+        result = _pick_closest_zone(
+            direction="BUY",
+            zones=[active],
+            bid=4700.0, ask=4700.1, now=NOW,
+            df=make_df(), max_distance_points=50.0, max_age_days=7,
+        )
+        assert result is None
+
+    def test_flipped_zone_body_broken_below_excluded(self) -> None:
+        # BUY-flipped zone (was SELL). A post-flip bar body-closed
+        # BELOW zone.bottom → flip premise dead → exclude.
+        flipped_at = NOW - timedelta(hours=2)
+        flipped = make_zone(
+            direction="SELL", status="FLIPPED",
+            flipped_direction="BUY",
+            top=4690.0, bottom=4684.0,
+            flipped_at=flipped_at,
+        )
+        # Build a df where the last bar closes below zone.bottom.
+        df = make_df()
+        df.loc[df.index[-1], "close"] = 4680.0  # below zone.bottom 4684
+
+        result = _pick_closest_zone(
+            direction="BUY",
+            zones=[flipped],
+            bid=4700.0, ask=4700.1, now=NOW,
+            df=df, max_distance_points=50.0, max_age_days=7,
+        )
+        assert result is None
+
+    def test_flipped_zone_body_broken_above_excluded_for_sell(self) -> None:
+        # SELL-flipped zone (was BUY). A post-flip bar body-closed
+        # ABOVE zone.top → flip premise dead → exclude.
+        flipped_at = NOW - timedelta(hours=2)
+        flipped = make_zone(
+            direction="BUY", status="FLIPPED",
+            flipped_direction="SELL",
+            top=4710.0, bottom=4704.0,
+            flipped_at=flipped_at,
+        )
+        df = make_df()
+        df.loc[df.index[-1], "close"] = 4715.0  # above zone.top 4710
+
+        result = _pick_closest_zone(
+            direction="SELL",
+            zones=[flipped],
+            bid=4699.9, ask=4700.0, now=NOW,
+            df=df, max_distance_points=50.0, max_age_days=7,
+        )
+        assert result is None
+
+    def test_flipped_zone_with_intact_premise_included(self) -> None:
+        # BUY-flipped zone with no post-flip body-breaks → still alive.
+        flipped_at = NOW - timedelta(hours=2)
+        flipped = make_zone(
+            direction="SELL", status="FLIPPED",
+            flipped_direction="BUY",
+            top=4690.0, bottom=4684.0,
+            flipped_at=flipped_at,
+        )
+        # Default df has close=4700 on every bar — above zone.bottom.
+        result = _pick_closest_zone(
+            direction="BUY",
+            zones=[flipped],
+            bid=4700.0, ask=4700.1, now=NOW,
+            df=make_df(), max_distance_points=50.0, max_age_days=7,
+        )
+        assert result is flipped
+
+    def test_flipped_zone_missing_flipped_at_excluded(self) -> None:
+        # DB CHECK should prevent this in production, but defensive
+        # in-memory filter must still reject it.
+        bad = Zone(
+            id=uuid4(),
+            symbol="XAUUSD",
+            direction="SELL",  # type: ignore[arg-type]
+            zone_type="STRONG_POINT",
+            pattern_type="RBR",  # type: ignore[arg-type]
+            top=Decimal("4690.0"),
+            bottom=Decimal("4684.0"),
+            approach_count=0,
+            formed_at=NOW - timedelta(hours=2),
+            invalidated_at=None,
+            last_evaluation_result=None,
+            status="FLIPPED",  # type: ignore[arg-type]
+            consumed_at=None,
+            violated_at=None,
+            flipped_at=None,  # ← missing!
+            flipped_direction="BUY",  # type: ignore[arg-type]
+            created_at=NOW - timedelta(hours=2),
+            updated_at=NOW,
+        )
+        result = _pick_closest_zone(
+            direction="BUY",
+            zones=[bad],
+            bid=4700.0, ask=4700.1, now=NOW,
+            df=make_df(), max_distance_points=50.0, max_age_days=7,
+        )
+        assert result is None
+
+    def test_break_before_flip_does_not_count(self) -> None:
+        # The bot's flip-break check only looks at bars AFTER flipped_at.
+        # A break that happened before the flip shouldn't disqualify
+        # the zone — that's a separate, prior history.
+        flipped_at = NOW - timedelta(minutes=30)  # ← recent flip
+        flipped = make_zone(
+            direction="SELL", status="FLIPPED",
+            flipped_direction="BUY",
+            top=4690.0, bottom=4684.0,
+            flipped_at=flipped_at,
+        )
+        df = make_df(n_bars=60)
+        # An old bar (well before flipped_at) has a body-break, but
+        # everything after the flip is clean.
+        df.loc[df.index[0], "close"] = 4680.0  # pre-flip, doesn't count
+
+        result = _pick_closest_zone(
+            direction="BUY",
+            zones=[flipped],
+            bid=4700.0, ask=4700.1, now=NOW,
+            df=df, max_distance_points=50.0, max_age_days=7,
+        )
+        assert result is flipped
+
+    def test_full_write_skips_dead_flipped_zone(
+        self, writer: NextSignalWriter, mock_supabase: MagicMock,
+    ) -> None:
+        # End-to-end: the only candidate is a dead flipped zone →
+        # writer deactivates the direction, no upsert.
+        flipped_at = NOW - timedelta(hours=2)
+        dead = make_zone(
+            direction="SELL", status="FLIPPED",
+            flipped_direction="BUY",
+            top=4690.0, bottom=4684.0,
+            flipped_at=flipped_at,
+        )
+        mock_supabase.get_zones_by_status.return_value = [dead]
+        df = make_df()
+        df.loc[df.index[-1], "close"] = 4680.0  # break post-flip
+
+        outcome = writer.write(df, bid=4700.0, ask=4700.1, now=NOW)
+        assert outcome["BUY"] == "deactivated"
+        mock_supabase.upsert_signal_for_direction.assert_not_called()
+
+    def test_full_write_picks_alive_when_dead_zone_nearer(
+        self, writer: NextSignalWriter, mock_supabase: MagicMock,
+    ) -> None:
+        # A dead flipped zone is closer to current price, but the
+        # writer must skip it and pick the further-away alive zone
+        # behind it. Matches the real production scenario the user
+        # hit: dashboard kept showing a dead flipped zone instead of
+        # the next valid one.
+        flipped_at = NOW - timedelta(hours=2)
+        dead_close = make_zone(
+            zone_id=uuid4(),
+            direction="SELL", status="FLIPPED",
+            flipped_direction="BUY",
+            top=4695.0, bottom=4691.0,  # near 4700 bid
+            flipped_at=flipped_at,
+        )
+        alive_far = make_zone(
+            zone_id=uuid4(),
+            direction="BUY", status="CONFIRMED",
+            top=4685.0, bottom=4680.0,  # further, still in range
+        )
+        mock_supabase.get_zones_by_status.return_value = [
+            dead_close, alive_far,
+        ]
+        df = make_df()
+        df.loc[df.index[-1], "close"] = 4688.0  # below dead.bottom (4691)
+
+        outcome = writer.write(df, bid=4700.0, ask=4700.1, now=NOW)
+        assert outcome["BUY"] == "wrote"
+        signal: SignalInput = (
+            mock_supabase.upsert_signal_for_direction.call_args.args[0]
+        )
+        assert signal.zone_id == alive_far.id
