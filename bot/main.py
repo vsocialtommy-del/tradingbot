@@ -764,12 +764,16 @@ class Bot:
         )
 
     def _run_zone_exit_pass(self, *, bid: float, ask: float) -> None:
-        """PR #47: per-setup body-close-out-of-zone BE trigger.
+        """PR #47 + PR #52: per-setup body-close-out-of-zone BE trigger.
 
         Runs on every M5 close. For each ACTIVE setup, the manager
-        checks whether the just-closed bar's close price has confirmed
-        direction (BUY: close > L1 / zone.top; SELL: close < L1 /
-        zone.bottom). On fire:
+        checks whether the last N M5 bars (N = ``confirmation_candles``,
+        default 2 per PR #52) have all body-closed past L1 in the
+        profit direction (BUY: close > zone.top; SELL: close <
+        zone.bottom). Two consecutive bars sustained outside the zone
+        is much harder to fake than one — filters out the liquidity
+        grabs / stop hunts / news spikes the single-bar version used
+        to BE on prematurely. On fire:
 
         * Close the shallowest still-FILLED layer at the current
           bid/ask (``close_reason='ZONE_EXIT'``).
@@ -784,14 +788,20 @@ class Bot:
         df: pd.DataFrame | None = getattr(self, "_latest_ohlc", None)
         if df is None or len(df) == 0:
             return
-        last_close = float(df.iloc[-1]["close"])
+        # Pass the last several closes; the manager picks the trailing
+        # N it needs based on its config. Slicing the last 10 is plenty
+        # (we only ever look at the last ~3 in practice).
+        recent_closes = [
+            float(c) for c in df["close"].iloc[-10:].tolist()
+        ]
 
         for setup in self._safe_get_active_setups():
             if setup.status != "ACTIVE":
                 continue
             try:
                 result = self.zone_exit_manager.check(
-                    setup, last_close=last_close, bid=bid, ask=ask,
+                    setup, recent_closes=recent_closes,
+                    bid=bid, ask=ask,
                 )
             except Exception:
                 logger.exception(
