@@ -91,6 +91,7 @@ from bot.exits.sl_manager import SLManager, SLManagerConfig
 from bot.exits.tp_manager import TPManager
 from bot.exits.trailing_stop_manager import TrailingStopManager
 from bot.exits.zone_exit_manager import ZoneExitManager
+from bot.signals.next_signal_writer import NextSignalWriter
 from bot.filters.news_filter import NewsFilter, NewsFilterConfig
 from bot.logging.supabase_logger import (
     Setup,
@@ -238,6 +239,12 @@ class Bot:
         self.trailing_stop_manager = TrailingStopManager(
             mt5, supabase, self.position_tracker,
         )
+        # PR #51: dashboard signal writer. Updates the ``signals`` table
+        # on every M5 close so the Vercel-hosted dashboard can show
+        # the closest BUY + SELL zones the bot is currently watching.
+        # Failures here NEVER affect trading — the writer is wrapped
+        # again at the call site.
+        self.next_signal_writer = NextSignalWriter(supabase)
         # PR #49: zone visualization on the MT5 chart via a CSV
         # sidecar file the MQL5 EA reads. No-op if MT5_FILES_DIR is
         # unset (e.g. dev machines without MT5).
@@ -478,6 +485,10 @@ class Bot:
                 # and only tightens further when the 30 % activation
                 # threshold is reached.
                 self._run_trailing_stop_pass(bid=bid, ask=ask)
+                # PR #51: refresh the dashboard signal snapshot.
+                # Strictly operator-facing — wrapped so any failure
+                # is logged and the trading loop continues.
+                self._run_next_signal_pass(bid=bid, ask=ask)
 
         # 5a. PR #48: per-tick zone-death pass — cancel WAITING layers
         # on active setups whose zones have been obscured (≥1 candle
@@ -838,6 +849,32 @@ class Bot:
                 f"profit={result.current_profit:.2f}"
                 + (f" error={result.error}" if result.error else "")
             )
+
+    def _run_next_signal_pass(self, *, bid: float, ask: float) -> None:
+        """PR #51: refresh the dashboard signal snapshot.
+
+        Computes the closest pending BUY + SELL zone the bot is
+        watching and writes them to ``signals`` so the Vercel
+        dashboard can render them. The writer itself wraps every
+        Supabase / strategy call in a try/except; this outer
+        try/except is a defensive belt — under no circumstances
+        may a dashboard refresh affect the trading loop.
+        """
+        df: pd.DataFrame | None = getattr(self, "_latest_ohlc", None)
+        if df is None or len(df) == 0:
+            return
+        try:
+            outcome = self.next_signal_writer.write(df, bid=bid, ask=ask)
+        except Exception:
+            logger.exception(
+                "next-signal writer raised; dashboard will be stale "
+                "until the next M5 close"
+            )
+            return
+        logger.debug(
+            f"next-signal: BUY={outcome.get('BUY')} "
+            f"SELL={outcome.get('SELL')}"
+        )
 
     def _run_zone_death_pass(self) -> None:
         """PR #48: per-tick zone-visibility check for ACTIVE setups.

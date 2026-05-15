@@ -219,6 +219,32 @@ class LogEvent(_ModelBase):
     trade_id: UUID | None = None
 
 
+class SignalInput(_ModelBase):
+    """Insert payload for ``signals`` (PR #51 / migration 014).
+
+    Represents the next zone the bot is waiting to retest in each
+    direction. The writer creates one row per direction per M5 close
+    and marks the previous same-direction row ``is_active = FALSE``
+    in the same transaction-like sequence — see
+    :meth:`SupabaseLogger.upsert_signal_for_direction`.
+    """
+
+    direction: Direction
+    zone_id: UUID | None = None
+    zone_top: Decimal
+    zone_bottom: Decimal
+    entry_price: Decimal
+    sl_price: Decimal
+    tp1_price: Decimal | None = None
+    tp2_price: Decimal | None = None
+    tp3_price: Decimal | None = None
+    pattern_type: str | None = None
+    zone_status: str | None = None
+    current_price: Decimal | None = None
+    distance_dollars: Decimal | None = None
+    is_active: bool = True
+
+
 # ---------------------------------------------------------------------------
 # Pydantic READ models — typed views of rows pulled back from Supabase.
 # Used by position_tracker for type-safe state-machine logic.
@@ -637,6 +663,53 @@ class SupabaseLogger:
         if not rows:
             raise ValueError(f"trade {trade_id} not found for update")
         return Trade.model_validate(rows[0])
+
+    # ---- signals (PR #51 / migration 014) ----
+
+    def upsert_signal_for_direction(
+        self, signal: SignalInput,
+    ) -> dict[str, Any]:
+        """Replace the active signal row for one direction.
+
+        Two-step path (Supabase / PostgREST has no atomic
+        "deactivate-then-insert" in a single call):
+
+        1. UPDATE every existing ``is_active=TRUE`` row of the same
+           direction to ``is_active=FALSE``. Historical rows stay
+           in the table for the audit trail.
+        2. INSERT the new payload with ``is_active=TRUE``.
+
+        A failure between (1) and (2) leaves the table with zero
+        active rows for that direction — the dashboard will render
+        "No active signal" until the next M5 close re-runs this
+        path and succeeds. That's the safe failure mode (no stale
+        signal shown) so we don't wrap in a retry here.
+        """
+        self._client.table("signals").update(
+            {"is_active": False}
+        ).eq("direction", signal.direction).eq(
+            "is_active", True
+        ).execute()
+        payload = signal.model_dump(mode="json", exclude_none=True)
+        result = self._client.table("signals").insert(payload).execute()
+        return result.data[0]
+
+    def deactivate_signals_for_direction(self, direction: Direction) -> int:
+        """Mark every active signal of ``direction`` inactive.
+
+        Used when an M5 close finds no qualifying zone in that
+        direction — we want the dashboard to render the "No active
+        signal" placeholder, not a stale entry. Returns the number
+        of rows that transitioned (zero if nothing was active).
+        """
+        result = (
+            self._client.table("signals")
+            .update({"is_active": False})
+            .eq("direction", direction)
+            .eq("is_active", True)
+            .execute()
+        )
+        return len(result.data or [])
 
 
 # ---------------------------------------------------------------------------
