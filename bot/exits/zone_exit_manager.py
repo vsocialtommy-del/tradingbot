@@ -1,10 +1,17 @@
-"""Zone-exit BE trigger — PR #47.
+"""Zone-exit BE trigger — PR #47 + PR #52.
 
-Fires on M5 close when the just-closed bar's body confirms the trade
-direction by closing **out of the originating zone** past the L1 entry:
+Fires on M5 close when the last ``confirmation_candles`` bars (default
+2) have **all** body-closed out of the originating zone past the L1
+entry in the profit direction:
 
-* BUY  setups → close > L1 entry  (= zone.top — price left going up)
-* SELL setups → close < L1 entry  (= zone.bottom — price left going down)
+* BUY  setups → every bar.close > L1 entry  (= zone.top — price left going up)
+* SELL setups → every bar.close < L1 entry  (= zone.bottom — price left going down)
+
+PR #52 raised the requirement from 1 candle to 2 because a single M5
+body close out of zone is too easily produced by liquidity grabs,
+stop-hunt spikes, or brief news ticks. Two consecutive body closes
+(10 minutes sustained outside the zone) is much harder to fake and
+matches the confirmation rule most discretionary S&D traders use.
 
 Action on fire (per-setup, idempotent):
 
@@ -117,6 +124,23 @@ class ZoneExitConfig:
     a small fraction. 0.01 catches "already done" without false
     positives from real cascaded-SL moves."""
 
+    confirmation_candles: int = 2
+    """Number of consecutive M5 candles that must body-close out of
+    the zone in the profit direction before the trigger fires.
+
+    Default 2: requires two consecutive bars sustained outside the
+    zone. One body close is too easily produced by liquidity grabs
+    / stop-hunt spikes / brief news ticks on M5 XAUUSD; two
+    consecutive (10 minutes sustained) is a much harder signal to
+    fake. The trade-off is a 5-minute delay in BE activation
+    versus the original behaviour — acceptable because (a) the
+    original SL still protects in the meantime, and (b) the
+    trailing-stop (PR #50) provides the secondary protection for
+    larger profits.
+
+    Set to 1 to restore the original single-candle behaviour. Values
+    > 2 work but get conservative fast (15 min for 3, 20 min for 4)."""
+
 
 # --------------------------------------------------------------------------- #
 # Public API
@@ -139,24 +163,42 @@ class ZoneExitManager:
         self._config = config or ZoneExitConfig()
 
     def check(
-        self, setup: Setup, last_close: float, bid: float, ask: float,
+        self, setup: Setup, recent_closes: list[float],
+        bid: float, ask: float,
     ) -> ZoneExitResult | None:
-        """Evaluate one setup against the last M5 bar's close.
+        """Evaluate one setup against the last few M5 bar closes.
 
-        Returns ``None`` if the trigger doesn't fire (either the
-        body-close condition isn't met OR idempotency says already
-        done). Returns a :class:`ZoneExitResult` on a real firing.
+        ``recent_closes`` is the list of the most recent M5 close
+        prices (oldest first). The caller passes at least
+        ``config.confirmation_candles`` entries — the manager looks
+        at the last N and only fires if every one is past L1 entry
+        in the profit direction. Passing fewer than N entries is a
+        no-op (not enough history to confirm).
+
+        Returns ``None`` if the trigger doesn't fire (insufficient
+        history, confirmation gate failed, or idempotency says
+        already done). Returns a :class:`ZoneExitResult` on a real
+        firing.
         """
         if setup.status != "ACTIVE":
             return None
 
-        # 1. Body-close trigger. L1 == the zone edge price entered from.
+        # 1. Body-close confirmation gate. L1 == the zone edge price
+        # entered from. All `confirmation_candles` most-recent closes
+        # must be past L1 in the profit direction.
+        n_required = self._config.confirmation_candles
+        if n_required < 1:
+            # Defensive: a config of 0 would short-circuit every call.
+            return None
+        if len(recent_closes) < n_required:
+            return None
+        closes_to_check = recent_closes[-n_required:]
         l1 = float(setup.planned_layer1_price)
         if setup.direction == "BUY":
-            if last_close <= l1:
+            if not all(c > l1 for c in closes_to_check):
                 return None
         else:  # SELL
-            if last_close >= l1:
+            if not all(c < l1 for c in closes_to_check):
                 return None
 
         # 2. Load trades, sort by layer number ascending (1, 2, 3).

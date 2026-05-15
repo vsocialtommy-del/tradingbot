@@ -30,7 +30,7 @@ from pytest_mock import MockerFixture
 
 from bot.execution.mt5_connector import MT5Connector
 from bot.execution.position_tracker import PositionTracker
-from bot.exits.zone_exit_manager import ZoneExitManager
+from bot.exits.zone_exit_manager import ZoneExitConfig, ZoneExitManager
 from bot.logging.supabase_logger import Setup, SupabaseLogger, Trade
 
 
@@ -161,7 +161,7 @@ class TestTriggerCondition:
                 sl_price=Decimal("4671.50"),
             ),
         ]
-        result = manager.check(s, last_close=4695.0, bid=4695.0, ask=4695.1)
+        result = manager.check(s, recent_closes=[4695.0, 4695.0], bid=4695.0, ask=4695.1)
         assert result is not None
         assert result.closed_layer == 1
         assert result.be_layer_count == 1  # layer 2
@@ -171,7 +171,7 @@ class TestTriggerCondition:
     ) -> None:
         # BUY close == L1 is NOT "out" — strict inequality.
         s = make_setup(direction="BUY", planned_layer1_price=Decimal("4694.00"))
-        result = manager.check(s, last_close=4694.0, bid=4694.0, ask=4694.1)
+        result = manager.check(s, recent_closes=[4694.0, 4694.0], bid=4694.0, ask=4694.1)
         assert result is None
         mock_supabase.get_trades_for_setup.assert_not_called()
 
@@ -180,7 +180,7 @@ class TestTriggerCondition:
     ) -> None:
         # BUY close below L1 (still inside zone or below it) → no fire.
         s = make_setup(direction="BUY", planned_layer1_price=Decimal("4694.00"))
-        result = manager.check(s, last_close=4691.0, bid=4691.0, ask=4691.1)
+        result = manager.check(s, recent_closes=[4691.0, 4691.0], bid=4691.0, ask=4691.1)
         assert result is None
         mock_supabase.get_trades_for_setup.assert_not_called()
 
@@ -209,7 +209,7 @@ class TestTriggerCondition:
                 sl_price=Decimal("4711.50"),
             ),
         ]
-        result = manager.check(s, last_close=4688.0, bid=4687.9, ask=4688.0)
+        result = manager.check(s, recent_closes=[4688.0, 4688.0], bid=4687.9, ask=4688.0)
         assert result is not None
         assert result.closed_layer == 1
 
@@ -225,14 +225,14 @@ class TestTriggerCondition:
             planned_tp2_price=Decimal("4660.00"),
             planned_tp3_price=Decimal("4650.00"),
         )
-        result = manager.check(s, last_close=4689.0, bid=4689.0, ask=4689.1)
+        result = manager.check(s, recent_closes=[4689.0, 4689.0], bid=4689.0, ask=4689.1)
         assert result is None
 
     def test_pending_setup_short_circuits(
         self, manager: ZoneExitManager, mock_supabase: MagicMock,
     ) -> None:
         s = make_setup(status="PENDING")
-        result = manager.check(s, last_close=4700.0, bid=4700.0, ask=4700.1)
+        result = manager.check(s, recent_closes=[4700.0, 4700.0], bid=4700.0, ask=4700.1)
         assert result is None
         mock_supabase.get_trades_for_setup.assert_not_called()
 
@@ -266,7 +266,7 @@ class TestTwoOrMoreFilled:
         )
         mock_supabase.get_trades_for_setup.return_value = [l1, l2, l3]
 
-        result = manager.check(s, last_close=4696.0, bid=4696.0, ask=4696.1)
+        result = manager.check(s, recent_closes=[4696.0, 4696.0], bid=4696.0, ask=4696.1)
 
         assert result is not None
         assert result.closed_trade_id == l1.id
@@ -327,7 +327,7 @@ class TestTwoOrMoreFilled:
         )
         mock_supabase.get_trades_for_setup.return_value = [l1, l2, l3]
 
-        result = manager.check(s, last_close=4687.0, bid=4686.9, ask=4687.0)
+        result = manager.check(s, recent_closes=[4687.0, 4687.0], bid=4686.9, ask=4687.0)
 
         assert result is not None
         assert result.closed_layer == 1
@@ -379,7 +379,7 @@ class TestOnlyOneFilled:
         )
         mock_supabase.get_trades_for_setup.return_value = [l1, l2, l3]
 
-        result = manager.check(s, last_close=4696.0, bid=4696.0, ask=4696.1)
+        result = manager.check(s, recent_closes=[4696.0, 4696.0], bid=4696.0, ask=4696.1)
 
         assert result is not None
         assert result.closed_trade_id is None
@@ -424,7 +424,7 @@ class TestNoFilled:
         )
         mock_supabase.get_trades_for_setup.return_value = [l1, l2]
 
-        result = manager.check(s, last_close=4696.0, bid=4696.0, ask=4696.1)
+        result = manager.check(s, recent_closes=[4696.0, 4696.0], bid=4696.0, ask=4696.1)
 
         assert result is not None
         assert result.closed_trade_id is None
@@ -461,7 +461,7 @@ class TestIdempotency:
         )
         mock_supabase.get_trades_for_setup.return_value = [l1, l2]
 
-        result = manager.check(s, last_close=4700.0, bid=4700.0, ask=4700.1)
+        result = manager.check(s, recent_closes=[4700.0, 4700.0], bid=4700.0, ask=4700.1)
 
         assert result is None
         mock_mt5.close_position.assert_not_called()
@@ -486,7 +486,7 @@ class TestIdempotency:
             sl_price=Decimal("4691.50"),
         )
         mock_supabase.get_trades_for_setup.return_value = [l1, l2]
-        result = manager.check(s, last_close=4700.0, bid=4700.0, ask=4700.1)
+        result = manager.check(s, recent_closes=[4700.0, 4700.0], bid=4700.0, ask=4700.1)
         assert result is None
 
 
@@ -517,10 +517,242 @@ class TestBrokerFailures:
         mock_supabase.get_trades_for_setup.return_value = [l1, l2]
         mock_mt5.close_position.side_effect = RuntimeError("broker down")
 
-        result = manager.check(s, last_close=4696.0, bid=4696.0, ask=4696.1)
+        result = manager.check(s, recent_closes=[4696.0, 4696.0], bid=4696.0, ask=4696.1)
 
         assert result is not None
         assert result.error is not None
         assert "close_position failed" in result.error
         # BE on L2 still attempted.
         mock_mt5.modify_order.assert_called_once_with(22222, sl=4691.5)
+
+
+# --------------------------------------------------------------------------- #
+# PR #52: 2-candle confirmation
+# --------------------------------------------------------------------------- #
+
+
+class TestTwoCandleConfirmation:
+    """The default config requires TWO consecutive M5 body closes
+    out of the zone in the profit direction before the BE trigger
+    fires. Reduces the false-positive rate from single-bar liquidity
+    grabs / stop hunts / news spikes."""
+
+    def test_buy_single_bar_out_does_not_fire(
+        self, manager: ZoneExitManager, mock_supabase: MagicMock,
+    ) -> None:
+        # Only the most recent bar is above L1. The bar before is
+        # still inside the zone. Must NOT fire.
+        s = make_setup(direction="BUY", planned_layer1_price=Decimal("4694.00"))
+        result = manager.check(
+            s, recent_closes=[4690.0, 4695.0], bid=4695.0, ask=4695.1,
+        )
+        assert result is None
+        # Bail-out happens before any Supabase call.
+        mock_supabase.get_trades_for_setup.assert_not_called()
+
+    def test_buy_two_consecutive_out_fires(
+        self, manager: ZoneExitManager, mock_supabase: MagicMock,
+    ) -> None:
+        # Both most-recent bars above L1 → fires.
+        s = make_setup(direction="BUY", planned_layer1_price=Decimal("4694.00"))
+        mock_supabase.get_trades_for_setup.return_value = [
+            make_trade(
+                setup_id=s.id, layer_number=1,
+                entry_price=Decimal("4694.00"),
+                sl_price=Decimal("4671.50"),
+            ),
+        ]
+        result = manager.check(
+            s, recent_closes=[4695.5, 4696.0], bid=4696.0, ask=4696.1,
+        )
+        assert result is not None
+        assert result.be_layer_count == 1
+
+    def test_buy_fakeout_back_into_zone_does_not_fire(
+        self, manager: ZoneExitManager, mock_supabase: MagicMock,
+    ) -> None:
+        # Bar N-1 out of zone, bar N back inside (classic fakeout).
+        # Old 1-candle logic would have fired on bar N-1 *then BE-hit*
+        # when bar N retraced. The 2-candle gate rejects this.
+        s = make_setup(direction="BUY", planned_layer1_price=Decimal("4694.00"))
+        result = manager.check(
+            s, recent_closes=[4695.5, 4693.0], bid=4693.0, ask=4693.1,
+        )
+        assert result is None
+        mock_supabase.get_trades_for_setup.assert_not_called()
+
+    def test_sell_single_bar_out_does_not_fire(
+        self, manager: ZoneExitManager, mock_supabase: MagicMock,
+    ) -> None:
+        s = make_setup(
+            direction="SELL",
+            planned_layer1_price=Decimal("4689.00"),
+            planned_layer3_price=Decimal("4694.00"),
+            planned_sl_price=Decimal("4711.50"),
+            planned_tp1_price=Decimal("4670.00"),
+            planned_tp2_price=Decimal("4660.00"),
+            planned_tp3_price=Decimal("4650.00"),
+        )
+        # Most-recent below L1, previous still inside.
+        result = manager.check(
+            s, recent_closes=[4690.5, 4687.0], bid=4686.9, ask=4687.0,
+        )
+        assert result is None
+
+    def test_sell_two_consecutive_out_fires(
+        self, manager: ZoneExitManager, mock_supabase: MagicMock,
+    ) -> None:
+        s = make_setup(
+            direction="SELL",
+            planned_layer1_price=Decimal("4689.00"),
+            planned_layer3_price=Decimal("4694.00"),
+            planned_sl_price=Decimal("4711.50"),
+            planned_tp1_price=Decimal("4670.00"),
+            planned_tp2_price=Decimal("4660.00"),
+            planned_tp3_price=Decimal("4650.00"),
+        )
+        mock_supabase.get_trades_for_setup.return_value = [
+            make_trade(
+                setup_id=s.id, layer_number=1, direction="SELL",
+                entry_price=Decimal("4689.00"),
+                sl_price=Decimal("4711.50"),
+            ),
+        ]
+        result = manager.check(
+            s, recent_closes=[4687.5, 4687.0], bid=4686.9, ask=4687.0,
+        )
+        assert result is not None
+        assert result.be_layer_count == 1
+
+    def test_insufficient_history_does_not_fire(
+        self, manager: ZoneExitManager, mock_supabase: MagicMock,
+    ) -> None:
+        # Only one close passed but the default config requires 2.
+        # Bot startup or thin history — must NOT fire defensively.
+        s = make_setup(direction="BUY", planned_layer1_price=Decimal("4694.00"))
+        result = manager.check(
+            s, recent_closes=[4695.0], bid=4695.0, ask=4695.1,
+        )
+        assert result is None
+        mock_supabase.get_trades_for_setup.assert_not_called()
+
+    def test_empty_closes_does_not_fire(
+        self, manager: ZoneExitManager, mock_supabase: MagicMock,
+    ) -> None:
+        s = make_setup(direction="BUY", planned_layer1_price=Decimal("4694.00"))
+        result = manager.check(
+            s, recent_closes=[], bid=4695.0, ask=4695.1,
+        )
+        assert result is None
+
+    def test_extra_history_uses_only_trailing_n(
+        self, manager: ZoneExitManager, mock_supabase: MagicMock,
+    ) -> None:
+        # 10 bars passed; only the trailing 2 (the default N) matter.
+        # First 8 inside, last 2 out → fires.
+        s = make_setup(direction="BUY", planned_layer1_price=Decimal("4694.00"))
+        mock_supabase.get_trades_for_setup.return_value = [
+            make_trade(
+                setup_id=s.id, layer_number=1,
+                entry_price=Decimal("4694.00"),
+                sl_price=Decimal("4671.50"),
+            ),
+        ]
+        closes = [4690.0] * 8 + [4695.0, 4696.0]
+        result = manager.check(
+            s, recent_closes=closes, bid=4696.0, ask=4696.1,
+        )
+        assert result is not None
+
+    def test_extra_history_old_breakout_does_not_fire(
+        self, manager: ZoneExitManager, mock_supabase: MagicMock,
+    ) -> None:
+        # First 8 outside, last 2 back inside — the breakout was
+        # historical and price has since retraced. The trailing-N
+        # rule correctly says "not now".
+        s = make_setup(direction="BUY", planned_layer1_price=Decimal("4694.00"))
+        closes = [4696.0] * 8 + [4690.0, 4690.0]
+        result = manager.check(
+            s, recent_closes=closes, bid=4690.0, ask=4690.1,
+        )
+        assert result is None
+
+
+class TestConfirmationCandlesConfig:
+    """The number of confirming candles is configurable. Default 2;
+    tunable to 1 (original behaviour) or higher for stricter
+    confirmation."""
+
+    def test_one_candle_config_restores_original_behaviour(
+        self,
+        mock_mt5: MagicMock, mock_supabase: MagicMock,
+        mock_tracker: MagicMock,
+    ) -> None:
+        mgr = ZoneExitManager(
+            mock_mt5, mock_supabase, mock_tracker,
+            config=ZoneExitConfig(confirmation_candles=1),
+        )
+        s = make_setup(direction="BUY", planned_layer1_price=Decimal("4694.00"))
+        mock_supabase.get_trades_for_setup.return_value = [
+            make_trade(
+                setup_id=s.id, layer_number=1,
+                entry_price=Decimal("4694.00"),
+                sl_price=Decimal("4671.50"),
+            ),
+        ]
+        # Only the latest bar out of zone — 1-candle config fires.
+        result = mgr.check(
+            s, recent_closes=[4690.0, 4695.0], bid=4695.0, ask=4695.1,
+        )
+        assert result is not None
+
+    def test_three_candle_config_requires_three_consecutive(
+        self,
+        mock_mt5: MagicMock, mock_supabase: MagicMock,
+        mock_tracker: MagicMock,
+    ) -> None:
+        mgr = ZoneExitManager(
+            mock_mt5, mock_supabase, mock_tracker,
+            config=ZoneExitConfig(confirmation_candles=3),
+        )
+        s = make_setup(direction="BUY", planned_layer1_price=Decimal("4694.00"))
+
+        # Two consecutive out of zone is not enough for the 3-candle
+        # config.
+        assert (
+            mgr.check(
+                s, recent_closes=[4690.0, 4695.0, 4696.0],
+                bid=4696.0, ask=4696.1,
+            )
+            is None
+        )
+        # Three consecutive fires.
+        mock_supabase.get_trades_for_setup.return_value = [
+            make_trade(
+                setup_id=s.id, layer_number=1,
+                entry_price=Decimal("4694.00"),
+                sl_price=Decimal("4671.50"),
+            ),
+        ]
+        result = mgr.check(
+            s, recent_closes=[4695.0, 4696.0, 4697.0],
+            bid=4697.0, ask=4697.1,
+        )
+        assert result is not None
+
+    def test_zero_candle_config_short_circuits(
+        self,
+        mock_mt5: MagicMock, mock_supabase: MagicMock,
+        mock_tracker: MagicMock,
+    ) -> None:
+        # Pathological config (0 or negative) is rejected defensively.
+        mgr = ZoneExitManager(
+            mock_mt5, mock_supabase, mock_tracker,
+            config=ZoneExitConfig(confirmation_candles=0),
+        )
+        s = make_setup(direction="BUY", planned_layer1_price=Decimal("4694.00"))
+        result = mgr.check(
+            s, recent_closes=[4696.0, 4696.0], bid=4696.0, ask=4696.1,
+        )
+        assert result is None
+        mock_supabase.get_trades_for_setup.assert_not_called()
