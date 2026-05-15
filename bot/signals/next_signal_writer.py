@@ -10,25 +10,33 @@ Algorithm
 
 For each direction (BUY / SELL):
 
-1. Pull all currently-renderable zones from Supabase (CONFIRMED /
-   ACTIVE / FLIPPED). FLIPPED zones with ``flipped_direction`` set
-   to the target direction count too — they're tradeable in that
-   flipped direction (PR #38).
-2. Filter:
-   * Recent: ``formed_at`` within the last ``max_age_days`` (default
-     7) — matches the zone-snapshot CSV writer's age cutoff.
-   * Reachable: zone's nearest edge is within ``max_distance_points``
-     of current price (default $50). Matches zone-snapshot too.
-   * Visible: skip "dead" zones whose status is CONSUMED or
-     VIOLATED. The Supabase status filter already excludes these,
-     but FLIPPED rows with old prior state can still survive — the
-     status check is defensive.
-   * Direction-correct: price is still on the right side of the
-     zone to retest into it. For BUY (demand), bid > zone.top
-     (price above, waiting to drop to entry). For SELL (supply),
-     ask < zone.bottom (price below, waiting to rise to entry).
-     If price is already inside or past the zone, the retest moment
-     has passed — that zone isn't a "next signal".
+1. Pull currently-alive, untraded zones from Supabase: status in
+   ``("CONFIRMED", "FLIPPED")``.
+
+   * ``ACTIVE`` is deliberately excluded — those zones already have
+     a setup with at least one filled layer on them. Showing them
+     as "next signal" would be misleading: the bot can't (and
+     won't) place another setup on a zone it's already trading
+     (dedup rule).
+   * ``CONSUMED`` and ``VIOLATED`` are dead by their lifecycle
+     status — excluded automatically by the status filter.
+
+2. Filter further:
+   * **Recent**: ``formed_at`` within the last ``max_age_days``
+     (default 7) — matches the zone-snapshot CSV writer.
+   * **Reachable**: zone's nearest edge is within
+     ``max_distance_points`` of current price (default $50).
+   * **Direction-correct**: price still on the right side of the
+     zone to retest into it. For BUY (demand), bid > zone.top.
+     For SELL (supply), ask < zone.bottom. Zones price is
+     already inside or past aren't "next signals".
+   * **Flip premise intact (FLIPPED zones only)**: skip zones
+     whose flip has been body-broken by a post-flip bar. Mirrors
+     the bot's own ``_load_flipped_candidates`` rule — without
+     this check, the dashboard would advertise FLIPPED zones the
+     bot has correctly decided are dead. Uses the current df, so
+     the dashboard always reflects the *live* tradeability state,
+     not whatever was true at flip time.
 3. Pick the closest qualifying zone by distance from current price
    to the L1 entry edge.
 4. Compute SL (= ``zone.bottom - sl_buffer`` for BUY / ``zone.top +
@@ -64,6 +72,7 @@ from loguru import logger
 
 from bot.logging.supabase_logger import SignalInput, SupabaseLogger, Zone
 from bot.strategy.tp_target import find_nearest_local_peak
+from bot.strategy.zone_lifecycle import flipped_zone_body_broken_since_flip
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -150,8 +159,12 @@ class NextSignalWriter:
             return {"BUY": "skipped", "SELL": "skipped"}
 
         try:
+            # ACTIVE is excluded: those zones already have a filled
+            # setup on them (dedup blocks placement on the same zone
+            # again), so showing them as a "next signal" is misleading.
+            # CONSUMED / VIOLATED are also out — dead by status.
             zones = self._supabase.get_zones_by_status(
-                ["CONFIRMED", "ACTIVE", "FLIPPED"],
+                ["CONFIRMED", "FLIPPED"],
             )
         except Exception:
             logger.exception(
@@ -185,6 +198,7 @@ class NextSignalWriter:
                 bid=bid,
                 ask=ask,
                 now=now,
+                df=df,
                 max_distance_points=self._cfg.max_distance_points,
                 max_age_days=self._cfg.max_age_days,
             )
@@ -328,26 +342,54 @@ def _pick_closest_zone(
     bid: float,
     ask: float,
     now: datetime,
+    df: "pd.DataFrame",
     max_distance_points: float,
     max_age_days: int,
 ) -> Zone | None:
-    """Filter + pick the nearest qualifying zone in one pass.
+    """Filter + pick the nearest qualifying ALIVE zone.
+
+    "Alive" means:
+    * Status is ``CONFIRMED`` or ``FLIPPED`` (``ACTIVE`` already has a
+      filled setup on it — bot can't trade it again, so showing it as a
+      "next signal" is misleading).
+    * For FLIPPED zones, the flip premise hasn't been body-broken by
+      any post-flip bar in the current df. Mirrors the same check the
+      bot uses in ``_load_flipped_candidates`` so the dashboard never
+      advertises a zone the bot won't actually trade.
 
     Pure function. The only branchy logic is the BUY-vs-SELL
     asymmetry (which price to compare to which zone edge).
     """
+    import pandas as pd  # noqa: PLC0415 — keep TYPE_CHECKING import light
+
     current_price = bid if direction == "BUY" else ask
     cutoff = now - timedelta(days=max_age_days)
     candidates: list[tuple[float, Zone]] = []
 
     for z in zones:
         # Status filter — defensive; supabase query already excludes
-        # CONSUMED / VIOLATED but be paranoid in case of races.
-        if z.status not in ("CONFIRMED", "ACTIVE", "FLIPPED"):
+        # CONSUMED / VIOLATED / ACTIVE but be paranoid in case of races.
+        if z.status not in ("CONFIRMED", "FLIPPED"):
             continue
         # Direction match (handles FLIPPED via flipped_direction).
         if not _zone_matches_direction(z, direction):
             continue
+        # FLIPPED flip-premise check: skip zones whose flip has been
+        # invalidated by a body-close past the wrong side since the
+        # flip. The bot's placement queue applies the same check, so
+        # mirroring it here keeps the dashboard truthful.
+        if z.status == "FLIPPED":
+            if z.flipped_at is None or z.flipped_direction is None:
+                # DB CHECK should prevent this; defensive skip.
+                continue
+            if flipped_zone_body_broken_since_flip(
+                zone_top=float(z.top),
+                zone_bottom=float(z.bottom),
+                flipped_direction=z.flipped_direction,
+                flipped_at=pd.Timestamp(z.flipped_at),
+                df=df,
+            ):
+                continue
         # Pending-retest gate — price still on the right side.
         if not _zone_is_pending_retest(z, direction, bid, ask):
             continue
