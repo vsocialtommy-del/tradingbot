@@ -384,8 +384,8 @@ class TestWrite:
     def test_zones_too_far_deactivate(
         self, writer: NextSignalWriter, mock_supabase: MagicMock,
     ) -> None:
-        # +60 away (outside the 50pt distance filter).
-        far = make_zone(direction="BUY", top=4640.0, bottom=4634.0)
+        # +150 away (outside the 100pt distance filter — PR #54).
+        far = make_zone(direction="BUY", top=4550.0, bottom=4544.0)
         mock_supabase.get_zones_by_status.return_value = [far]
         df = make_df()
 
@@ -472,6 +472,21 @@ class TestWrite:
 
 
 class TestConfig:
+    def test_default_distance_is_100(self) -> None:
+        # PR #54 raised the default from 50 to 100. Lock it in so
+        # future drift surfaces as a test failure.
+        assert NextSignalConfig().max_distance_points == 100.0
+
+    def test_default_distance_includes_zone_within_100(
+        self, writer: NextSignalWriter, mock_supabase: MagicMock,
+    ) -> None:
+        # 75 away — was excluded under the old 50pt default, now included.
+        z = make_zone(direction="BUY", top=4625.0, bottom=4619.0)
+        mock_supabase.get_zones_by_status.return_value = [z]
+        df = make_df()
+        outcome = writer.write(df, bid=4700.0, ask=4700.1, now=NOW)
+        assert outcome["BUY"] == "wrote"
+
     def test_custom_distance_filter(
         self, mock_supabase: MagicMock,
     ) -> None:
