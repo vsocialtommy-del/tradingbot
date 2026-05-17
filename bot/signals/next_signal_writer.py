@@ -25,7 +25,7 @@ For each direction (BUY / SELL):
    * **Recent**: ``formed_at`` within the last ``max_age_days``
      (default 7) — matches the zone-snapshot CSV writer.
    * **Reachable**: zone's nearest edge is within
-     ``max_distance_points`` of current price (default $50).
+     ``max_distance_points`` of current price (default $100).
    * **Direction-correct**: price still on the right side of the
      zone to retest into it. For BUY (demand), bid > zone.top.
      For SELL (supply), ask < zone.bottom. Zones price is
@@ -87,10 +87,17 @@ if TYPE_CHECKING:
 class NextSignalConfig:
     """Tunables for :class:`NextSignalWriter`."""
 
-    max_distance_points: float = 50.0
+    max_distance_points: float = 100.0
     """A zone qualifies only if its nearest edge is within this many
-    price points of the current bid/ask. Matches the zone-snapshot
-    CSV writer (PR #49)."""
+    price points of the current bid/ask.
+
+    Bumped from 50 to 100 in PR #54 — at 50 the dashboard regularly
+    showed "No active signal" because no qualifying zone existed
+    within that tight window (especially in directional markets where
+    fresh zones lag $50+ behind the move). 100 surfaces the next
+    reasonable opportunity without cluttering the view with truly
+    distant zones. Doesn't affect any trading behaviour; this filter
+    is dashboard-only."""
 
     max_age_days: int = 7
     """Zone must have ``formed_at`` within this many days. Matches
