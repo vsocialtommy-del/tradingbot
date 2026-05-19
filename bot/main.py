@@ -69,7 +69,7 @@ import os
 import signal
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
@@ -1137,6 +1137,18 @@ class Bot:
             )
             return []
 
+        # PR #56: apply the same freshness window we use for dedup.
+        # If the bot can't see a zone (older than the window), we
+        # don't load it. Symmetric with the dedup block — old burnt
+        # zones don't block placement, AND old CONFIRMED zones don't
+        # get traded. One config knob governs both.
+        freshness_cutoff: datetime | None = None
+        freshness_hours = self.strategy_pipeline_config.zone_freshness_hours
+        if freshness_hours > 0:
+            freshness_cutoff = datetime.now(tz=timezone.utc) - timedelta(
+                hours=freshness_hours,
+            )
+
         candidates: list[tuple[ValidatedZone, UUID]] = []
         for cz in confirmed_zones:
             # Defensive: only consider rows whose status is actually
@@ -1147,6 +1159,9 @@ class Bot:
             if cz.status != "CONFIRMED":
                 continue
             if cz.id in exclude_zone_ids:
+                continue
+            # Freshness window — see PR #56 commentary above.
+            if freshness_cutoff is not None and cz.created_at < freshness_cutoff:
                 continue
             # Body-broken-since-formation defense. Reuses the same
             # helper the FLIPPED loader uses — the function is
@@ -1632,11 +1647,17 @@ class Bot:
     # ------------------------------------------------------------------ #
 
     def _zone_already_used(self, candidate: ValidatedZone) -> bool:
-        """True iff a CONSUMED/VIOLATED/FLIPPED zone overlaps ``candidate``.
+        """True iff a *recent* CONSUMED/VIOLATED/FLIPPED zone overlaps ``candidate``.
 
         Best-effort: if the lookup fails we let the setup proceed
         (logging the error). Better to occasionally re-trade than to
         miss real entries because of a Supabase blip.
+
+        PR #56: applies ``zone_freshness_hours`` to the dedup lookup
+        — burnt zones older than the window stop blocking new setups
+        in their price band. The same window also gates which zones
+        ``_load_confirmed_candidates`` puts in the queue; "if the bot
+        can't see it, it can't be locked out by it" is the symmetry.
         """
         try:
             existing = self.supabase.get_zones_by_status(
@@ -1648,12 +1669,24 @@ class Bot:
             )
             return False
 
+        cutoff: datetime | None = None
+        freshness_hours = self.strategy_pipeline_config.zone_freshness_hours
+        if freshness_hours > 0:
+            # Default: only zones from within the freshness window
+            # can block placement. Set freshness_hours <= 0 to disable
+            # (restores the pre-PR-#56 "any age blocks" rule).
+            cutoff = datetime.now(tz=timezone.utc) - timedelta(
+                hours=freshness_hours,
+            )
+
         candidate_ref = ZoneRef(
             direction=candidate.direction,
             top=float(candidate.top),
             bottom=float(candidate.bottom),
         )
         for z in existing:
+            if cutoff is not None and z.created_at < cutoff:
+                continue
             existing_ref = ZoneRef(
                 direction=z.direction,
                 top=float(z.top),

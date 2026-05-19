@@ -974,9 +974,21 @@ def _make_zone_row(
     violated_at: datetime | None = None,
     flipped_at: datetime | None = None,
     flipped_direction: str | None = None,
+    created_at: datetime | None = None,
+    formed_at: datetime | None = None,
 ):
-    """Build a Zone read model for lifecycle tests."""
+    """Build a Zone read model for lifecycle tests.
+
+    ``created_at`` defaults to "recent relative to real wall-clock"
+    so PR #56's freshness window (which uses real
+    ``datetime.now(utc)``) considers the row fresh. Tests that
+    explicitly want a stale row pass an older value.
+    """
     from bot.logging.supabase_logger import Zone
+    # Default to a fresh row (within ~1 min of wall-clock now). Older
+    # values can be passed explicitly to test the time-decay path.
+    effective_created = created_at or datetime.now(tz=timezone.utc)
+    effective_formed = formed_at or NOW
     return Zone(
         id=uuid4(),
         symbol="XAUUSD",
@@ -986,14 +998,14 @@ def _make_zone_row(
         top=Decimal(str(top)),
         bottom=Decimal(str(bottom)),
         approach_count=0,
-        formed_at=NOW,
+        formed_at=effective_formed,
         status=status,  # type: ignore[arg-type]
         consumed_at=consumed_at,
         violated_at=violated_at,
         flipped_at=flipped_at,
         flipped_direction=flipped_direction,  # type: ignore[arg-type]
-        created_at=NOW,
-        updated_at=NOW,
+        created_at=effective_created,
+        updated_at=effective_created,
     )
 
 
@@ -2377,6 +2389,174 @@ class TestDetectNewZonesSeedsFromSupabase:
         # Pipeline-output zone + DB zone are the same UUID → exactly
         # one entry in the queue, not two.
         assert len(b._pending_pipeline_zones) == 1
+
+
+# --------------------------------------------------------------------------- #
+# PR #56: zone freshness window. ONE config knob (`zone_freshness_hours`)
+# governs two filters symmetrically:
+#
+#   1. `_load_confirmed_candidates` — only loads CONFIRMED zones whose
+#      created_at is within the window. Older zones don't enter the
+#      placement queue, can't be traded.
+#
+#   2. `_zone_already_used` (dedup pre-flight) — only blocks new setups
+#      on overlapping CONSUMED/VIOLATED/FLIPPED zones whose created_at
+#      is within the window. Older "burnt" zones don't lock placement
+#      out of their price band.
+#
+# "If the bot can't see it, it can't be locked out by it" — symmetric.
+# Solves the production graveyard problem (87 dead zones blocking every
+# fresh pattern in a price band over 8 days).
+# --------------------------------------------------------------------------- #
+
+
+def _hours_ago(n: float) -> datetime:
+    return datetime.now(tz=timezone.utc) - timedelta(hours=n)
+
+
+class TestDedupFreshness:
+    """`_zone_already_used` only blocks on recent overlapping dead zones."""
+
+    def test_recent_consumed_zone_blocks(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        b, _ = bot
+        # Consumed 1h ago — well within the 6h default freshness window.
+        recent = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONSUMED", consumed_at=_hours_ago(1),
+            created_at=_hours_ago(1),
+        )
+        mock_supabase.get_zones_by_status.return_value = [recent]
+
+        candidate = _make_validated_for_persistence(_PT.RBR)
+        assert b._zone_already_used(candidate) is True
+
+    def test_old_consumed_zone_does_not_block(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        # Consumed 12h ago — outside the 6h default freshness window.
+        b, _ = bot
+        old = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONSUMED", consumed_at=_hours_ago(12),
+            created_at=_hours_ago(12),
+        )
+        mock_supabase.get_zones_by_status.return_value = [old]
+
+        candidate = _make_validated_for_persistence(_PT.RBR)
+        assert b._zone_already_used(candidate) is False
+
+    def test_old_flipped_zone_does_not_block(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        b, _ = bot
+        old = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="FLIPPED", flipped_at=_hours_ago(8),
+            flipped_direction="SELL",
+            created_at=_hours_ago(8),
+        )
+        mock_supabase.get_zones_by_status.return_value = [old]
+
+        candidate = _make_validated_for_persistence(_PT.RBR)
+        assert b._zone_already_used(candidate) is False
+
+    def test_zero_freshness_hours_disables_filter(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        # Setting freshness_hours to 0 restores pre-PR-#56 behaviour
+        # (any age blocks). Useful escape hatch for operators who want
+        # the old strict dedup.
+        from dataclasses import replace
+        b, _ = bot
+        b.strategy_pipeline_config = replace(
+            b.strategy_pipeline_config, zone_freshness_hours=0.0,
+        )
+
+        ancient = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONSUMED", consumed_at=_hours_ago(72),
+            created_at=_hours_ago(72),
+        )
+        mock_supabase.get_zones_by_status.return_value = [ancient]
+
+        candidate = _make_validated_for_persistence(_PT.RBR)
+        assert b._zone_already_used(candidate) is True
+
+
+class TestLoadConfirmedCandidatesFreshness:
+    """`_load_confirmed_candidates` skips CONFIRMED zones outside the
+    freshness window — old zones in Supabase don't end up in the queue."""
+
+    def _df_no_break(self) -> pd.DataFrame:
+        return pd.DataFrame({
+            "open":  [1910.0] * 20,
+            "high":  [1911.0] * 20,
+            "low":   [1909.0] * 20,
+            "close": [1910.0] * 20,
+        }, index=pd.date_range(
+            end=NOW, periods=20, freq="5min", tz="UTC",
+        ))
+
+    def test_recent_confirmed_zone_loaded(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        b, _ = bot
+        recent = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONFIRMED", created_at=_hours_ago(2),
+        )
+        mock_supabase.get_zones_by_status.return_value = [recent]
+
+        out = b._load_confirmed_candidates(
+            self._df_no_break(), exclude_zone_ids=set(),
+        )
+        assert len(out) == 1
+        assert out[0][1] == recent.id
+
+    def test_old_confirmed_zone_skipped(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        # Outside the 6h default → not loaded.
+        b, _ = bot
+        old = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONFIRMED", created_at=_hours_ago(10),
+        )
+        mock_supabase.get_zones_by_status.return_value = [old]
+
+        out = b._load_confirmed_candidates(
+            self._df_no_break(), exclude_zone_ids=set(),
+        )
+        assert out == []
+
+    def test_mixed_ages_only_loads_fresh(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        b, _ = bot
+        fresh = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONFIRMED", created_at=_hours_ago(1),
+        )
+        stale = _make_zone_row(
+            direction="BUY", top=1875.0, bottom=1870.0,
+            status="CONFIRMED", created_at=_hours_ago(48),
+        )
+        mock_supabase.get_zones_by_status.return_value = [fresh, stale]
+
+        out = b._load_confirmed_candidates(
+            self._df_no_break(), exclude_zone_ids=set(),
+        )
+        assert len(out) == 1
+        assert out[0][1] == fresh.id
 
 
 # --------------------------------------------------------------------------- #
