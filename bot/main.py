@@ -718,12 +718,29 @@ class Bot:
                 continue
             new_pipeline_pending.append((zone, zid))
 
+        # PR #55: also pull CONFIRMED zones from Supabase that the
+        # pipeline didn't re-detect this close. Without this, a zone
+        # alive in the DB silently drops out of the placement queue
+        # whenever the pipeline run doesn't reproduce it (newer
+        # pattern overshadows, lookback aging, validation drift). The
+        # signal writer pulls from Supabase and would still show the
+        # zone — operator sees "next signal here", bot does nothing
+        # because the in-memory queue is empty. Production-observed
+        # failure case: BUY 4486.84 zone alive in DB, price drops
+        # cleanly through it, no entry, no setup row, no error.
+        already_queued = {zid for (_, zid) in new_pipeline_pending}
+        extra_confirmed = self._load_confirmed_candidates(
+            df, exclude_zone_ids=already_queued,
+        )
+        new_pipeline_pending.extend(extra_confirmed)
+
         self._pending_pipeline_zones = new_pipeline_pending
         self._pending_flipped_zones = list(flipped_candidates)
         if self._pending_pipeline_zones or self._pending_flipped_zones:
             logger.debug(
                 f"M5 close: pending placement queue refreshed — "
-                f"{len(self._pending_pipeline_zones)} pipeline, "
+                f"{len(self._pending_pipeline_zones)} pipeline "
+                f"({len(extra_confirmed)} from DB), "
                 f"{len(self._pending_flipped_zones)} flipped"
             )
 
@@ -1080,6 +1097,83 @@ class Bot:
     # ------------------------------------------------------------------ #
     # SnD Flip trade side path (PR #38)
     # ------------------------------------------------------------------ #
+
+    def _load_confirmed_candidates(
+        self,
+        df: pd.DataFrame,
+        *,
+        exclude_zone_ids: set[UUID],
+    ) -> list[tuple[ValidatedZone, UUID]]:
+        """PR #55: load CONFIRMED zones from DB for the placement queue.
+
+        Mirrors :meth:`_load_flipped_candidates` for the CONFIRMED path.
+        The placement queue used to be built solely from the latest
+        ``run_strategy_pipeline`` output, which silently dropped any
+        CONFIRMED zone the pipeline failed to re-detect on a given M5
+        close — even though the zone was still alive in Supabase. This
+        method makes Supabase the source of truth: every alive
+        CONFIRMED zone enters the queue, regardless of whether the
+        pipeline reproduced it.
+
+        ``exclude_zone_ids`` is the set of zone UUIDs already present
+        in the pipeline-output queue — passing them in avoids
+        duplicate (zone, view) tuples in ``_pending_pipeline_zones``.
+
+        The body-broken-since-formation check is applied against the
+        live df. Zones whose bottom (BUY) or top (SELL) has already
+        been body-violated by a post-formation bar are skipped — the
+        zone is structurally dead. Same rule the original
+        ``validate_strong_point`` path applies; mirroring it here
+        keeps the queue and the lifecycle scanner in agreement.
+        """
+        try:
+            confirmed_zones = self.supabase.get_zones_by_status(
+                ["CONFIRMED"]
+            )
+        except Exception:
+            logger.exception(
+                "_load_confirmed_candidates: "
+                "get_zones_by_status(['CONFIRMED']) failed"
+            )
+            return []
+
+        candidates: list[tuple[ValidatedZone, UUID]] = []
+        for cz in confirmed_zones:
+            # Defensive: only consider rows whose status is actually
+            # CONFIRMED. The Supabase query already filters, but a
+            # racing transition (zone moves to CONSUMED between query
+            # and processing) shouldn't end up adding a dead zone to
+            # the queue.
+            if cz.status != "CONFIRMED":
+                continue
+            if cz.id in exclude_zone_ids:
+                continue
+            # Body-broken-since-formation defense. Reuses the same
+            # helper the FLIPPED loader uses — the function is
+            # direction- + timestamp-keyed, not actually FLIPPED-
+            # specific. For a CONFIRMED zone we key off ``formed_at``
+            # (when the pattern's impulse_after ended).
+            if flipped_zone_body_broken_since_flip(
+                zone_top=float(cz.top),
+                zone_bottom=float(cz.bottom),
+                flipped_direction=cz.direction,
+                flipped_at=pd.Timestamp(cz.formed_at),
+                df=df,
+            ):
+                logger.info(
+                    f"confirmed zone {cz.id} skipped: body-broken "
+                    f"since formation"
+                )
+                continue
+            view = _confirmed_zone_as_validated(cz)
+            candidates.append((view, cz.id))
+
+        if candidates:
+            logger.debug(
+                f"_load_confirmed_candidates: {len(candidates)} "
+                f"DB-only candidate(s) after body-break filter"
+            )
+        return candidates
 
     def _load_flipped_candidates(
         self, df: pd.DataFrame,
@@ -1679,6 +1773,71 @@ def _zone_to_input(zone: ValidatedZone) -> ZoneInput:
         approach_count=0,            # Imbalance-only field; 0 in v1
         qualified_imbalance_at=None,  # Imbalance-only field; None in v1
         formed_at=zone.formed_at.to_pydatetime(),
+    )
+
+
+def _confirmed_zone_as_validated(zone_row: Any) -> ValidatedZone:
+    """PR #55: synthesise a tradeable ``ValidatedZone`` view of a
+    CONFIRMED zone row.
+
+    Counterpart to :func:`_flipped_zone_as_validated`. Same idea:
+    the placement code reads only ``direction``, ``top``, ``bottom``,
+    ``refined_zone.is_tradeable``, and ``is_strong_point``; the rest
+    is stubbed for traceability. The CONFIRMED case uses
+    ``zone_row.direction`` and ``zone_row.formed_at`` directly (no
+    flipped indirection).
+    """
+    direction = zone_row.direction
+    formed_at = zone_row.formed_at
+    if direction is None or formed_at is None:
+        raise ValueError(
+            f"zone {zone_row.id} missing direction or formed_at; "
+            f"cannot synthesise ValidatedZone view"
+        )
+
+    ts = pd.Timestamp(formed_at)
+    top = float(zone_row.top)
+    bottom = float(zone_row.bottom)
+    pt = _PT(zone_row.pattern_type)
+    impulse_dir = "RALLY" if direction == "BUY" else "DROP"
+    impulse = _Impulse(
+        direction=impulse_dir,
+        start_index=0, end_index=0,
+        start_time=ts, end_time=ts,
+        range_size=0.0, largest_body=0.0, candle_count=1,
+    )
+    base = _Base(
+        start_index=0, end_index=0, candle_count=1,
+        top=top, bottom=bottom,
+        range_size=top - bottom, largest_body=0.0,
+    )
+    pattern = _Pattern(
+        pattern_type=pt,
+        impulse_before=impulse, base=base, impulse_after=impulse,
+        direction=direction,
+        formed_at=ts,
+    )
+    zone_shape = _ZoneShape(
+        direction=direction,
+        top=top, bottom=bottom,
+        formed_at=ts, source_pattern=pattern,
+    )
+    refined = _RefinedZone(
+        direction=direction,
+        top=top, bottom=bottom,
+        formed_at=ts, source_pattern=pattern,
+        is_tradeable=True,
+        rejection_reason=None,
+        original_zone=zone_shape,
+    )
+    return ValidatedZone(
+        direction=direction,
+        top=top, bottom=bottom,
+        formed_at=ts, source_pattern=pattern,
+        refined_zone=refined,
+        is_strong_point=True,
+        validation_failures=[],
+        broken_swing=None, broken_at=None, sl_anchor_swing=None,
     )
 
 
