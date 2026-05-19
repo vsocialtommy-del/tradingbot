@@ -2121,6 +2121,265 @@ class TestFlippedZoneAsValidated:
 
 
 # --------------------------------------------------------------------------- #
+# PR #55: pending placement queue seeded from Supabase, not just from
+# the latest pipeline run. Before this change, a CONFIRMED zone in
+# Supabase that the pipeline didn't re-detect on a given M5 close
+# would silently drop out of `_pending_pipeline_zones` and the bot
+# would never attempt placement on it — even though the dashboard
+# kept showing it. Production-observed failure: BUY zone alive in DB,
+# price drops cleanly through it, no entry, no setup row.
+# --------------------------------------------------------------------------- #
+
+
+class TestConfirmedZoneAsValidated:
+    def test_builds_view_with_correct_direction(self) -> None:
+        from bot.main import _confirmed_zone_as_validated
+        cz = _make_zone_row(direction="BUY", top=1905.0, bottom=1900.0)
+        view = _confirmed_zone_as_validated(cz)
+        assert view.direction == "BUY"
+        assert view.top == 1905.0
+        assert view.bottom == 1900.0
+        assert view.is_strong_point is True
+        assert view.refined_zone.is_tradeable is True
+        # Stubbed-None fields for the loosened-rules shape.
+        assert view.broken_swing is None
+        assert view.broken_at is None
+        assert view.sl_anchor_swing is None
+
+    def test_builds_view_for_sell_direction(self) -> None:
+        from bot.main import _confirmed_zone_as_validated
+        cz = _make_zone_row(direction="SELL", top=1910.0, bottom=1905.0)
+        view = _confirmed_zone_as_validated(cz)
+        assert view.direction == "SELL"
+        assert view.top == 1910.0
+        assert view.bottom == 1905.0
+
+
+class TestLoadConfirmedCandidates:
+    """Bot._load_confirmed_candidates: source the CONFIRMED zones the
+    placement queue would otherwise lose when the latest pipeline run
+    doesn't re-detect them."""
+
+    def _make_df_no_break(self, *, base: float = 1908.0) -> pd.DataFrame:
+        # 20 bars, all closing safely above any BUY zone bottom we use
+        # in these tests, and below any SELL zone top.
+        return pd.DataFrame({
+            "open":  [base] * 20,
+            "high":  [base + 1.0] * 20,
+            "low":   [base - 1.0] * 20,
+            "close": [base] * 20,
+        }, index=pd.date_range(
+            end=NOW, periods=20, freq="5min", tz="UTC",
+        ))
+
+    def _make_df_with_post_formation_break_below(
+        self, *, zone_bottom: float, formed_at: datetime,
+    ) -> pd.DataFrame:
+        # 10 pre-formation bars + 10 post-formation bars, where the
+        # last post-formation bar closes below `zone_bottom`.
+        pre_times = pd.date_range(
+            end=formed_at, periods=10, freq="5min", tz="UTC",
+        )
+        post_times = pd.date_range(
+            start=formed_at + pd.Timedelta(minutes=5),
+            periods=10, freq="5min", tz="UTC",
+        )
+        all_times = pre_times.union(post_times)
+        closes = [zone_bottom + 5.0] * 19 + [zone_bottom - 1.0]
+        return pd.DataFrame({
+            "open":  [zone_bottom + 5.0] * 20,
+            "high":  [zone_bottom + 6.0] * 20,
+            "low":   [zone_bottom - 2.0] * 20,
+            "close": closes,
+        }, index=all_times)
+
+    def test_loads_confirmed_zone_not_in_exclude_set(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        b, _ = bot
+        cz = _make_zone_row(direction="BUY", top=1905.0, bottom=1900.0)
+        mock_supabase.get_zones_by_status.return_value = [cz]
+
+        out = b._load_confirmed_candidates(
+            self._make_df_no_break(), exclude_zone_ids=set(),
+        )
+        assert len(out) == 1
+        view, zid = out[0]
+        assert zid == cz.id
+        assert view.direction == "BUY"
+        assert view.top == 1905.0
+
+    def test_excludes_zone_ids_already_in_pipeline_queue(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        b, _ = bot
+        cz = _make_zone_row(direction="BUY", top=1905.0, bottom=1900.0)
+        mock_supabase.get_zones_by_status.return_value = [cz]
+
+        out = b._load_confirmed_candidates(
+            self._make_df_no_break(), exclude_zone_ids={cz.id},
+        )
+        assert out == []
+
+    def test_skips_non_confirmed_status_defensively(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        # Mock returns a CONSUMED row even though we asked for
+        # CONFIRMED (race or test bleed-through). Must NOT process.
+        b, _ = bot
+        cz = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONSUMED", consumed_at=NOW,
+        )
+        mock_supabase.get_zones_by_status.return_value = [cz]
+
+        out = b._load_confirmed_candidates(
+            self._make_df_no_break(), exclude_zone_ids=set(),
+        )
+        assert out == []
+
+    def test_filters_body_broken_since_formation(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        # BUY zone, last post-formation bar closed below zone.bottom →
+        # premise broken, must be excluded.
+        b, _ = bot
+        formed_at = NOW - timedelta(hours=1)
+        cz = _make_zone_row(direction="BUY", top=1905.0, bottom=1900.0)
+        cz = cz.model_copy(update={"formed_at": formed_at})
+        mock_supabase.get_zones_by_status.return_value = [cz]
+
+        df = self._make_df_with_post_formation_break_below(
+            zone_bottom=1900.0, formed_at=formed_at,
+        )
+        out = b._load_confirmed_candidates(df, exclude_zone_ids=set())
+        assert out == []
+
+    def test_supabase_failure_returns_empty(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        b, _ = bot
+        mock_supabase.get_zones_by_status.side_effect = RuntimeError(
+            "supabase down"
+        )
+        out = b._load_confirmed_candidates(
+            self._make_df_no_break(), exclude_zone_ids=set(),
+        )
+        assert out == []
+
+
+class TestDetectNewZonesSeedsFromSupabase:
+    """End-to-end: a CONFIRMED zone alive in Supabase but NOT in the
+    latest pipeline output must still end up in
+    `_pending_pipeline_zones`. This is the actual production bug —
+    pipeline misses a zone for a close, the in-memory queue forgets
+    it, the bot never tries placement when price hits."""
+
+    def test_db_only_confirmed_zone_added_to_pending(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mock_supabase: MagicMock,
+        mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            # Price ABOVE the zone — the per-tick gate will defer
+            # placement (the test isolates the *queue presence*).
+            "bid": 1950.0, "ask": 1950.1, "time": NOW, "time_msc": 0,
+        }
+        # Pipeline produces nothing this close.
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        # But Supabase has a CONFIRMED zone.
+        db_zone = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+        )
+
+        def get_zones_side_effect(statuses: list[str]) -> list[Any]:
+            # The lifecycle scanner queries multiple statuses; the
+            # confirmed-loader queries only ["CONFIRMED"]. Return
+            # the zone for both so neither path empties.
+            if "CONFIRMED" in statuses:
+                return [db_zone]
+            return []
+
+        mock_supabase.get_zones_by_status.side_effect = (
+            get_zones_side_effect
+        )
+
+        b.run_iteration(NOW)
+
+        # The queue includes the DB-sourced zone even though the
+        # pipeline produced no candidates this iteration.
+        assert len(b._pending_pipeline_zones) == 1
+        view, zid = b._pending_pipeline_zones[0]
+        assert zid == db_zone.id
+        assert view.direction == "BUY"
+
+    def test_no_duplicate_when_zone_in_both_pipeline_and_db(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mock_supabase: MagicMock,
+        mocker: MockerFixture,
+    ) -> None:
+        # Pipeline detects a zone, it gets persisted. The same
+        # post-persist row would be in Supabase. The merge must NOT
+        # double-add it to the queue.
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1950.0, "ask": 1950.1, "time": NOW, "time_msc": 0,
+        }
+
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+
+        # Capture the UUID assigned at persistence by patching
+        # log_zone to return a known id, then echo it via
+        # get_zones_by_status so the confirmed-loader sees it.
+        persisted_id = uuid4()
+        mock_supabase.log_zone.return_value = {
+            "id": str(persisted_id),
+            "symbol": "XAUUSD",
+            "direction": zone.direction,
+            "zone_type": "STRONG_POINT",
+            "pattern_type": "RBR",
+            "top": str(zone.top),
+            "bottom": str(zone.bottom),
+            "approach_count": 0,
+            "formed_at": NOW.isoformat(),
+            "status": "CONFIRMED",
+            "created_at": NOW.isoformat(),
+            "updated_at": NOW.isoformat(),
+        }
+        echoed_row = _make_zone_row(
+            direction=zone.direction,
+            top=float(zone.top), bottom=float(zone.bottom),
+        ).model_copy(update={"id": persisted_id})
+
+        def get_zones_side_effect(statuses: list[str]) -> list[Any]:
+            if "CONFIRMED" in statuses:
+                return [echoed_row]
+            return []
+
+        mock_supabase.get_zones_by_status.side_effect = (
+            get_zones_side_effect
+        )
+
+        b.run_iteration(NOW)
+
+        # Pipeline-output zone + DB zone are the same UUID → exactly
+        # one entry in the queue, not two.
+        assert len(b._pending_pipeline_zones) == 1
+
+
+# --------------------------------------------------------------------------- #
 # Price-vs-zone gate (Bug 2 fix) — defer placement when current price
 # hasn't reached the planned Layer 1 entry yet. Applies uniformly to
 # pipeline-detected and flipped zones. The "overshoot past far edge"
