@@ -1399,15 +1399,22 @@ class Bot:
         Returns True iff ``order_manager.place_layered_orders`` reported
         ``PLACED`` (not FAILED, not SKIPPED-via-gap).
         """
-        # 0. Dedup — skip if a CONSUMED/VIOLATED/FLIPPED zone with
-        # overlapping bounds already exists. Re-arming a CONSUMED zone
-        # is explicitly disallowed (design decision Q3). Skipped for
-        # flipped retrades — see ``is_flipped_retrade`` above.
-        if not is_flipped_retrade and self._zone_already_used(zone):
+        # 0. Dedup — skip if a CONFIRMED/ACTIVE/CONSUMED/VIOLATED/FLIPPED
+        # zone with overlapping bounds already exists (within the
+        # freshness window). PR #59 added CONFIRMED + ACTIVE to the
+        # check; previously only the dead-zone statuses blocked, so
+        # the bot could fire multiple setups on the same band when
+        # the pipeline kept re-detecting the same structural zone
+        # across consecutive M5 closes with shifting ``formed_at``.
+        # ``zone_id`` is excluded from the overlap scan so the
+        # candidate doesn't dedup against itself.
+        if not is_flipped_retrade and self._zone_already_used(
+            zone, candidate_zone_id=zone_id,
+        ):
             logger.info(
                 f"new setup skipped: zone {zone.direction} "
                 f"{zone.bottom:.2f}-{zone.top:.2f} overlaps an existing "
-                f"CONSUMED/VIOLATED/FLIPPED zone"
+                f"recent zone"
             )
             return False
 
@@ -1682,8 +1689,13 @@ class Bot:
     # Internals
     # ------------------------------------------------------------------ #
 
-    def _zone_already_used(self, candidate: ValidatedZone) -> bool:
-        """True iff a *recent* CONSUMED/VIOLATED/FLIPPED zone overlaps ``candidate``.
+    def _zone_already_used(
+        self,
+        candidate: ValidatedZone,
+        *,
+        candidate_zone_id: UUID | None = None,
+    ) -> bool:
+        """True iff a *recent* overlapping zone already exists in the DB.
 
         Best-effort: if the lookup fails we let the setup proceed
         (logging the error). Better to occasionally re-trade than to
@@ -1694,10 +1706,23 @@ class Bot:
         in their price band. The same window also gates which zones
         ``_load_confirmed_candidates`` puts in the queue; "if the bot
         can't see it, it can't be locked out by it" is the symmetry.
+
+        PR #59: extends the dedup status set to include CONFIRMED and
+        ACTIVE in addition to the dead-zone statuses (CONSUMED /
+        VIOLATED / FLIPPED). Previously the pipeline could detect the
+        same structural zone on consecutive M5 closes with shifting
+        ``formed_at`` (the impulse_after's end bar moves as new bars
+        accumulate), producing multiple CONFIRMED rows with identical
+        bounds and different UUIDs. Dedup didn't catch them because
+        it only checked dead statuses → the bot fired a fresh setup
+        on every duplicate. Operator-observed: 17 SELL trades on the
+        same 4477-4486 band in 7 hours. ``candidate_zone_id`` is
+        passed so the candidate doesn't dedup against its own row
+        (which is in DB with status CONFIRMED at this point).
         """
         try:
             existing = self.supabase.get_zones_by_status(
-                sorted(SKIP_NEW_SETUP_STATUSES),
+                ["CONFIRMED", "ACTIVE", "CONSUMED", "VIOLATED", "FLIPPED"],
             )
         except Exception:
             logger.exception(
@@ -1721,6 +1746,12 @@ class Bot:
             bottom=float(candidate.bottom),
         )
         for z in existing:
+            # PR #59: self-exclude. The candidate's own zone row is
+            # already persisted (status CONFIRMED) at this point, so
+            # without this check every candidate would dedup against
+            # itself and skip placement.
+            if candidate_zone_id is not None and z.id == candidate_zone_id:
+                continue
             if cutoff is not None and z.created_at < cutoff:
                 continue
             existing_ref = ZoneRef(
