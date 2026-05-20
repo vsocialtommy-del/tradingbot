@@ -314,11 +314,16 @@ class TestMetadata:
 
 
 class TestWickExtension:
-    """``wick_extend_bars`` widens the zone to include border-bar wicks."""
+    """``wick_extend_bars`` widens the zone in the **rejection direction only**.
+
+    PR #60: BUY zones widen ``bottom`` (lower rejection wicks); SELL
+    zones widen ``top`` (upper rejection wicks). The opposite side is
+    the impulse itself, not a rejection wick, and is left at base.
+    """
 
     def test_extend_zero_matches_strict_base(self) -> None:
-        # ``wick_extend_bars=0`` (the pre-PR-#57 default) returns the
-        # base's own wick-inclusive envelope, ignoring border bars.
+        # ``wick_extend_bars=0`` returns the base's own wick-inclusive
+        # envelope, ignoring border bars (in either direction).
         df = make_ohlc(
             opens=[95.0, 100.0, 101.0, 102.0, 105.0],
             closes=[100.0, 101.0, 100.5, 105.0, 110.0],
@@ -337,9 +342,13 @@ class TestWickExtension:
         assert zone.top == 102.0
         assert zone.bottom == 99.0
 
-    def test_extend_one_captures_border_wicks(self) -> None:
-        # Border bars (index 0 and 3) have wicks extending BEYOND the
-        # base's range — those wicks should now be in the zone.
+    def test_buy_extend_one_widens_bottom_only(self) -> None:
+        # BUY (RBR) — bar 0 (impulse_before's last rally bar) has a
+        # low wick at 94, BELOW base.bottom. That's a real rejection
+        # wick: demand defended that level. bar 3 (impulse_after's
+        # first rally bar) has a high wick at 108, ABOVE base.top —
+        # but that's the rally taking off, NOT a rejection wick, so
+        # it must NOT pull ``top`` up.
         df = make_ohlc(
             opens=[95.0, 100.0, 101.0, 102.0, 105.0],
             closes=[100.0, 101.0, 100.5, 105.0, 110.0],
@@ -353,19 +362,46 @@ class TestWickExtension:
             imp_after_indices=(3, 4),
         )
         zone = mark_zone(pattern, df, wick_extend_bars=1)
-        # Now scans bars 0..3: top = max(101, 102, 101.5, 108) = 108
-        # bottom = min(94, 99, 99.5, 101) = 94
-        assert zone.top == 108.0
+        # top stays at base.top (102) — the high wick at 108 on the
+        # impulse_after bar is part of the RALLY, not a rejection.
+        # bottom widens to min(99.0, 94.0) = 94.0 — real rejection wick.
+        assert zone.top == 102.0
         assert zone.bottom == 94.0
 
-    def test_border_wicks_inside_zone_leave_unchanged(self) -> None:
-        # Border bars exist but don't extend past the base's range —
-        # the zone is unchanged from the strict-base result.
+    def test_sell_extend_one_widens_top_only(self) -> None:
+        # SELL (RBD) — bar 3 (impulse_after's first drop bar) has a
+        # high wick at 105, ABOVE base.top. That's a real rejection
+        # wick: supply defended that level. bar 0 (impulse_before's
+        # last rally bar) has a low wick at 94, BELOW base.bottom —
+        # but that's a body of the prior rally, NOT a rejection wick,
+        # so it must NOT pull ``bottom`` down.
+        df = make_ohlc(
+            opens=[95.0, 100.0, 101.0, 100.5, 95.0],
+            closes=[101.0, 101.0, 100.5, 100.0, 90.0],
+            highs=[102.0, 102.0, 101.5, 105.0, 95.0],   # bar 3 wicks UP to 105
+            lows=[94.0, 99.0, 99.5, 99.5, 89.0],         # bar 0 wicks down to 94
+        )
+        pattern = make_pattern(
+            PatternType.RBD, df,
+            imp_before_indices=(0, 0),
+            base_indices=(1, 2),
+            imp_after_indices=(3, 4),
+        )
+        zone = mark_zone(pattern, df, wick_extend_bars=1)
+        # top widens to max(102.0, 105.0) = 105.0 — real rejection wick.
+        # bottom stays at base.bottom (99) — the low wick at 94 is on
+        # the rally-up bar, not a rejection.
+        assert zone.top == 105.0
+        assert zone.bottom == 99.0
+
+    def test_buy_border_wicks_inside_zone_leave_unchanged(self) -> None:
+        # BUY with border bars but no lower wick below base.bottom —
+        # zone is unchanged from strict-base.
         df = make_ohlc(
             opens=[101.0, 100.0, 101.0, 102.0, 105.0],
             closes=[101.5, 101.0, 100.5, 105.0, 110.0],
-            highs=[101.8, 102.0, 101.5, 101.9, 111.0],  # borders <= base.top
-            lows=[100.5, 99.0, 99.5, 99.8, 104.0],       # borders >= base.bottom
+            highs=[101.8, 102.0, 101.5, 101.9, 111.0],
+            lows=[100.5, 99.0, 99.5, 99.8, 104.0],       # all borders >= base.bottom
         )
         pattern = make_pattern(
             PatternType.RBR, df,
@@ -374,17 +410,18 @@ class TestWickExtension:
             imp_after_indices=(3, 4),
         )
         zone = mark_zone(pattern, df, wick_extend_bars=1)
-        # Same as wick_extend_bars=0 — no border wick is outside base bounds.
         assert zone.top == 102.0
         assert zone.bottom == 99.0
 
-    def test_extend_two_captures_further_wicks(self) -> None:
-        # ``wick_extend_bars=2`` reaches one bar further on each side.
+    def test_buy_extend_two_reaches_further_lower_wick(self) -> None:
+        # BUY (RBR), N=2 reaches one bar further on each side. Only
+        # lower wicks matter; the high outlier at bar 4 must be
+        # ignored (it's in impulse_after).
         df = make_ohlc(
             opens=[95.0, 100.0, 101.0, 102.0, 102.5, 105.0],
             closes=[100.0, 101.0, 100.5, 102.5, 105.0, 110.0],
-            highs=[101.0, 102.0, 101.5, 102.8, 115.0, 111.0],  # bar 4 high
-            lows=[94.0, 99.0, 99.5, 101.5, 102.0, 80.0],       # bar 5 low (out of reach for N=2)
+            highs=[101.0, 102.0, 101.5, 102.8, 115.0, 111.0],  # bar 4 high (ignored)
+            lows=[80.0, 99.0, 99.5, 101.5, 102.0, 104.0],       # bar 0 low = 80
         )
         pattern = make_pattern(
             PatternType.RBR, df,
@@ -393,49 +430,51 @@ class TestWickExtension:
             imp_after_indices=(4, 5),
         )
         zone = mark_zone(pattern, df, wick_extend_bars=2)
-        # Scans bars 0..5: top = max(101, 102, 101.5, 102.8, 115, 111) = 115
-        # bottom = min(94, 99, 99.5, 101.5, 102, 80) = 80
-        assert zone.top == 115.0
+        # Scans bars 0..5. top stays at base.top = max(101.5, 102.8) = 102.8.
+        # bottom widens to min(99.5, 101.5, 80, 99, 102, 104) = 80.
+        assert zone.top == 102.8
         assert zone.bottom == 80.0
 
-    def test_extend_clips_to_df_start(self) -> None:
+    def test_buy_extend_clips_to_df_start(self) -> None:
         # Base at the start of df — extension can't walk off the left.
         df = make_ohlc(
             opens=[100.0, 101.0, 105.0],
             closes=[101.0, 100.5, 110.0],
             highs=[102.0, 101.5, 111.0],
-            lows=[99.0, 99.5, 104.0],
+            lows=[99.0, 95.0, 104.0],                    # bar 1 low = 95
         )
         pattern = make_pattern(
             PatternType.RBR, df,
-            imp_before_indices=(0, 0),  # impulse_before = bar 0
+            imp_before_indices=(0, 0),
             base_indices=(0, 1),         # base starts at bar 0
             imp_after_indices=(2, 2),
         )
         zone = mark_zone(pattern, df, wick_extend_bars=1)
-        # ext_start = max(0, 0 - 1) = 0. ext_end = min(2, 1 + 1) = 2.
-        # Scan bars 0..2: top = max(102, 101.5, 111) = 111, bottom = 99.
-        assert zone.top == 111.0
-        assert zone.bottom == 99.0
+        # ext_start = max(0, 0-1) = 0. ext_end = min(2, 1+1) = 2.
+        # BUY: top stays at base.top = max(102, 101.5) = 102.
+        # bottom widens to min(99, 95, 104) = 95.
+        assert zone.top == 102.0
+        assert zone.bottom == 95.0
 
-    def test_extend_clips_to_df_end(self) -> None:
+    def test_sell_extend_clips_to_df_end(self) -> None:
         df = make_ohlc(
-            opens=[95.0, 100.0, 101.0],
-            closes=[100.0, 101.0, 100.5],
-            highs=[101.0, 102.0, 101.5],
-            lows=[94.0, 99.0, 99.5],
+            opens=[105.0, 100.0, 101.0],
+            closes=[100.0, 100.5, 99.5],
+            highs=[106.0, 102.0, 103.0],                 # bar 2 high = 103
+            lows=[99.0, 99.5, 99.0],
         )
         pattern = make_pattern(
-            PatternType.RBR, df,
+            PatternType.RBD, df,
             imp_before_indices=(0, 0),
             base_indices=(1, 2),         # base ends at last bar
             imp_after_indices=(2, 2),
         )
         zone = mark_zone(pattern, df, wick_extend_bars=1)
-        # ext_end clipped to df.len - 1 = 2. ext_start = 0.
-        # Scan bars 0..2: top = max(101, 102, 101.5) = 102, bottom = min = 94.
-        assert zone.top == 102.0
-        assert zone.bottom == 94.0
+        # ext_end clipped to df.len-1 = 2. ext_start = 0.
+        # SELL: top widens to max(102, 103, 106) = 106.
+        # bottom stays at base.bottom = min(99.5, 99) = 99.
+        assert zone.top == 106.0
+        assert zone.bottom == 99.0
 
     def test_negative_extend_raises(self) -> None:
         df = make_ohlc([100.0, 100.0, 105.0])
@@ -447,15 +486,36 @@ class TestWickExtension:
         with pytest.raises(ValueError, match="wick_extend_bars must be >= 0"):
             mark_zone(pattern, df, wick_extend_bars=-1)
 
-    def test_sell_zone_captures_rejection_wick_above_base(self) -> None:
-        # Operator's production case: SELL (RBD). The first bar of
-        # impulse_after has a high wick reaching ABOVE the base's
-        # high — that's the rejection wick that should be in the zone.
+    def test_buy_zone_ignores_upper_border_wick(self) -> None:
+        # Regression for the bug PR #60 fixes: a BUY zone where the
+        # impulse_after's first bar has a tall upper wick (the rally
+        # taking off) must NOT widen the zone top. Pre-PR-#60 the
+        # symmetric extension pulled top up to the rally's peak.
+        df = make_ohlc(
+            opens=[100.0, 100.0, 101.0, 102.0, 105.0],
+            closes=[101.0, 101.0, 100.5, 105.0, 110.0],
+            highs=[101.5, 102.0, 101.5, 120.0, 111.0],   # bar 3 high = 120 (rally peak)
+            lows=[100.0, 99.0, 99.5, 101.0, 104.0],
+        )
+        pattern = make_pattern(
+            PatternType.RBR, df,
+            imp_before_indices=(0, 0),
+            base_indices=(1, 2),
+            imp_after_indices=(3, 4),
+        )
+        zone = mark_zone(pattern, df, wick_extend_bars=1)
+        # Direction-aware: top stays at base.top = 102.0, NOT 120.0.
+        assert zone.top == 102.0
+
+    def test_sell_zone_ignores_lower_border_wick(self) -> None:
+        # Mirror: SELL zone where the impulse_after's first bar has a
+        # deep lower wick (the drop taking off) must NOT widen the
+        # zone bottom.
         df = make_ohlc(
             opens=[95.0, 100.0, 101.0, 100.5, 95.0],
             closes=[101.0, 101.0, 100.5, 100.0, 90.0],
-            highs=[102.0, 102.0, 101.5, 105.0, 95.0],   # bar 3 wicks UP to 105
-            lows=[94.0, 99.0, 99.5, 99.5, 89.0],
+            highs=[102.0, 102.0, 101.5, 100.8, 95.0],
+            lows=[94.0, 99.0, 99.5, 80.0, 89.0],         # bar 3 low = 80 (drop trough)
         )
         pattern = make_pattern(
             PatternType.RBD, df,
@@ -464,9 +524,5 @@ class TestWickExtension:
             imp_after_indices=(3, 4),
         )
         zone = mark_zone(pattern, df, wick_extend_bars=1)
-        # Pre-PR-#57 (strict base): top would be 102.0 (base only).
-        # Post-PR-#57 (extend=1): top is 105.0, including the bar-3 wick.
-        assert zone.top == 105.0
-        # The original SELL setup's entry would now be 105 instead of
-        # 102 — which is what the operator wants (the rejection wick
-        # is part of the institutional defence of the level).
+        # Direction-aware: bottom stays at base.bottom = 99.0, NOT 80.0.
+        assert zone.bottom == 99.0

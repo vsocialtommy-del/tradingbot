@@ -1,4 +1,4 @@
-"""Zone marking — wick-inclusive envelope of the base + border wicks.
+"""Zone marking — wick-inclusive envelope of the base.
 
 Step 1 of zone construction. The remaining steps live in
 :mod:`bot.strategy.zone_refinement` (size filter) and
@@ -8,31 +8,35 @@ Geometry
 --------
 
 For both demand zones (RBR / DBR, BUY) and supply zones (DBD / RBD,
-SELL) the zone is the **wick-inclusive envelope** of the base, with
-optional rejection-wick extension on either side:
+SELL) the zone is the **wick-inclusive envelope of the base candles
+only**:
 
 ::
 
-    ext_start  = max(0, base.start_index - wick_extend_bars)
-    ext_end    = min(n - 1, base.end_index + wick_extend_bars)
-    zone.top    = max(bar.high for bar in df[ext_start : ext_end + 1])
-    zone.bottom = min(bar.low  for bar in df[ext_start : ext_end + 1])
+    zone.top    = max(bar.high for bar in df[base.start : base.end + 1])
+    zone.bottom = min(bar.low  for bar in df[base.start : base.end + 1])
 
-PR #57: ``wick_extend_bars`` defaults to ``1`` via the strategy
-config. Captures the rejection wicks on the last bar of the rally
-(impulse_before) and the first bar of the drop (impulse_after).
-Pre-PR-#57 behaviour was strict base-only (``wick_extend_bars=0``);
-set the config field back to ``0`` to restore it.
+PR #60: strict base-only by default. PR #57 had tried to widen the
+zone into bordering impulse bars to catch rejection wicks, but its
+symmetric extension swept in the rally's peak (for BUY) or the drop's
+trough (for SELL) — inflating zone width by tens of points.
+
+``mark_zone`` keeps an opt-in ``wick_extend_bars`` kwarg. When > 0
+the extension is **direction-aware**:
+
+* BUY (demand) — only widens ``bottom`` (lower rejection wicks).
+* SELL (supply) — only widens ``top`` (upper rejection wicks).
+
+The opposite side stays at base. Production uses ``0`` (the
+:class:`StrategyPipelineConfig` default).
 
 Pre-PR (body-only) history
 --------------------------
 Earlier versions (pre-loosened S&D) marked the zone from candle
 bodies only (``max(open, close)`` / ``min(open, close)``), excluding
-wicks. Then we moved to wick-inclusive over the base. PR #57 widens
-to wick-inclusive over the base plus border bars. Downstream Strong
-Point validation still uses body closes for breaks and the SL buffer
-is independent of zone width, so SL placement adjusts by exactly
-the amount the zone widened.
+wicks. We then moved to wick-inclusive over the base, which is the
+current default. Downstream Strong Point validation uses body closes
+for breaks and the SL buffer is independent of zone width.
 """
 
 from __future__ import annotations
@@ -75,30 +79,28 @@ def mark_zone(
     the zone reports the base's own wick extremes (``base.top`` /
     ``base.bottom``).
 
-    PR #57: when ``wick_extend_bars > 0``, the zone's top/bottom are
-    widened to include the highs/lows of ``N`` bars on each side of
-    the base's index range. The motivation:
+    PR #60: when ``wick_extend_bars > 0``, the zone is widened only
+    in the **rejection direction**:
 
-    The base-detection algorithm picks a tightly-clustered 1-5 bar
-    window as "the base", and the immediate border bars (last bar
-    of impulse_before, first bar of impulse_after) often have
-    rejection wicks that extend past the base's wick range — they're
-    where institutional supply/demand defended the level before the
-    move started or finished. Strict base-only marking excludes them
-    and the resulting zone is too narrow relative to what manual
-    traders draw and the market actually respects. Operator-observed:
-    bot's zones consistently $5-10 narrower on top for SELL zones
-    because the highest rejection wick was on the first drop bar,
-    classified as impulse_after rather than base.
+    * BUY (demand): scan lows in the window; ``bottom`` may move
+      down. ``top`` is left at ``base.top``.
+    * SELL (supply): scan highs in the window; ``top`` may move up.
+      ``bottom`` is left at ``base.bottom``.
 
-    The default in :class:`StrategyPipelineConfig` is now ``1`` —
-    capture immediate border bars. ``0`` restores the strict
-    base-only behaviour. ``2+`` is more aggressive (catches
-    multi-bar rejection sequences).
+    Why direction-aware: a BUY zone's rejection wicks are the *lower*
+    wicks below the base (price tried to fall, demand defended).
+    *Upper* wicks on the border bars are the rally itself — including
+    them pulls ``top`` up to the rally's peak, not a real rejection.
+    The reverse holds for SELL. PR #57 widened symmetrically and
+    over-extended both sides; PR #60 fixes that.
+
+    The default in :class:`StrategyPipelineConfig` is ``1`` — capture
+    the immediate border bar. ``0`` restores strict base-only
+    behaviour. ``2+`` catches multi-bar rejection sequences.
 
     Pattern detection, base validation, lifecycle, SL distance buffer,
-    TP chain, dedup, and freshness are all unaffected — only the
-    zone's reported top/bottom widen.
+    TP chain, dedup, and freshness are all unaffected — only one side
+    of the zone widens, in the rejection direction.
     """
     for col in ("open", "high", "low", "close"):
         if col not in df.columns:
@@ -126,18 +128,19 @@ def mark_zone(
     bottom = base.bottom
     if wick_extend_bars > 0:
         # Scan ``wick_extend_bars`` bars on each side of the base for
-        # higher highs / lower lows. Clip to df bounds so we don't
-        # walk off the start/end of the OHLC window. Border bars that
-        # don't extend the zone (their high <= top, their low >=
-        # bottom) leave the zone unchanged; only genuine rejection
-        # wicks widen it.
+        # rejection wicks. Clip to df bounds so we don't walk off the
+        # start/end of the OHLC window. Direction-aware: BUY zones
+        # only widen ``bottom`` (lower rejection wicks); SELL zones
+        # only widen ``top`` (upper rejection wicks).
         ext_start = max(0, base.start_index - wick_extend_bars)
         ext_end = min(n - 1, base.end_index + wick_extend_bars)
         if ext_start < base.start_index or ext_end > base.end_index:
-            window_highs = df["high"].iloc[ext_start : ext_end + 1]
-            window_lows = df["low"].iloc[ext_start : ext_end + 1]
-            top = float(max(top, window_highs.max()))
-            bottom = float(min(bottom, window_lows.min()))
+            if pattern.direction == "BUY":
+                window_lows = df["low"].iloc[ext_start : ext_end + 1]
+                bottom = float(min(bottom, window_lows.min()))
+            else:
+                window_highs = df["high"].iloc[ext_start : ext_end + 1]
+                top = float(max(top, window_highs.max()))
 
     zone = Zone(
         direction=pattern.direction,
