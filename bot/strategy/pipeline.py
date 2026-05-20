@@ -93,29 +93,26 @@ class StrategyPipelineConfig:
     # this field directly.
     tp1_local_peak_lookback_bars: int = 50
 
-    # PR #56: zone freshness window (single knob, used in TWO places).
+    # PR #56 (partial): zone freshness window for the dedup pre-flight.
     #
-    # 1. ``Bot._load_confirmed_candidates`` only loads zones whose
-    #    ``created_at`` is within the last ``zone_freshness_hours``.
-    #    Older zones are invisible to the bot — won't be loaded into
-    #    the placement queue, won't be traded.
+    # ``Bot._zone_already_used`` only blocks new setups on overlapping
+    # CONSUMED / VIOLATED / FLIPPED zones whose ``created_at`` is
+    # within the last ``zone_freshness_hours``. Older "burnt" zones
+    # don't block fresh patterns.
     #
-    # 2. ``Bot._zone_already_used`` (dedup pre-flight) only blocks new
-    #    setups on overlapping CONSUMED/VIOLATED/FLIPPED zones whose
-    #    ``created_at`` is within the same window. Older "burnt"
-    #    zones don't block fresh patterns.
+    # Solves the production graveyard problem (87 dead zones
+    # accumulated over 8 days blocking every fresh pattern in a
+    # 250-point band) without permanently turning off dedup. The
+    # 6-hour default treats "more than one session ago" as ancient
+    # history.
     #
-    # Symmetric by design: if the bot can't see it, it can't be locked
-    # out by it either. Solves the production graveyard problem
-    # (87 dead zones accumulated over 8 days blocking every fresh
-    # pattern in a 250-point band) without permanently turning off
-    # dedup. The 6-hour default treats "more than one session ago"
-    # as ancient history — the market has had time to develop fresh
-    # structure since then.
+    # PR #56's loader half (``_load_confirmed_candidates`` freshness)
+    # was removed when PR #55 was reverted — the bot is back to
+    # acting on pipeline-fresh detections only.
     #
     # Tunable: smaller = more aggressive re-engagement; larger = more
-    # respect for recent dead zones. Set to 0 to disable both filters
-    # entirely (restores the pre-PR-#56 "any age" behaviour).
+    # respect for recent dead zones. Set to 0 to disable (restores
+    # the pre-PR-#56 "any age" behaviour).
     zone_freshness_hours: float = 6.0
 
     # PR #60: zone is strict wick-to-wick of the base candles only.
