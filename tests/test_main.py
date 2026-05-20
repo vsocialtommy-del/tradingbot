@@ -1163,6 +1163,172 @@ class TestZoneLifecycleLoop:
 # --------------------------------------------------------------------------- #
 
 
+class TestFlippedZoneConsumption:
+    """PR #58: FLIPPED zones get consumed by a wick into them.
+
+    Before this PR, the lifecycle scanner only ran the consumption
+    check on CONFIRMED and ACTIVE zones. A wick into a FLIPPED zone
+    left the zone in FLIPPED status indefinitely — the dashboard
+    kept advertising it and the placement queue kept trying to fire
+    on a zone whose institutional liquidity had already been
+    triggered by the first touch.
+
+    The fix uses ``flipped_direction`` (not the original
+    ``direction``) as the effective retest direction for the
+    consumption check.
+    """
+
+    def _make_df_with_wick(
+        self, *, last_high: float, last_low: float,
+    ) -> pd.DataFrame:
+        last_time = "2026-05-08T12:00:00Z"
+        times = pd.date_range(
+            end=last_time, periods=30, freq="5min", tz="UTC",
+        )
+        opens = [1910.0] * 30
+        highs = [1911.0] * 30
+        lows = [1909.0] * 30
+        closes = [1910.0] * 30
+        highs[-1] = last_high
+        lows[-1] = last_low
+        return pd.DataFrame(
+            {"open": opens, "high": highs, "low": lows, "close": closes,
+             "volume": [100] * 30},
+            index=times,
+        )
+
+    def test_wick_into_flipped_buy_zone_consumes(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Originally SELL zone, now FLIPPED → BUY. Retest happens
+        # from ABOVE coming down to zone.top. A low wick into the
+        # zone consumes it.
+        b, mgrs = bot
+        b.state.last_config_refresh = NOW
+
+        flipped = _make_zone_row(
+            direction="SELL",                  # original
+            status="FLIPPED",
+            flipped_direction="BUY",           # effective
+            flipped_at=NOW - timedelta(hours=1),
+            top=1905.0, bottom=1900.0,
+        )
+        mock_supabase.get_zones_by_status.return_value = [flipped]
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+
+        # Last bar wicks DOWN to 1902 — inside the zone from above
+        # (which is how a BUY retest tests a demand zone).
+        df = self._make_df_with_wick(last_high=1911.0, last_low=1902.0)
+        mgrs["ohlc_provider"].get.return_value = df
+
+        b.run_iteration(NOW)
+
+        consumed_calls = [
+            c for c in mock_supabase.update_zone_status.call_args_list
+            if c.args[1] == "CONSUMED"
+        ]
+        assert len(consumed_calls) == 1
+        assert consumed_calls[0].args[0] == flipped.id
+
+    def test_wick_into_flipped_sell_zone_consumes(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Originally BUY zone, now FLIPPED → SELL. Retest from BELOW
+        # rising to zone.bottom. A high wick into the zone consumes
+        # it. This is exactly the operator's production scenario
+        # (zone 951b5451 in the chat log).
+        b, mgrs = bot
+        b.state.last_config_refresh = NOW
+
+        flipped = _make_zone_row(
+            direction="BUY",
+            status="FLIPPED",
+            flipped_direction="SELL",
+            flipped_at=NOW - timedelta(hours=1),
+            top=1905.0, bottom=1900.0,
+        )
+        mock_supabase.get_zones_by_status.return_value = [flipped]
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+
+        # Last bar wicks UP to 1903 — inside the zone from below.
+        df = self._make_df_with_wick(last_high=1903.0, last_low=1899.0)
+        mgrs["ohlc_provider"].get.return_value = df
+
+        b.run_iteration(NOW)
+
+        consumed_calls = [
+            c for c in mock_supabase.update_zone_status.call_args_list
+            if c.args[1] == "CONSUMED"
+        ]
+        assert len(consumed_calls) == 1
+        assert consumed_calls[0].args[0] == flipped.id
+
+    def test_flipped_zone_no_wick_no_consumption(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, mgrs = bot
+        b.state.last_config_refresh = NOW
+
+        flipped = _make_zone_row(
+            direction="BUY",
+            status="FLIPPED",
+            flipped_direction="SELL",
+            flipped_at=NOW - timedelta(hours=1),
+            top=1905.0, bottom=1900.0,
+        )
+        mock_supabase.get_zones_by_status.return_value = [flipped]
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+
+        # Last bar high=1899 — below zone.bottom, no wick into zone.
+        df = self._make_df_with_wick(last_high=1899.0, last_low=1898.0)
+        mgrs["ohlc_provider"].get.return_value = df
+
+        b.run_iteration(NOW)
+
+        consumed_calls = [
+            c for c in mock_supabase.update_zone_status.call_args_list
+            if c.args[1] == "CONSUMED"
+        ]
+        assert len(consumed_calls) == 0
+
+    def test_flipped_without_flipped_direction_skipped(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        # Malformed row (DB CHECK should prevent this, but be
+        # defensive). No flipped_direction means we can't determine
+        # the effective retest side, so we skip without crashing.
+        b, mgrs = bot
+        b.state.last_config_refresh = NOW
+
+        bad = _make_zone_row(
+            direction="BUY",
+            status="FLIPPED",
+            flipped_direction=None,            # ← malformed
+            flipped_at=NOW - timedelta(hours=1),
+            top=1905.0, bottom=1900.0,
+        )
+        mock_supabase.get_zones_by_status.return_value = [bad]
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+
+        df = self._make_df_with_wick(last_high=1903.0, last_low=1899.0)
+        mgrs["ohlc_provider"].get.return_value = df
+
+        b.run_iteration(NOW)
+
+        # No transition; no crash.
+        mock_supabase.update_zone_status.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Dedup pre-flight — _try_place_setup skips when a zone with overlapping
+# bounds is already CONSUMED/VIOLATED/FLIPPED.
+# --------------------------------------------------------------------------- #
+
+
 class TestDedupSkip:
     def test_skip_when_consumed_zone_overlaps(
         self, bot: tuple[Bot, dict[str, MagicMock]],
