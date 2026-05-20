@@ -200,6 +200,47 @@ class TestUpdateZoneStatus:
         assert payload["status"] == "VIOLATED"
         assert "violated_at" in payload
         assert "consumed_at" not in payload
+        # CHECK constraint: VIOLATED rows must have flipped_at IS NULL.
+        # Even when there's no prior flip, the payload sends an explicit
+        # NULL to be safe — harmless on a row that already has it NULL.
+        assert "flipped_at" in payload
+        assert payload["flipped_at"] is None
+
+    def test_to_violated_clears_prior_flipped_at(self) -> None:
+        # Production regression (May 2026): a zone that went
+        # FLIPPED → ACTIVE → CONSUMED retains ``flipped_at`` as an
+        # audit marker (migration 010). On the CONSUMED → VIOLATED
+        # transition the CHECK constraint
+        # ``status='VIOLATED' AND flipped_at IS NULL`` rejected the row
+        # because ``update_zone_status`` only set ``violated_at`` and
+        # left the existing ``flipped_at`` populated. The fix sends an
+        # explicit NULL for ``flipped_at`` on every VIOLATED update.
+        logger, client = _make_logger_with_mock_client()
+        zone_id = uuid4()
+        returned = {
+            "id": str(zone_id),
+            "symbol": "XAUUSD", "direction": "SELL",
+            "zone_type": "STRONG_POINT", "pattern_type": "DBD",
+            "top": "4546.42", "bottom": "4535.67", "approach_count": 0,
+            "formed_at": NOW.isoformat(),
+            "status": "VIOLATED",
+            "consumed_at": NOW.isoformat(),
+            "violated_at": NOW.isoformat(),
+            "flipped_direction": "BUY",  # historical, allowed to persist
+            "created_at": NOW.isoformat(), "updated_at": NOW.isoformat(),
+        }
+        update = _stub_table_update(client, returned)
+
+        logger.update_zone_status(zone_id, "VIOLATED")
+
+        payload = update.call_args.args[0]
+        # Explicit NULL — postgrest sets the column to NULL, satisfying
+        # the CHECK.
+        assert payload["flipped_at"] is None
+        # flipped_direction is NOT cleared — migration 008 explicitly
+        # allows it on any status, and the operator/analytics may want
+        # to see "this zone was once flipped" on the violated row.
+        assert "flipped_direction" not in payload
 
     def test_to_flipped_requires_direction_and_stamps_all(self) -> None:
         logger, client = _make_logger_with_mock_client()
