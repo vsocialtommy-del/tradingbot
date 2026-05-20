@@ -443,10 +443,21 @@ class SupabaseLogger:
         """
         now = datetime.now(tz=timezone.utc)
         fields: dict[str, Any] = {"status": status}
+        # CHECK constraint (migration 010) requires
+        # ``status='VIOLATED' AND flipped_at IS NULL``. A zone that
+        # came via FLIPPED → ACTIVE → CONSUMED retains ``flipped_at``
+        # as an audit marker (legal under the relaxed CHECK for those
+        # statuses). When that zone moves to VIOLATED we must
+        # explicitly clear ``flipped_at`` or the CHECK fails. The
+        # serializer drops ``None`` values so we set the explicit
+        # null on the payload after serialization. ``flipped_direction``
+        # may persist on any status (migration 008), so we leave it.
+        clear_flipped_at = False
         if status == "CONSUMED":
             fields["consumed_at"] = now
         elif status == "VIOLATED":
             fields["violated_at"] = now
+            clear_flipped_at = True
         elif status == "FLIPPED":
             if flipped_direction is None:
                 raise ValueError(
@@ -460,6 +471,8 @@ class SupabaseLogger:
         # row stay as historical markers — migration 010 makes that
         # legal under the CHECK.
         payload = _serialize_update_payload(fields)
+        if clear_flipped_at:
+            payload["flipped_at"] = None
         result = (
             self._client.table("zones")
             .update(payload)
