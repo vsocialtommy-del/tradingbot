@@ -213,19 +213,21 @@ class PatternConfig:
     """
 
     # Impulse strength
-    impulse_body_to_range_ratio_min: float = 0.0
-    """Body / total_range threshold. PR #46: defaulted to 0.0
-    (disabled) — the previous 0.6 default rejected visually-clean
-    zones with wick-heavy impulse candles. The ATR multiple below
-    is the surviving "is this a meaningful move" guard. Operators
-    can re-enable by setting an explicit non-zero value."""
-    impulse_atr_multiple_min: float = 0.7
-    """Body ≥ 0.7 × ATR(14). Loosened from 1.0 (PR #44) to catch
-    zones where impulses are roughly ATR-sized rather than strictly
-    above. The pre-PR-44 1.0 default rejected real zones the user
-    trades manually (e.g. the 4685-4691 DBR with ~$3-4 impulse
-    bodies against ATR≈$4). After PR #46 this is the sole impulse-
-    strength gate (the body/range ratio is disabled by default)."""
+    impulse_body_to_range_ratio_min: float = 0.6
+    """Body / total_range threshold. PR #64 restored the strict 0.6
+    default (PR #46 had disabled it at 0.0). The 0.0 setting let
+    wick-dominated bars qualify as impulses, which combined with the
+    relaxed ATR multiple let "DBD" patterns mark inside continuous
+    impulse legs — no real base, just a trending wick-heavy sequence.
+    Operators who want PR #46's loose behaviour can set 0.0 explicitly."""
+    impulse_atr_multiple_min: float = 1.0
+    """Body ≥ 1.0 × ATR(14). PR #64 restored the strict 1.0 default
+    (PR #44 had loosened to 0.7). The 0.7 setting accepted small-range
+    bars in low-volatility periods as "impulses," producing patterns
+    where the impulse_before and impulse_after were barely-bigger
+    than the base they were supposed to be enclosing. Operators
+    targeting tight pre-PR-44 calibration can stay at 1.0; those
+    needing more signals can lower toward 0.7 (PR #44's choice)."""
     atr_period: int = 14
     max_impulse_run_candles: int = 5
     """Cap on consecutive strong same-direction candles in one impulse."""
@@ -233,12 +235,15 @@ class PatternConfig:
     # Base shape
     min_base_candles: int = 1
     max_base_candles: int = 5
-    base_range_to_impulse_ratio_max: float = 1.0
+    base_range_to_impulse_ratio_max: float = 0.6
     """Total base range ≤ this × mean(impulse_before.range,
-    impulse_after.range). Loosened from 0.6 (PR #44) to allow bases
-    that span roughly as wide as the surrounding impulses — that
-    captures real zones the visual eye reads as tight even when the
-    strict 0.6 ratio rejects them."""
+    impulse_after.range). PR #64 restored the strict 0.6 default
+    (PR #44 had loosened to 1.0). The 1.0 setting allowed bases as
+    wide as the impulses around them — which by definition isn't a
+    base anymore, it's another impulse-class bar sequence. The 0.6
+    default enforces the "tight consolidation" S&D premise. Operators
+    can loosen back to 1.0 to catch wider-base setups, at the cost
+    of false-positive "DBDs" in continuous trends."""
     base_max_body_to_impulse_body_ratio: float = 0.4
     """No single base body ≥ this × largest impulse body. Unchanged
     — this guards against a 'mini-impulse' candle inside the base."""

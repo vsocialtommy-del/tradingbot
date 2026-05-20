@@ -323,11 +323,10 @@ class TestDetectBases:
         assert len(impulses) == 2
         assert detect_bases(df, impulses) == []
 
-    def test_base_within_loosened_ratio_accepted(self) -> None:
-        # PR #44 loosened ``base_range_to_impulse_ratio_max`` 0.6 → 1.0.
-        # The same shape that used to fail (base range 4.0 vs impulse
-        # range 5.0 — ratio 0.8) now passes. The strict-mode rejection
-        # is preserved in :class:`TestStrictModeBaseline` below.
+    def test_base_within_loose_ratio_only_accepted_with_loose_config(self) -> None:
+        # PR #64 restored the strict 0.6 default. Same shape (base
+        # range 4.0 vs impulse range 5.0 — ratio 0.8) is rejected by
+        # default. Loose 1.0 still works as an opt-in.
         opens, highs, lows, closes = quiet_prelude(100.0)
         o, h, l, c = make_strong_bar("RALLY", 100.0, body=5.0)
         opens.append(o); highs.append(h); lows.append(l); closes.append(c)
@@ -337,9 +336,16 @@ class TestDetectBases:
         o, h, l, c = make_strong_bar("RALLY", 109.0, body=5.0)
         opens.append(o); highs.append(h); lows.append(l); closes.append(c)
         df = make_ohlc(opens, highs, lows, closes)
+        # Default config (strict) rejects.
         impulses = detect_impulses(df)
-        bases = detect_bases(df, impulses)
-        assert len(bases) == 1
+        assert detect_bases(df, impulses) == []
+        # Explicit loose config accepts.
+        loose = PatternConfig(
+            impulse_body_to_range_ratio_min=0.0,
+            impulse_atr_multiple_min=0.7,
+            base_range_to_impulse_ratio_max=1.0,
+        )
+        assert len(detect_bases(df, detect_impulses(df, loose), loose)) == 1
 
     # Note: the "big body in base" criterion is hard to test in
     # isolation because a base bar with body ≥ 0.4× the impulse body
@@ -511,19 +517,17 @@ class TestLargeDataframe:
 class TestPatternConfigDefaults:
     def test_defaults(self) -> None:
         c = PatternConfig()
-        # PR #46 disabled the body/range filter (was 0.6). The 0.6
-        # strict mode is preserved in ``TestStrictModeBaseline``.
-        assert c.impulse_body_to_range_ratio_min == 0.0
-        # PR #44 loosened from 1.0 → 0.7. The strict mode is
-        # preserved as a regression baseline in
-        # ``TestStrictModeBaseline``.
-        assert c.impulse_atr_multiple_min == 0.7
+        # PR #64 restored strict defaults (was 0.0 under PR #46).
+        # The strict mode is also exercised by ``TestStrictModeBaseline``.
+        assert c.impulse_body_to_range_ratio_min == 0.6
+        # PR #64 restored strict (was 0.7 under PR #44).
+        assert c.impulse_atr_multiple_min == 1.0
         assert c.atr_period == 14
         assert c.max_impulse_run_candles == 5
         assert c.min_base_candles == 1
         assert c.max_base_candles == 5
-        # PR #44 loosened from 0.6 → 1.0.
-        assert c.base_range_to_impulse_ratio_max == 1.0
+        # PR #64 restored strict (was 1.0 under PR #44).
+        assert c.base_range_to_impulse_ratio_max == 0.6
         assert c.base_max_body_to_impulse_body_ratio == 0.4
         assert c.lookback_bars == 50
 
@@ -635,26 +639,30 @@ class TestUserMissedZoneRegression:
         highs.append(100.5); lows.append(96.6)
         return make_ohlc(opens, highs, lows, closes)
 
-    def test_dbr_with_loosened_base_ratio_detected(self) -> None:
-        # With the new PR-44 defaults (base ratio cap 1.0), the
-        # base/impulse ratio of ~0.72 passes and detect_patterns
-        # returns the DBR.
+    def test_dbr_with_loose_base_ratio_only_detected_with_loose_config(self) -> None:
+        # PR #64 restored the strict 0.6 base-ratio default — the
+        # 0.72 ratio in this fixture is rejected. Operators can still
+        # opt into the loose mode explicitly with a custom config.
         df = self._build_user_zone_df()
-        patterns = detect_patterns(df)
+        loose = PatternConfig(
+            impulse_body_to_range_ratio_min=0.0,
+            impulse_atr_multiple_min=0.7,
+            base_range_to_impulse_ratio_max=1.0,
+        )
+        patterns = detect_patterns(df, loose)
         dbrs = [p for p in patterns if p.pattern_type == PatternType.DBR]
         assert dbrs, (
-            "user-missed-zone regression: expected at least one DBR, "
-            f"got patterns={[p.pattern_type.value for p in patterns]}"
+            "loose-config opt-in: expected at least one DBR under "
+            "explicit loose config, got patterns="
+            f"{[p.pattern_type.value for p in patterns]}"
         )
         assert all(p.direction == "BUY" for p in dbrs)
 
-    def test_strict_mode_rejects_same_shape(self) -> None:
-        # Inverse: with the pre-PR-44 strict defaults the ratio 0.72
-        # fails the 0.6 cap → no base → no pattern. Confirms the
-        # loose defaults are doing real work, not just matching
-        # pre-existing behaviour.
+    def test_default_strict_mode_rejects_same_shape(self) -> None:
+        # PR #64: default config IS strict. The ratio 0.72 fails the
+        # 0.6 cap → no base → no pattern.
         df = self._build_user_zone_df()
-        patterns = detect_patterns(df, _STRICT)
+        patterns = detect_patterns(df)
         dbrs = [p for p in patterns if p.pattern_type == PatternType.DBR]
         assert dbrs == []
 
@@ -702,24 +710,29 @@ class TestUserMissedZoneBodyRatio:
         highs.append(103.2); lows.append(99.8)
         return make_ohlc(opens, highs, lows, closes)
 
-    def test_rbd_with_wick_heavy_rally_detected(self) -> None:
-        # With the PR-46 default (body/range = 0.0), the wick-heavy
-        # rally bar qualifies as an impulse and detect_patterns
-        # returns the RBD.
+    def test_rbd_with_wick_heavy_rally_only_detected_with_loose_config(self) -> None:
+        # PR #64 restored the strict 0.6 body/range default — the
+        # wick-heavy rally is rejected. Operators can still opt into
+        # the loose body/range filter explicitly.
         df = self._build_wick_heavy_rbd_df()
-        patterns = detect_patterns(df)
+        loose = PatternConfig(
+            impulse_body_to_range_ratio_min=0.0,
+            impulse_atr_multiple_min=0.7,
+            base_range_to_impulse_ratio_max=1.0,
+        )
+        patterns = detect_patterns(df, loose)
         rbds = [p for p in patterns if p.pattern_type == PatternType.RBD]
         assert rbds, (
-            "PR #46 regression: expected at least one RBD, "
-            f"got patterns={[p.pattern_type.value for p in patterns]}"
+            "loose-config opt-in: expected at least one RBD under "
+            "explicit loose config, got patterns="
+            f"{[p.pattern_type.value for p in patterns]}"
         )
         assert all(p.direction == "SELL" for p in rbds)
 
-    def test_strict_mode_rejects_wick_heavy_rally(self) -> None:
-        # Inverse: pre-PR-46 strict 0.6 rejects the wick-heavy rally
-        # → no impulse_before → no pattern. Confirms PR #46 is doing
-        # real work.
+    def test_default_strict_mode_rejects_wick_heavy_rally(self) -> None:
+        # PR #64: default config IS strict. The wick-heavy rally
+        # fails the 0.6 body/range cap → no impulse_before → no pattern.
         df = self._build_wick_heavy_rbd_df()
-        patterns = detect_patterns(df, _STRICT)
+        patterns = detect_patterns(df)
         rbds = [p for p in patterns if p.pattern_type == PatternType.RBD]
         assert rbds == []

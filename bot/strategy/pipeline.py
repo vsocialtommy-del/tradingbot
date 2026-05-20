@@ -64,19 +64,46 @@ from bot.strategy.zone_refinement import (
 class StrategyPipelineConfig:
     """Aggregate of all per-stage tunables. Defaults mirror per-module defaults."""
 
-    # Pattern detection (S&D). Three defaults loosened across PR #44
-    # (impulse_atr_multiple_min, base_range_to_impulse_ratio_max) and
-    # PR #46 (impulse_body_to_range_ratio_min) to catch zones the
-    # strict thresholds rejected; see
-    # ``bot.strategy.pattern_detection.PatternConfig`` for the full
-    # rationale + the TestStrictModeBaseline regression class.
-    impulse_body_to_range_ratio_min: float = 0.0  # PR #46: 0.6 → 0.0
-    impulse_atr_multiple_min: float = 0.7  # PR #44: 1.0 → 0.7
+    # Pattern detection (S&D). Strict thresholds — reverted from
+    # PR #44 (impulse_atr_multiple_min, base_range_to_impulse_ratio_max)
+    # and PR #46 (impulse_body_to_range_ratio_min) by PR #64.
+    #
+    # Why the revert: PR #44/#46 loosened detection to catch zones
+    # the strict thresholds rejected. In production this turned out
+    # to mark "DBDs" inside continuous impulse legs — no real base,
+    # just a 1-3 bar hesitation in a trend. Operator's chart review
+    # confirmed: no visible base where the bot was marking zones.
+    # These junk patterns were briefly masked by the pipeline's natural
+    # re-detection filter (pre-PR-#55), then exposed by PR #55's DB
+    # loader; PR #63 reverted PR #55, but the underlying detection
+    # is still producing junk that the lifecycle scanner then
+    # flips into tradeable BUY/SELL signals.
+    #
+    # Strict-mode defaults restored here:
+    #   * impulse_body_to_range_ratio_min = 0.6
+    #     Impulse candle bodies must cover ≥60% of the bar range.
+    #     Filters out wick-dominated bars (pin bars / dojis) that
+    #     the loose detection happily counted as impulse.
+    #   * impulse_atr_multiple_min = 1.0
+    #     Impulse range must be ≥1× ATR(14). Filters out small-range
+    #     bars in low-volatility periods.
+    #   * base_range_to_impulse_ratio_max = 0.6
+    #     Base range must be ≤60% of the impulse range. Enforces the
+    #     "tight consolidation" S&D premise; loose 1.0 allowed bases
+    #     as wide as the impulse, which isn't a base — it's another
+    #     impulse-class candle.
+    #
+    # Trade-off: 3-5× fewer signals than the loose mode. The
+    # ``TestStrictModeBaseline`` regression class in
+    # ``bot.strategy.pattern_detection`` captures the strict
+    # behaviour these defaults restore.
+    impulse_body_to_range_ratio_min: float = 0.6  # PR #64: 0.0 → 0.6
+    impulse_atr_multiple_min: float = 1.0  # PR #64: 0.7 → 1.0
     atr_period: int = 14
     max_impulse_run_candles: int = 5
     min_base_candles: int = 1
     max_base_candles: int = 5
-    base_range_to_impulse_ratio_max: float = 1.0  # PR #44: 0.6 → 1.0
+    base_range_to_impulse_ratio_max: float = 0.6  # PR #64: 1.0 → 0.6
     base_max_body_to_impulse_body_ratio: float = 0.4
     pattern_lookback_bars: int = 50
 
