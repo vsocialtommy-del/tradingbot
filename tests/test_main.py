@@ -2655,6 +2655,122 @@ class TestDedupFreshness:
         assert b._zone_already_used(candidate) is True
 
 
+class TestDedupAgainstConfirmedActive:
+    """PR #59: dedup also blocks against overlapping CONFIRMED / ACTIVE
+    zones (not just CONSUMED / VIOLATED / FLIPPED). Prevents the bot
+    from firing duplicate setups when the pipeline re-detects the same
+    structural zone across consecutive M5 closes with shifting
+    formed_at."""
+
+    def test_recent_confirmed_overlap_blocks(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        # Earlier-fired CONFIRMED setup with same bounds → must block
+        # a fresh candidate at those bounds.
+        b, _ = bot
+        existing = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONFIRMED", created_at=_hours_ago(1),
+        )
+        mock_supabase.get_zones_by_status.return_value = [existing]
+
+        candidate = _make_validated_for_persistence(_PT.RBR)
+        assert b._zone_already_used(candidate) is True
+
+    def test_recent_active_overlap_blocks(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        b, _ = bot
+        existing = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="ACTIVE", created_at=_hours_ago(1),
+        )
+        mock_supabase.get_zones_by_status.return_value = [existing]
+
+        candidate = _make_validated_for_persistence(_PT.RBR)
+        assert b._zone_already_used(candidate) is True
+
+    def test_old_confirmed_overlap_does_not_block(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        # Freshness window still applies — a CONFIRMED zone older
+        # than the window doesn't block.
+        b, _ = bot
+        ancient = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONFIRMED", created_at=_hours_ago(48),
+        )
+        mock_supabase.get_zones_by_status.return_value = [ancient]
+
+        candidate = _make_validated_for_persistence(_PT.RBR)
+        assert b._zone_already_used(candidate) is False
+
+    def test_candidate_does_not_dedup_against_self(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        # The candidate's own row is in Supabase as CONFIRMED at this
+        # point (persisted by ``_persist_zone_if_new`` before
+        # placement). Without self-exclusion, the candidate would
+        # block itself.
+        b, _ = bot
+        own_row = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONFIRMED", created_at=_hours_ago(0),
+        )
+        mock_supabase.get_zones_by_status.return_value = [own_row]
+
+        candidate = _make_validated_for_persistence(_PT.RBR)
+        assert b._zone_already_used(
+            candidate, candidate_zone_id=own_row.id,
+        ) is False
+
+    def test_self_excluded_but_other_overlap_still_blocks(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        # Own row + a sibling row with same bounds. Self-exclude the
+        # own, but the sibling still triggers dedup.
+        b, _ = bot
+        own_row = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONFIRMED", created_at=_hours_ago(0),
+        )
+        sibling = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONFIRMED", created_at=_hours_ago(1),
+        )
+        mock_supabase.get_zones_by_status.return_value = [own_row, sibling]
+
+        candidate = _make_validated_for_persistence(_PT.RBR)
+        # This is the production scenario: pipeline re-detects same
+        # bounds with shifting formed_at, sibling row exists from a
+        # prior detection that already fired a setup.
+        assert b._zone_already_used(
+            candidate, candidate_zone_id=own_row.id,
+        ) is True
+
+    def test_status_set_passed_to_supabase_includes_confirmed_active(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        # The query must include CONFIRMED and ACTIVE alongside the
+        # dead statuses, otherwise PR #59's whole point is missed.
+        b, _ = bot
+        mock_supabase.get_zones_by_status.return_value = []
+        candidate = _make_validated_for_persistence(_PT.RBR)
+        b._zone_already_used(candidate)
+
+        statuses = mock_supabase.get_zones_by_status.call_args.args[0]
+        assert set(statuses) >= {
+            "CONFIRMED", "ACTIVE",
+            "CONSUMED", "VIOLATED", "FLIPPED",
+        }
+
+
 class TestLoadConfirmedCandidatesFreshness:
     """`_load_confirmed_candidates` skips CONFIRMED zones outside the
     freshness window — old zones in Supabase don't end up in the queue."""
