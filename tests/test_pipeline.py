@@ -329,5 +329,7 @@ class TestConfig:
         # PR #56: zone freshness window (default 6h, used by both
         # _load_confirmed_candidates and _zone_already_used).
         assert c.zone_freshness_hours == 6.0
-        # PR #57: rejection-wick extension (default 1 bar each side).
-        assert c.zone_wick_extend_bars == 1
+        # PR #60: strict base wick-to-wick by default. ``mark_zone``
+        # keeps the opt-in ``wick_extend_bars`` kwarg (direction-aware
+        # when > 0), but the pipeline config sets it to 0.
+        assert c.zone_wick_extend_bars == 0

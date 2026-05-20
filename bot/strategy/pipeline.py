@@ -118,28 +118,24 @@ class StrategyPipelineConfig:
     # entirely (restores the pre-PR-#56 "any age" behaviour).
     zone_freshness_hours: float = 6.0
 
-    # PR #57: rejection-wick capture. The base-detection algorithm
-    # picks 1-5 tightly-clustered candles as "the base" and the zone
-    # is wick-to-wick over those candles. But the rejection wicks
-    # immediately bordering the base — the high wick on the last
-    # rally bar (impulse_before), the high wick on the first drop bar
-    # (impulse_after) — often extend past the base's wicks and are
-    # part of the institutional defence of the level. Manual S&D
-    # traders draw their boxes around these too; strict base-only
-    # marking under-sizes the zone.
+    # PR #60: zone is strict wick-to-wick of the base candles only.
+    # No extension into bordering impulse bars by default.
     #
-    # When ``zone_wick_extend_bars > 0``, ``mark_zone`` widens the
-    # zone's top/bottom by scanning the highs/lows of ``N`` bars on
-    # each side of the base's index range. ``N=1`` (default) captures
-    # the immediate border bars. ``N=2`` is more aggressive (catches
-    # multi-bar rejection sequences). ``N=0`` restores the strict
-    # base-only behaviour.
+    # History: PR #57 introduced a symmetric N-bar extension to catch
+    # rejection wicks on the border bars. That over-extended zones —
+    # for a BUY (RBR) the impulse_before bar's high is the rally's
+    # peak, pulling ``top`` way up; for a SELL (RBD) the impulse_after
+    # bar's low is the drop's trough, pulling ``bottom`` way down.
+    # Real-world example: a BUY zone marked 4476.60-4514.54 ($37.94
+    # wide) when the actual rejection was ~$10-15 — the rally peak
+    # got swept in as if it were the zone.
     #
-    # Doesn't change pattern detection, base validation, lifecycle,
-    # SL distance buffer, TP chain, dedup, or freshness — only the
-    # zone's reported top/bottom widen. The SL is buffer-relative to
-    # the new bound, so SL distance grows slightly with the zone.
-    zone_wick_extend_bars: int = 1
+    # ``mark_zone`` retains the ``wick_extend_bars`` kwarg as an
+    # opt-in. When > 0 it is **direction-aware**: BUY widens only
+    # ``bottom`` (lower rejection wicks), SELL widens only ``top``
+    # (upper rejection wicks). The opposite side stays at base. The
+    # default is ``0`` — strict base-only.
+    zone_wick_extend_bars: int = 0
 
 
 def run_strategy_pipeline(
