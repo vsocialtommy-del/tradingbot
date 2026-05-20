@@ -326,9 +326,14 @@ class TestConfig:
         assert c.zone_max_size_points == 80.0
         assert c.sl_buffer_points == 17.5
         assert c.tp1_local_peak_lookback_bars == 50
-        # PR #56: zone freshness window (default 6h, used by both
-        # _load_confirmed_candidates and _zone_already_used).
+        # PR #56: live-zone freshness window (default 6h, used by
+        # _load_confirmed_candidates and the live-zone branch of
+        # _zone_already_used).
         assert c.zone_freshness_hours == 6.0
+        # PR #62: dead-zone dedup has its own knob, default 0.0 (no
+        # age cap). Old burnt zones in the DB filter loose-detection
+        # false positives — restores the pre-PR-#56 behaviour.
+        assert c.dead_zone_dedup_freshness_hours == 0.0
         # PR #60: strict base wick-to-wick by default. ``mark_zone``
         # keeps the opt-in ``wick_extend_bars`` kwarg (direction-aware
         # when > 0), but the pipeline config sets it to 0.

@@ -2558,21 +2558,23 @@ class TestDetectNewZonesSeedsFromSupabase:
 
 
 # --------------------------------------------------------------------------- #
-# PR #56: zone freshness window. ONE config knob (`zone_freshness_hours`)
-# governs two filters symmetrically:
+# PR #56 / PR #62: two-tier freshness for dedup.
 #
-#   1. `_load_confirmed_candidates` — only loads CONFIRMED zones whose
-#      created_at is within the window. Older zones don't enter the
-#      placement queue, can't be traded.
+#   1. `_load_confirmed_candidates` — loads CONFIRMED zones within the
+#      last `zone_freshness_hours` only (default 6h).
 #
-#   2. `_zone_already_used` (dedup pre-flight) — only blocks new setups
-#      on overlapping CONSUMED/VIOLATED/FLIPPED zones whose created_at
-#      is within the window. Older "burnt" zones don't lock placement
-#      out of their price band.
+#   2. `_zone_already_used` (dedup pre-flight) splits by status:
+#      - Live zones (CONFIRMED / ACTIVE) — capped at
+#        `zone_freshness_hours` (matches the loader; if the loader
+#        won't load it, it shouldn't block either).
+#      - Dead zones (CONSUMED / VIOLATED / FLIPPED) — capped at
+#        `dead_zone_dedup_freshness_hours` (default 0.0 = no cap).
+#        Old burnt zones in the DB filter loose-detection false
+#        positives the same way they did pre-PR-#56.
 #
-# "If the bot can't see it, it can't be locked out by it" — symmetric.
-# Solves the production graveyard problem (87 dead zones blocking every
-# fresh pattern in a price band over 8 days).
+# PR #62 split the original unified `zone_freshness_hours` knob into
+# two because the symmetric 6h cap on dead zones removed a protective
+# filter that was masking the loose pattern-detection quality issue.
 # --------------------------------------------------------------------------- #
 
 
@@ -2581,14 +2583,14 @@ def _hours_ago(n: float) -> datetime:
 
 
 class TestDedupFreshness:
-    """`_zone_already_used` only blocks on recent overlapping dead zones."""
+    """`_zone_already_used`: two-tier age cap (live vs dead zones)."""
 
     def test_recent_consumed_zone_blocks(
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mock_supabase: MagicMock,
     ) -> None:
         b, _ = bot
-        # Consumed 1h ago — well within the 6h default freshness window.
+        # Consumed 1h ago — recent dead zone, always blocks.
         recent = _make_zone_row(
             direction="BUY", top=1905.0, bottom=1900.0,
             status="CONSUMED", consumed_at=_hours_ago(1),
@@ -2599,12 +2601,57 @@ class TestDedupFreshness:
         candidate = _make_validated_for_persistence(_PT.RBR)
         assert b._zone_already_used(candidate) is True
 
-    def test_old_consumed_zone_does_not_block(
+    def test_old_consumed_zone_blocks_at_default(
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mock_supabase: MagicMock,
     ) -> None:
-        # Consumed 12h ago — outside the 6h default freshness window.
+        # PR #62: dead-zone dedup has no age cap by default — old
+        # burnt zones still block new overlapping setups. This
+        # restores the pre-PR-#56 protective filter that was
+        # masking the loose pattern-detection problem.
         b, _ = bot
+        old = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONSUMED", consumed_at=_hours_ago(72),
+            created_at=_hours_ago(72),
+        )
+        mock_supabase.get_zones_by_status.return_value = [old]
+
+        candidate = _make_validated_for_persistence(_PT.RBR)
+        assert b._zone_already_used(candidate) is True
+
+    def test_old_flipped_zone_blocks_at_default(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        # FLIPPED is treated as a dead zone for dedup — same
+        # no-cap rule applies.
+        b, _ = bot
+        old = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="FLIPPED", flipped_at=_hours_ago(48),
+            flipped_direction="SELL",
+            created_at=_hours_ago(48),
+        )
+        mock_supabase.get_zones_by_status.return_value = [old]
+
+        candidate = _make_validated_for_persistence(_PT.RBR)
+        assert b._zone_already_used(candidate) is True
+
+    def test_dead_zone_dedup_freshness_cap_when_set(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        # Operator can re-enable the dead-zone cap by setting
+        # ``dead_zone_dedup_freshness_hours > 0``. Old dead zones
+        # outside that window stop blocking — the PR #56 graveyard
+        # fix is one config flip away.
+        from dataclasses import replace
+        b, _ = bot
+        b.strategy_pipeline_config = replace(
+            b.strategy_pipeline_config,
+            dead_zone_dedup_freshness_hours=6.0,
+        )
         old = _make_zone_row(
             direction="BUY", top=1905.0, bottom=1900.0,
             status="CONSUMED", consumed_at=_hours_ago(12),
@@ -2615,41 +2662,34 @@ class TestDedupFreshness:
         candidate = _make_validated_for_persistence(_PT.RBR)
         assert b._zone_already_used(candidate) is False
 
-    def test_old_flipped_zone_does_not_block(
+    def test_old_confirmed_zone_does_not_block(
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mock_supabase: MagicMock,
     ) -> None:
+        # Live-zone branch: CONFIRMED still uses ``zone_freshness_hours``
+        # so it ages out at 6h. Symmetry with the loader.
         b, _ = bot
         old = _make_zone_row(
             direction="BUY", top=1905.0, bottom=1900.0,
-            status="FLIPPED", flipped_at=_hours_ago(8),
-            flipped_direction="SELL",
-            created_at=_hours_ago(8),
+            status="CONFIRMED",
+            created_at=_hours_ago(12),
         )
         mock_supabase.get_zones_by_status.return_value = [old]
 
         candidate = _make_validated_for_persistence(_PT.RBR)
         assert b._zone_already_used(candidate) is False
 
-    def test_zero_freshness_hours_disables_filter(
+    def test_recent_confirmed_zone_blocks(
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mock_supabase: MagicMock,
     ) -> None:
-        # Setting freshness_hours to 0 restores pre-PR-#56 behaviour
-        # (any age blocks). Useful escape hatch for operators who want
-        # the old strict dedup.
-        from dataclasses import replace
         b, _ = bot
-        b.strategy_pipeline_config = replace(
-            b.strategy_pipeline_config, zone_freshness_hours=0.0,
-        )
-
-        ancient = _make_zone_row(
+        recent = _make_zone_row(
             direction="BUY", top=1905.0, bottom=1900.0,
-            status="CONSUMED", consumed_at=_hours_ago(72),
-            created_at=_hours_ago(72),
+            status="CONFIRMED",
+            created_at=_hours_ago(1),
         )
-        mock_supabase.get_zones_by_status.return_value = [ancient]
+        mock_supabase.get_zones_by_status.return_value = [recent]
 
         candidate = _make_validated_for_persistence(_PT.RBR)
         assert b._zone_already_used(candidate) is True

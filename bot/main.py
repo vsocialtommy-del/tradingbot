@@ -1701,24 +1701,35 @@ class Bot:
         (logging the error). Better to occasionally re-trade than to
         miss real entries because of a Supabase blip.
 
-        PR #56: applies ``zone_freshness_hours`` to the dedup lookup
-        — burnt zones older than the window stop blocking new setups
-        in their price band. The same window also gates which zones
-        ``_load_confirmed_candidates`` puts in the queue; "if the bot
-        can't see it, it can't be locked out by it" is the symmetry.
+        PR #56 / PR #62: two-tier freshness cap. The dedup lookup
+        applies different age cutoffs depending on whether the
+        overlapping zone is **live** (CONFIRMED / ACTIVE) or **dead**
+        (CONSUMED / VIOLATED / FLIPPED):
+
+        * Live zones — capped at ``zone_freshness_hours`` (default 6h).
+          Symmetric with ``_load_confirmed_candidates``: if the loader
+          ignores a CONFIRMED zone older than 6h, dedup should ignore
+          it too. Otherwise the zone becomes a zombie — invisible to
+          trading but still blocking new patterns in its band.
+        * Dead zones — capped at ``dead_zone_dedup_freshness_hours``
+          (default 0.0 = no cap). Restores the pre-PR-#56 protective
+          filter where stale burnt zones in the DB filter out the
+          loose pattern-detection false positives (PR #44 / PR #46
+          lowered thresholds enough that "DBD" patterns get marked
+          inside continuous impulse legs; the pre-PR-#56 strict-era
+          dead zones quietly dedup-blocked them).
 
         PR #59: extends the dedup status set to include CONFIRMED and
-        ACTIVE in addition to the dead-zone statuses (CONSUMED /
-        VIOLATED / FLIPPED). Previously the pipeline could detect the
-        same structural zone on consecutive M5 closes with shifting
-        ``formed_at`` (the impulse_after's end bar moves as new bars
-        accumulate), producing multiple CONFIRMED rows with identical
-        bounds and different UUIDs. Dedup didn't catch them because
-        it only checked dead statuses → the bot fired a fresh setup
-        on every duplicate. Operator-observed: 17 SELL trades on the
-        same 4477-4486 band in 7 hours. ``candidate_zone_id`` is
-        passed so the candidate doesn't dedup against its own row
-        (which is in DB with status CONFIRMED at this point).
+        ACTIVE in addition to the dead-zone statuses. Previously the
+        pipeline could detect the same structural zone on consecutive
+        M5 closes with shifting ``formed_at`` (the impulse_after's
+        end bar moves as new bars accumulate), producing multiple
+        CONFIRMED rows with identical bounds and different UUIDs.
+        Dedup didn't catch them because it only checked dead statuses
+        → the bot fired a fresh setup on every duplicate.
+        ``candidate_zone_id`` is passed so the candidate doesn't dedup
+        against its own row (which is in DB with status CONFIRMED at
+        this point).
         """
         try:
             existing = self.supabase.get_zones_by_status(
@@ -1730,21 +1741,24 @@ class Bot:
             )
             return False
 
-        cutoff: datetime | None = None
-        freshness_hours = self.strategy_pipeline_config.zone_freshness_hours
-        if freshness_hours > 0:
-            # Default: only zones from within the freshness window
-            # can block placement. Set freshness_hours <= 0 to disable
-            # (restores the pre-PR-#56 "any age blocks" rule).
-            cutoff = datetime.now(tz=timezone.utc) - timedelta(
-                hours=freshness_hours,
-            )
+        now = datetime.now(tz=timezone.utc)
+        live_cutoff: datetime | None = None
+        live_hours = self.strategy_pipeline_config.zone_freshness_hours
+        if live_hours > 0:
+            live_cutoff = now - timedelta(hours=live_hours)
+        dead_cutoff: datetime | None = None
+        dead_hours = (
+            self.strategy_pipeline_config.dead_zone_dedup_freshness_hours
+        )
+        if dead_hours > 0:
+            dead_cutoff = now - timedelta(hours=dead_hours)
 
         candidate_ref = ZoneRef(
             direction=candidate.direction,
             top=float(candidate.top),
             bottom=float(candidate.bottom),
         )
+        live_statuses = ("CONFIRMED", "ACTIVE")
         for z in existing:
             # PR #59: self-exclude. The candidate's own zone row is
             # already persisted (status CONFIRMED) at this point, so
@@ -1752,6 +1766,7 @@ class Bot:
             # itself and skip placement.
             if candidate_zone_id is not None and z.id == candidate_zone_id:
                 continue
+            cutoff = live_cutoff if z.status in live_statuses else dead_cutoff
             if cutoff is not None and z.created_at < cutoff:
                 continue
             existing_ref = ZoneRef(

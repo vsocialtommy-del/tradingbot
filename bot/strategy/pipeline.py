@@ -93,30 +93,53 @@ class StrategyPipelineConfig:
     # this field directly.
     tp1_local_peak_lookback_bars: int = 50
 
-    # PR #56: zone freshness window (single knob, used in TWO places).
+    # PR #56: zone freshness window for **live** zones.
     #
     # 1. ``Bot._load_confirmed_candidates`` only loads zones whose
     #    ``created_at`` is within the last ``zone_freshness_hours``.
     #    Older zones are invisible to the bot — won't be loaded into
     #    the placement queue, won't be traded.
     #
-    # 2. ``Bot._zone_already_used`` (dedup pre-flight) only blocks new
-    #    setups on overlapping CONSUMED/VIOLATED/FLIPPED zones whose
-    #    ``created_at`` is within the same window. Older "burnt"
-    #    zones don't block fresh patterns.
+    # 2. ``Bot._zone_already_used`` (dedup pre-flight) blocks new
+    #    setups on overlapping **CONFIRMED / ACTIVE** zones within the
+    #    same window. Symmetry with #1: if the loader won't load it,
+    #    dedup shouldn't lock new patterns out against it either.
     #
-    # Symmetric by design: if the bot can't see it, it can't be locked
-    # out by it either. Solves the production graveyard problem
-    # (87 dead zones accumulated over 8 days blocking every fresh
-    # pattern in a 250-point band) without permanently turning off
-    # dedup. The 6-hour default treats "more than one session ago"
-    # as ancient history — the market has had time to develop fresh
-    # structure since then.
+    # PR #62: dead-zone dedup is now governed by a **separate** knob
+    # (``dead_zone_dedup_freshness_hours``) — see below. The unified
+    # 6h cap on dead zones was unmasking a long-standing pattern-
+    # detection quality problem: pre-May-19 the older strict-era dead
+    # zones in the DB acted as an unintentional dedup filter, blocking
+    # the loose-detection ``DBD``/``DBR`` false positives. PR #56's
+    # symmetric 6h cap aged those filters out and the false positives
+    # started reaching the queue.
     #
-    # Tunable: smaller = more aggressive re-engagement; larger = more
-    # respect for recent dead zones. Set to 0 to disable both filters
-    # entirely (restores the pre-PR-#56 "any age" behaviour).
+    # Tunable: smaller = more aggressive re-engagement of live zones;
+    # larger = more respect for recent confirmed/active overlaps.
+    # Set to 0 to disable both filters entirely (loader takes any age;
+    # dedup blocks any live overlap regardless of age).
     zone_freshness_hours: float = 6.0
+
+    # PR #62: dead-zone dedup freshness (separate knob from #56's
+    # ``zone_freshness_hours``).
+    #
+    # Controls only the dedup lookup's age cap on CONSUMED / VIOLATED
+    # / FLIPPED zones. Default ``0.0`` means **no age cap** — every
+    # dead zone in the DB can dedup-block a new overlapping pattern,
+    # regardless of how long ago it died. That restores the pre-PR-#56
+    # protective filter where stale "burnt" zones from earlier strict-
+    # detection runs blocked the loose pattern-detection false
+    # positives.
+    #
+    # The original 87-dead-zone graveyard problem PR #56 was solving
+    # is unrelated to this filter — that was about the loader trying
+    # to TRADE old zones, not about old zones blocking new setups.
+    # The loader still uses ``zone_freshness_hours`` for that.
+    #
+    # Tunable: ``0`` = no cap (restores pre-PR-#56 dedup, recommended).
+    # Set to a positive number (e.g. ``24.0``) for a sliding window if
+    # the band locks out repeatedly.
+    dead_zone_dedup_freshness_hours: float = 0.0
 
     # PR #60: zone is strict wick-to-wick of the base candles only.
     # No extension into bordering impulse bars by default.
