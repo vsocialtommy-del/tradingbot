@@ -134,7 +134,9 @@ def patch_stages(
     )
     stubs["mark"] = mocker.patch(
         "bot.strategy.pipeline.mark_zone",
-        side_effect=lambda p, df: make_zone(p.direction, p),
+        # PR #57: pipeline now passes ``wick_extend_bars=...`` from
+        # the config; stub accepts and ignores it.
+        side_effect=lambda p, df, **_kw: make_zone(p.direction, p),
     )
     if refined_results is not None:
         stubs["refine"] = mocker.patch(
@@ -324,3 +326,8 @@ class TestConfig:
         assert c.zone_max_size_points == 80.0
         assert c.sl_buffer_points == 17.5
         assert c.tp1_local_peak_lookback_bars == 50
+        # PR #56: zone freshness window (default 6h, used by both
+        # _load_confirmed_candidates and _zone_already_used).
+        assert c.zone_freshness_hours == 6.0
+        # PR #57: rejection-wick extension (default 1 bar each side).
+        assert c.zone_wick_extend_bars == 1

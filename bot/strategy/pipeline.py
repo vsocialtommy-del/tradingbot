@@ -118,6 +118,29 @@ class StrategyPipelineConfig:
     # entirely (restores the pre-PR-#56 "any age" behaviour).
     zone_freshness_hours: float = 6.0
 
+    # PR #57: rejection-wick capture. The base-detection algorithm
+    # picks 1-5 tightly-clustered candles as "the base" and the zone
+    # is wick-to-wick over those candles. But the rejection wicks
+    # immediately bordering the base — the high wick on the last
+    # rally bar (impulse_before), the high wick on the first drop bar
+    # (impulse_after) — often extend past the base's wicks and are
+    # part of the institutional defence of the level. Manual S&D
+    # traders draw their boxes around these too; strict base-only
+    # marking under-sizes the zone.
+    #
+    # When ``zone_wick_extend_bars > 0``, ``mark_zone`` widens the
+    # zone's top/bottom by scanning the highs/lows of ``N`` bars on
+    # each side of the base's index range. ``N=1`` (default) captures
+    # the immediate border bars. ``N=2`` is more aggressive (catches
+    # multi-bar rejection sequences). ``N=0`` restores the strict
+    # base-only behaviour.
+    #
+    # Doesn't change pattern detection, base validation, lifecycle,
+    # SL distance buffer, TP chain, dedup, or freshness — only the
+    # zone's reported top/bottom widen. The SL is buffer-relative to
+    # the new bound, so SL distance grows slightly with the zone.
+    zone_wick_extend_bars: int = 1
+
 
 def run_strategy_pipeline(
     df: pd.DataFrame,
@@ -148,7 +171,10 @@ def run_strategy_pipeline(
     validated: list[ValidatedZone] = []
     for pattern in patterns:
         try:
-            zone = mark_zone(pattern, df)
+            zone = mark_zone(
+                pattern, df,
+                wick_extend_bars=cfg.zone_wick_extend_bars,
+            )
             refined = refine_zone(zone, df, refinement_cfg)
             vz = validate_strong_point(refined, df, sp_cfg)
             # Return every validated zone (tradeable or not). The caller
