@@ -1250,6 +1250,20 @@ class Bot:
         FLIP recomputes structure from the current df (option B from
         the design doc) so the BoS target reflects today's structure,
         not the swing recorded at zone formation.
+
+        PR #58: FLIPPED zones now also undergo the consumption check
+        (using ``flipped_direction`` to determine the retest side).
+        Previously a wick into a flipped zone left it in FLIPPED
+        status indefinitely — the dashboard kept advertising it as
+        tradeable and the placement queue kept trying to fire on it
+        even though the institutional liquidity that defined the
+        flipped opportunity had already been triggered. Now the
+        first wick correctly transitions FLIPPED → CONSUMED.
+        Violation / re-flip transitions are NOT applied to already-
+        flipped zones — the loader's body-broken-since-flip filter
+        handles those cases by excluding them from the queue, and a
+        flipped-zone re-flip isn't a state the strategy currently
+        models.
         """
         if len(df) == 0:
             return
@@ -1258,16 +1272,38 @@ class Bot:
         bar_low = float(last["low"])
         bar_close = float(last["close"])
 
-        # Pull only the non-terminal zones we might transition.
+        # Pull non-terminal zones we might transition. PR #58 adds
+        # FLIPPED to the list so wicks into flipped zones get
+        # transitioned to CONSUMED.
         try:
             zones = self.supabase.get_zones_by_status(
-                ["CONFIRMED", "ACTIVE", "CONSUMED", "VIOLATED"],
+                ["CONFIRMED", "ACTIVE", "CONSUMED", "VIOLATED", "FLIPPED"],
             )
         except Exception:
             logger.exception("zone lifecycle: get_zones_by_status failed")
             return
 
         for z in zones:
+            # PR #58: FLIPPED zones get their own narrow consumption-
+            # only path. The retest direction is ``flipped_direction``,
+            # not the original ``direction``. Once consumed, no further
+            # transitions run (a flipped zone re-flipping isn't a
+            # state the strategy models).
+            if z.status == "FLIPPED":
+                if z.flipped_direction is None:
+                    # DB CHECK should prevent this — defensive skip.
+                    continue
+                flipped_ref = ZoneRef(
+                    direction=z.flipped_direction,
+                    top=float(z.top),
+                    bottom=float(z.bottom),
+                )
+                if check_consumption(
+                    flipped_ref, bar_high=bar_high, bar_low=bar_low,
+                ):
+                    self._safe_update_zone_status(z, "CONSUMED")
+                continue
+
             ref = ZoneRef(
                 direction=z.direction,
                 top=float(z.top),
