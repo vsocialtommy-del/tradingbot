@@ -156,7 +156,7 @@ def patch_stages(
     else:
         stubs["validate"] = mocker.patch(
             "bot.strategy.pipeline.validate_strong_point",
-            side_effect=lambda r, df, cfg: make_validated(direction=r.direction),
+            side_effect=lambda r, df, cfg, **kw: make_validated(direction=r.direction),
         )
     return stubs
 
@@ -322,7 +322,7 @@ class TestConfig:
         # PR #64 restored strict (was 1.0 under PR #44).
         assert c.base_range_to_impulse_ratio_max == 0.6
         assert c.base_max_body_to_impulse_body_ratio == 0.4
-        assert c.zone_min_size_points == 5.0
+        assert c.zone_min_size_points == 3.0
         assert c.zone_max_size_points == 80.0
         assert c.sl_buffer_points == 17.5
         assert c.tp1_local_peak_lookback_bars == 50

@@ -53,6 +53,7 @@ from bot.strategy.strong_point import (
     ValidatedZone,
     validate_strong_point,
 )
+from bot.strategy.structure import detect_swings
 from bot.strategy.zone_marking import mark_zone
 from bot.strategy.zone_refinement import (
     RefinementConfig,
@@ -108,7 +109,7 @@ class StrategyPipelineConfig:
     pattern_lookback_bars: int = 50
 
     # Zone size filter
-    zone_min_size_points: float = 5.0
+    zone_min_size_points: float = 3.0  # Nov 2026: 5 → 3 (real zones are often 3-5 pts)
     zone_max_size_points: float = 80.0
 
     # Strong Point (loosened — only the SL buffer matters now)
@@ -200,6 +201,12 @@ def run_strategy_pipeline(
         require_fresh_since_bos=cfg.require_fresh_since_bos,
     )
 
+    # Swings are needed by every pattern's BOS check; compute them once.
+    swings = (
+        detect_swings(df, cfg.bos_swing_strength)
+        if cfg.require_bos and patterns else []
+    )
+
     validated: list[ValidatedZone] = []
     for pattern in patterns:
         try:
@@ -208,7 +215,7 @@ def run_strategy_pipeline(
                 wick_extend_bars=cfg.zone_wick_extend_bars,
             )
             refined = refine_zone(zone, df, refinement_cfg)
-            vz = validate_strong_point(refined, df, sp_cfg)
+            vz = validate_strong_point(refined, df, sp_cfg, swings=swings)
             # Return every validated zone (tradeable or not). The caller
             # decides what to do with each — main.py persists the
             # is_tradeable=True subset and only attempts placement on
