@@ -57,7 +57,7 @@ import pandas as pd
 from loguru import logger
 
 from bot.strategy.pattern_detection import Pattern
-from bot.strategy.structure import Swing
+from bot.strategy.structure import Swing, detect_swings
 from bot.strategy.zone_marking import Direction
 from bot.strategy.zone_refinement import RefinedZone
 
@@ -65,6 +65,9 @@ from bot.strategy.zone_refinement import RefinedZone
 ValidationFailure = Literal[
     "NOT_TRADEABLE",
     "ZONE_VIOLATED_BEFORE_RETEST",
+    "PATTERN_NOT_ALLOWED",
+    "NO_BOS",
+    "ZONE_USED_SINCE_BOS",
 ]
 
 
@@ -77,6 +80,28 @@ class StrongPointConfig:
     zone top (SELL). Applied directly to the zone bound — no swing
     anchor. Spec wording: '$17.50 below the zone for BUY' (mirror SELL).
     """
+
+    # ---- XAUTISM zone rules (Nov 2026) ----------------------------------
+    allowed_pattern_types: tuple[str, ...] = ("DBR", "RBD")
+    """Only reversal bases are traded. RBR / DBD continuation bases are
+    weaker and rejected with ``PATTERN_NOT_ALLOWED``. Pass all four to
+    restore the old behaviour."""
+
+    require_bos: bool = True
+    """The move out of the base must body-close past the last swing
+    before the base (swing HIGH for a DBR, swing LOW for an RBD). That
+    swing is stored on ``broken_swing`` and is the TP1 level; the
+    breaking bar's time is ``broken_at`` (the zone's birth)."""
+
+    bos_swing_strength: int = 2
+    """Swing pivot strength on closes (the line-chart W / M points)."""
+
+    require_fresh_since_bos: bool = True
+    """Only the first retest is traded: if any bar after the BOS bar has
+    already traded into the zone edge (BUY: low <= top, SELL:
+    high >= bottom) the zone is used (``ZONE_USED_SINCE_BOS``). Bars
+    between the base and the BOS don't count. A near miss that never
+    reaches the edge leaves the zone fresh."""
 
 
 @dataclass(frozen=True)
@@ -136,16 +161,36 @@ def validate_strong_point(
     No break-and-close confirmation. No SL anchor lookup. No swing
     list. Pure pass / fail.
     """
-    del config  # unused — kept in signature for symmetry / future use
+    cfg = config or StrongPointConfig()
     failures: list[ValidationFailure] = []
 
     if not refined.is_tradeable:
         failures.append("NOT_TRADEABLE")
         return _build_unvalidated(refined, failures)
 
+    ptype = _pattern_code(refined.source_pattern)
+    if ptype not in cfg.allowed_pattern_types:
+        failures.append("PATTERN_NOT_ALLOWED")
+        return _build_unvalidated(refined, failures)
+
     if _zone_body_broken_since_formation(refined, df):
         failures.append("ZONE_VIOLATED_BEFORE_RETEST")
         return _build_unvalidated(refined, failures)
+
+    broken_swing: Swing | None = None
+    broken_at: pd.Timestamp | None = None
+    if cfg.require_bos:
+        bos = find_bos(refined, df, swing_strength=cfg.bos_swing_strength)
+        if bos is None:
+            failures.append("NO_BOS")
+            return _build_unvalidated(refined, failures)
+        broken_swing, bos_idx = bos
+        broken_at = df.index[bos_idx]
+        if cfg.require_fresh_since_bos and _zone_touched_after(
+            refined, df, bos_idx,
+        ):
+            failures.append("ZONE_USED_SINCE_BOS")
+            return _build_unvalidated(refined, failures)
 
     logger.debug(
         "Strong Point (passthrough): {} zone {:.2f}-{:.2f} tradeable",
@@ -160,10 +205,50 @@ def validate_strong_point(
         refined_zone=refined,
         is_strong_point=True,
         validation_failures=[],
-        broken_swing=None,
-        broken_at=None,
+        broken_swing=broken_swing,
+        broken_at=broken_at,
         sl_anchor_swing=None,
     )
+
+
+def find_bos(
+    refined: RefinedZone,
+    df: pd.DataFrame,
+    *,
+    swing_strength: int = 2,
+) -> tuple[Swing, int] | None:
+    """Find the first break of structure out of the base.
+
+    The reference is the **last swing before the base** on closes (the
+    line-chart point the move into the base came from):
+
+    * BUY (DBR): last swing HIGH before ``base.start_index``; BOS is the
+      first bar after the base whose close is above it.
+    * SELL (RBD): last swing LOW before the base; BOS is the first bar
+      after the base whose close is below it.
+
+    Returns ``(swing, bos_bar_index)`` or ``None`` when there is no
+    reference swing or the level has not been broken yet.
+    """
+    pattern = refined.source_pattern
+    base_start = pattern.base.start_index
+    base_end = pattern.base.end_index
+    want = "HIGH" if refined.direction == "BUY" else "LOW"
+    swings = [
+        sw for sw in detect_swings(df, swing_strength)
+        if sw.kind == want and sw.index < base_start
+    ]
+    if not swings:
+        return None
+    ref = swings[-1]
+    closes = df["close"].to_numpy()
+    for i in range(base_end + 1, len(df)):
+        c = float(closes[i])
+        if refined.direction == "BUY" and c > ref.price:
+            return ref, i
+        if refined.direction == "SELL" and c < ref.price:
+            return ref, i
+    return None
 
 
 def compute_sl_price(
@@ -215,6 +300,24 @@ def _zone_body_broken_since_formation(
         if refined.direction == "SELL" and bar_close > refined.top:
             return True
     return False
+
+
+def _zone_touched_after(
+    refined: RefinedZone, df: pd.DataFrame, bos_idx: int,
+) -> bool:
+    """True iff any bar after ``bos_idx`` traded into the zone edge."""
+    if bos_idx + 1 >= len(df):
+        return False
+    if refined.direction == "BUY":
+        lows = df["low"].to_numpy()[bos_idx + 1:]
+        return bool((lows <= refined.top).any())
+    highs = df["high"].to_numpy()[bos_idx + 1:]
+    return bool((highs >= refined.bottom).any())
+
+
+def _pattern_code(pattern: Pattern) -> str:
+    pt = getattr(pattern, "pattern_type", None)
+    return str(getattr(pt, "value", pt))
 
 
 def _build_unvalidated(

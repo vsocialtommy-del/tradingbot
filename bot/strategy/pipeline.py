@@ -114,6 +114,12 @@ class StrategyPipelineConfig:
     # Strong Point (loosened — only the SL buffer matters now)
     sl_buffer_points: float = 17.5
 
+    # XAUTISM zone rules (see StrongPointConfig for details).
+    allowed_pattern_types: tuple[str, ...] = ("DBR", "RBD")
+    require_bos: bool = True
+    bos_swing_strength: int = 2
+    require_fresh_since_bos: bool = True
+
     # TP1 target — read by ``main`` when computing TP1 for each zone.
     # Kept on the pipeline config so the operator only tunes one config
     # object even though :func:`run_strategy_pipeline` doesn't consume
@@ -186,7 +192,13 @@ def run_strategy_pipeline(
         zone_min_size_points=cfg.zone_min_size_points,
         zone_max_size_points=cfg.zone_max_size_points,
     )
-    sp_cfg = StrongPointConfig(sl_buffer_points=cfg.sl_buffer_points)
+    sp_cfg = StrongPointConfig(
+        sl_buffer_points=cfg.sl_buffer_points,
+        allowed_pattern_types=cfg.allowed_pattern_types,
+        require_bos=cfg.require_bos,
+        bos_swing_strength=cfg.bos_swing_strength,
+        require_fresh_since_bos=cfg.require_fresh_since_bos,
+    )
 
     validated: list[ValidatedZone] = []
     for pattern in patterns:
