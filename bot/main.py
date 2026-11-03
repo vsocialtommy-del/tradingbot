@@ -118,6 +118,7 @@ from bot.strategy.strong_point import (
     compute_sl_price,
 )
 from bot.strategy.direction_gate import DirectionGateConfig, check_direction
+from bot.strategy.levels import LevelsConfig, TradeLevels, compute_levels
 from bot.strategy.pipeline import (
     StrategyPipelineConfig,
     run_strategy_pipeline,
@@ -213,6 +214,9 @@ class BotLoopConfig:
     direction_gate: DirectionGateConfig = field(default_factory=DirectionGateConfig)
     """M15 direction + fresh-H1-zone exception. See
     :mod:`bot.strategy.direction_gate`."""
+
+    levels: LevelsConfig = field(default_factory=LevelsConfig)
+    """Entry / SL / TP1 rules. See :mod:`bot.strategy.levels`."""
 
     enable_flip_trading: bool = False
     """Trade FLIPPED zones (SnD Flip, PR #38). Off by default: not part of
@@ -1441,6 +1445,21 @@ class Bot:
         sl_price = compute_sl_price(zone, sp_cfg)
 
         entry_price = zone.top if zone.direction == "BUY" else zone.bottom
+
+        # 1a. XAUTISM levels (Nov 2026): SL 30% of the zone past the far
+        # edge, pushed beyond a swing that sits just past it; TP1 at the
+        # zone's first BOS less a spread buffer.
+        levels: TradeLevels | None = None
+        if self.config.levels.enabled:
+            levels = compute_levels(zone, ohlc_df, self.config.levels)
+            sl_price = levels.sl
+            entry_price = levels.entry
+            logger.info(
+                f"levels: {zone.direction} entry={levels.entry:.2f} "
+                f"sl={levels.sl:.2f} ({levels.sl_method}"
+                f"{'' if levels.swing_price is None else f' swing {levels.swing_price:.2f}'}) "
+                f"tp1={levels.tp1}"
+            )
         sl_validation = self.sl_manager.validate_sl_distance(
             entry_price=entry_price,
             sl_price=sl_price,
@@ -1459,12 +1478,17 @@ class Bot:
         # at the previous layer's TP hit. Q-B decision: a layer with
         # no TP rides on the cascaded SL until external close.
         lookback = self.strategy_pipeline_config.tp1_local_peak_lookback_bars
-        tp1_price = find_nearest_local_peak(
-            ohlc_df,
-            entry_price=entry_price,
-            direction=zone.direction,
-            lookback_bars=lookback,
-        )
+        if levels is not None and levels.tp1 is not None:
+            tp1_price = levels.tp1
+        else:
+            # No BOS level on the zone (e.g. flipped zones, or levels
+            # disabled): fall back to the nearest local peak / low.
+            tp1_price = find_nearest_local_peak(
+                ohlc_df,
+                entry_price=entry_price,
+                direction=zone.direction,
+                lookback_bars=lookback,
+            )
         if tp1_price is None:
             logger.info(
                 f"new setup skipped: no local "
