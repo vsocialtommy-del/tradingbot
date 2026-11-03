@@ -117,6 +117,7 @@ from bot.strategy.strong_point import (
     ValidatedZone,
     compute_sl_price,
 )
+from bot.strategy.direction_gate import DirectionGateConfig, check_direction
 from bot.strategy.pipeline import (
     StrategyPipelineConfig,
     run_strategy_pipeline,
@@ -208,6 +209,10 @@ class BotLoopConfig:
     fresh (untouched since its BOS, not closed through), however old,
     as long as it is inside this window. Nov 2026: 1000 → 5000; the old
     3.5-day window dropped still-fresh zones the user trades manually."""
+
+    direction_gate: DirectionGateConfig = field(default_factory=DirectionGateConfig)
+    """M15 direction + fresh-H1-zone exception. See
+    :mod:`bot.strategy.direction_gate`."""
 
     enable_flip_trading: bool = False
     """Trade FLIPPED zones (SnD Flip, PR #38). Off by default: not part of
@@ -1404,6 +1409,30 @@ class Bot:
                 f"waiting for price to retest"
             )
             return False
+
+        # 0c. Direction gate (Nov 2026): with the M15 trend, or against it
+        # only when the zone sits inside / touches a fresh H1 zone in the
+        # same direction. Runs after the price gate so it's only computed
+        # when price is actually at the zone.
+        if self.config.direction_gate.enabled:
+            decision = check_direction(
+                direction=zone.direction,
+                zone_bottom=float(zone.bottom),
+                zone_top=float(zone.top),
+                df_m5=ohlc_df,
+                config=self.config.direction_gate,
+                pipeline_cfg=self.strategy_pipeline_config,
+            )
+            if not decision.allowed:
+                logger.info(
+                    f"new setup skipped: {zone.direction} zone "
+                    f"{zone.bottom:.2f}-{zone.top:.2f} {decision.reason}"
+                )
+                return False
+            logger.info(
+                f"direction gate passed: {zone.direction} zone "
+                f"{zone.bottom:.2f}-{zone.top:.2f} {decision.reason}"
+            )
 
         # 1. SL — zone-bound formula (loosened-rules PR).
         sp_cfg = StrongPointConfig(
