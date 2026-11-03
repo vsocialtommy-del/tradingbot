@@ -202,11 +202,17 @@ class BotLoopConfig:
 
     max_simultaneous_setups: int = 3
     daily_loss_limit_pct: float = 10.0
-    ohlc_count: int = 1000
-    """Number of M5 bars to pull per pipeline run. 1000 ≈ 3.5 days of
-    history — wide enough that recent-but-not-current zones (24-48h
-    old) are still detectable. Pre-2026-05 default was 200 (~16 h),
-    which excluded zones the user trades manually."""
+    ohlc_count: int = 5000
+    """Number of M5 bars to pull per pipeline run. 5000 ≈ 17 trading
+    days (about 3.5 weeks). A zone stays tradeable for as long as it is
+    fresh (untouched since its BOS, not closed through), however old,
+    as long as it is inside this window. Nov 2026: 1000 → 5000; the old
+    3.5-day window dropped still-fresh zones the user trades manually."""
+
+    enable_flip_trading: bool = False
+    """Trade FLIPPED zones (SnD Flip, PR #38). Off by default: not part of
+    the XAUTISM method for now. The lifecycle still records flips, and
+    the code is kept so it can be switched back on later."""
     ohlc_timeframe: Literal["M5"] = "M5"
     error_backoff_seconds: float = 5.0
 
@@ -732,7 +738,10 @@ class Bot:
                 zone_ids[id(zone)] = zid
 
         # SnD Flip side path (PR #38): load FLIPPED zones from DB.
-        flipped_candidates = self._load_flipped_candidates(df)
+        flipped_candidates = (
+            self._load_flipped_candidates(df)
+            if self.config.enable_flip_trading else []
+        )
 
         # Refresh the per-tick placement queues. Each tuple is
         # (zone_view, zone_id). ``_try_place_pending`` pops entries

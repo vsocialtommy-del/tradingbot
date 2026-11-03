@@ -145,6 +145,8 @@ def validate_strong_point(
     refined: RefinedZone,
     df: pd.DataFrame,
     config: StrongPointConfig | None = None,
+    *,
+    swings: list[Swing] | None = None,
 ) -> ValidatedZone:
     """Decide whether ``refined`` is currently tradeable.
 
@@ -180,7 +182,9 @@ def validate_strong_point(
     broken_swing: Swing | None = None
     broken_at: pd.Timestamp | None = None
     if cfg.require_bos:
-        bos = find_bos(refined, df, swing_strength=cfg.bos_swing_strength)
+        bos = find_bos(
+            refined, df, swing_strength=cfg.bos_swing_strength, swings=swings,
+        )
         if bos is None:
             failures.append("NO_BOS")
             return _build_unvalidated(refined, failures)
@@ -216,6 +220,7 @@ def find_bos(
     df: pd.DataFrame,
     *,
     swing_strength: int = 2,
+    swings: list[Swing] | None = None,
 ) -> tuple[Swing, int] | None:
     """Find the first break of structure out of the base.
 
@@ -234,13 +239,14 @@ def find_bos(
     base_start = pattern.base.start_index
     base_end = pattern.base.end_index
     want = "HIGH" if refined.direction == "BUY" else "LOW"
-    swings = [
-        sw for sw in detect_swings(df, swing_strength)
+    all_swings = swings if swings is not None else detect_swings(df, swing_strength)
+    before = [
+        sw for sw in all_swings
         if sw.kind == want and sw.index < base_start
     ]
-    if not swings:
+    if not before:
         return None
-    ref = swings[-1]
+    ref = before[-1]
     closes = df["close"].to_numpy()
     for i in range(base_end + 1, len(df)):
         c = float(closes[i])

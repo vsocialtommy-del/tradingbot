@@ -196,6 +196,13 @@ def bot(
 # --------------------------------------------------------------------------- #
 
 
+def _enable_flips(bot_fixture: tuple[Bot, dict[str, MagicMock]]) -> None:
+    """Flip trading is off by default; flip tests switch it on."""
+    from dataclasses import replace
+    b, _ = bot_fixture
+    b.config = replace(b.config, enable_flip_trading=True)
+
+
 class TestElapsed:
     def test_none_returns_inf(self) -> None:
         assert _elapsed(None, NOW) == float("inf")
@@ -895,10 +902,11 @@ class TestDefaults:
         assert c.heartbeat_seconds == 300
         assert c.max_simultaneous_setups == 3
         assert c.daily_loss_limit_pct == 10.0
-        # 1000 M5 bars ≈ 3.5 days of history — wide enough for zones
-        # that formed 24-48 h ago to still be detectable. Pre-2026-05
-        # default was 200 (~16 h). See BotLoopConfig docstring.
-        assert c.ohlc_count == 1000
+        # 5000 M5 bars ≈ 17 trading days: fresh zones stay tradeable
+        # however old, within this window. See BotLoopConfig docstring.
+        assert c.ohlc_count == 5000
+        # SnD Flip trading is off by default (kept for later).
+        assert c.enable_flip_trading is False
         assert c.ohlc_timeframe == "M5"
 
 
@@ -1453,6 +1461,7 @@ class TestFlippedRetradeDedupSkip:
         mock_supabase: MagicMock, mock_mt5: MagicMock,
         mocker: MockerFixture,
     ) -> None:
+        _enable_flips(bot)
         # Reproduces the production case: zone 77fceff6 (BUY DBR
         # FLIPPED to SELL at 4704.32-4711.47). A previously-VIOLATED
         # SELL supply sits in the DB at the same price band — that's
@@ -2007,6 +2016,7 @@ class TestFlippedZoneTrading:
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mock_supabase: MagicMock, mocker: MockerFixture,
     ) -> None:
+        _enable_flips(bot)
         b, _ = bot
         b.state.last_config_refresh = NOW
         b.state.last_m5_bar_time = None
@@ -2113,6 +2123,7 @@ class TestFlippedZoneTrading:
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mock_supabase: MagicMock, mocker: MockerFixture,
     ) -> None:
+        _enable_flips(bot)
         # Symmetric to the above: the break happened BEFORE flipped_at
         # — it's pre-flip history. Should NOT disqualify the trade.
         b, mgrs = bot
@@ -2232,6 +2243,7 @@ class TestFlippedZoneTrading:
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mock_supabase: MagicMock, mocker: MockerFixture,
     ) -> None:
+        _enable_flips(bot)
         # Q3 lock-in: formed_at on the synthesised stub is flipped_at.
         b, _ = bot
         b.state.last_config_refresh = NOW
@@ -2680,6 +2692,7 @@ class TestPriceVsZoneGate:
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mock_supabase: MagicMock, mock_mt5: MagicMock, mocker: MockerFixture,
     ) -> None:
+        _enable_flips(bot)
         # Same flipped-SELL setup as above, but price has risen to
         # zone.bottom. Gate now passes; setup fires.
         b, _ = bot
@@ -2852,6 +2865,7 @@ class TestPerTickPlacement:
         mock_supabase: MagicMock, mock_mt5: MagicMock,
         mocker: MockerFixture,
     ) -> None:
+        _enable_flips(bot)
         # Flipped-zone path also rides the pending queue.
         b, _ = bot
         b.state.last_config_refresh = NOW
@@ -3068,6 +3082,7 @@ class TestZoneVisibilityGate:
         mock_supabase: MagicMock, mock_mt5: MagicMock,
         mocker: MockerFixture,
     ) -> None:
+        _enable_flips(bot)
         # PR #48's visibility gate is for the PIPELINE path only.
         # Flipped retrades (is_flipped_retrade=True) skip the gate —
         # the flipped path has its own existing safety guard
@@ -3341,3 +3356,19 @@ class TestDedupNewStructure:
         mock_supabase.get_zones_by_status.return_value = [live]
         candidate = _make_candidate_with_base_at(_hours_ago(0.5))
         assert b._zone_already_used(candidate) is True
+
+
+class TestFlipTradingDisabledByDefault:
+    def test_flipped_zones_not_loaded_when_disabled(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        assert b.config.enable_flip_trading is False
+        loader = mocker.patch.object(b, "_load_flipped_candidates", return_value=[])
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        b.run_iteration(NOW)
+        loader.assert_not_called()
+        assert b._pending_flipped_zones == []
