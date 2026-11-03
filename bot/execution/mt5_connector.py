@@ -369,6 +369,92 @@ class MT5Connector:
         result = self._send_order_with_retry(request)
         return int(result.order)
 
+    def place_stop_order(
+        self,
+        symbol: str,
+        direction: Direction,
+        lot_size: float,
+        price: float,
+        sl: float | None = None,
+        tp: float | None = None,
+        comment: str = "",
+    ) -> int:
+        """Place a pending BUY STOP / SELL STOP. Returns the order ticket.
+
+        XAUTISM layer 2: a buy stop at the zone top (sell stop at the
+        bottom) so the rest of the size goes in as price comes back out
+        of the zone. The broker holds it, so it fills even if the bot
+        lags. In MT5 the resulting position keeps the order's ticket.
+        """
+        self._ensure_symbol(symbol)
+        order_type = (
+            mt5.ORDER_TYPE_BUY_STOP
+            if direction == "BUY"
+            else mt5.ORDER_TYPE_SELL_STOP
+        )
+        request: dict[str, Any] = {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": symbol,
+            "volume": float(lot_size),
+            "type": order_type,
+            "price": float(price),
+            "deviation": self._deviation,
+            "magic": self._magic,
+            "comment": comment or "bot:stop",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_RETURN,
+        }
+        if sl is not None:
+            request["sl"] = float(sl)
+        if tp is not None:
+            request["tp"] = float(tp)
+        result = self._send_order_with_retry(request)
+        return int(result.order)
+
+    def cancel_pending_order(self, ticket: int) -> None:
+        """Delete a pending order (TRADE_ACTION_REMOVE)."""
+        request: dict[str, Any] = {
+            "action": mt5.TRADE_ACTION_REMOVE,
+            "order": int(ticket),
+        }
+        self._send_order_with_retry(request)
+
+    def get_pending_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        """List pending orders placed by this bot (filtered by magic)."""
+        orders = mt5.orders_get(symbol=symbol) if symbol else mt5.orders_get()
+        if orders is None:
+            return []
+        return [o._asdict() for o in orders if o.magic == self._magic]
+
+    def get_order_history_state(self, ticket: int) -> str | None:
+        """Final state of an order that has left the pending book.
+
+        Returns ``"FILLED"``, ``"CANCELED"``, ``"EXPIRED"``,
+        ``"REJECTED"`` or ``None`` if the history lookup found nothing.
+        """
+        orders = mt5.history_orders_get(ticket=int(ticket))
+        if not orders:
+            return None
+        state = orders[0].state
+        mapping = {
+            getattr(mt5, "ORDER_STATE_FILLED", -1): "FILLED",
+            getattr(mt5, "ORDER_STATE_CANCELED", -2): "CANCELED",
+            getattr(mt5, "ORDER_STATE_EXPIRED", -3): "EXPIRED",
+            getattr(mt5, "ORDER_STATE_REJECTED", -4): "REJECTED",
+        }
+        return mapping.get(state)
+
+    def get_min_stop_distance(self, symbol: str) -> float:
+        """Broker minimum distance (price units) between market and a
+        pending order / stop: ``trade_stops_level * point``. 0 if unknown."""
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            return 0.0
+        try:
+            return float(info.trade_stops_level) * float(info.point)
+        except Exception:
+            return 0.0
+
     def modify_order(
         self,
         ticket: int,

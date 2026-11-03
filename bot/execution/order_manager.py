@@ -300,6 +300,201 @@ def place_layered_orders(
     )
 
 
+def place_xautism_orders(
+    zone: ValidatedZone,
+    zone_id: UUID,
+    total_lots: float,
+    sl_price: float,
+    tp1_price: float,
+    *,
+    first_touch_lots: float = 0.01,
+    lot_step: float = 0.01,
+    mt5: MT5Connector,
+    supabase: SupabaseLogger,
+    tracker: PositionTracker,
+    config: OrderManagerConfig | None = None,
+) -> OrderPlacementResult:
+    """XAUTISM entry model (Nov 2026, step 6).
+
+    * Layer 1: ``first_touch_lots`` (0.01) as a market order the moment
+      price touches the zone edge. SL **and TP1 sit at the broker**.
+    * Layer 2: the rest of ``total_lots``, written as a WAITING row with
+      ``order_type='STOP'``. :mod:`bot.execution.layer2_stop` places it
+      at the broker as a BUY STOP at the zone top (SELL STOP at the
+      bottom) once price is far enough inside the zone, so it fills as
+      price comes back out. Same SL and TP as layer 1.
+    * No layer 3.
+
+    Planned prices on the setup row: layer 1 and layer 2 = the entry
+    edge, layer 3 = the far edge (kept for reference; no L3 trade).
+    """
+    cfg = config or OrderManagerConfig()
+    errors: list[str] = []
+
+    edge = zone.top if zone.direction == "BUY" else zone.bottom
+    far_edge = zone.bottom if zone.direction == "BUY" else zone.top
+
+    pre_check_error = _validate_inputs(zone, total_lots, sl_price, tp1_price)
+    if pre_check_error is not None:
+        errors.append(pre_check_error)
+        logger.warning(f"order_manager pre-check failed: {pre_check_error}")
+        return _failed_result(sl_price, tp1_price, errors)
+
+    l1_lots = min(first_touch_lots, total_lots)
+    l2_lots = _floor_lots(total_lots - l1_lots, lot_step)
+
+    try:
+        setup_row = supabase.log_setup(SetupInput(
+            zone_id=zone_id,
+            direction=zone.direction,
+            entry_mode="STRONG_POINT_FIRST_TOUCH",
+            planned_layer1_price=Decimal(str(edge)),
+            planned_layer2_price=Decimal(str(edge)),
+            planned_layer3_price=Decimal(str(far_edge)),
+            planned_sl_price=Decimal(str(sl_price)),
+            planned_tp1_price=Decimal(str(tp1_price)),
+            status="PENDING",
+        ))
+        setup_id = UUID(str(setup_row["id"]))
+    except Exception as e:
+        errors.append(f"Supabase log_setup failed: {e}")
+        logger.exception("order_manager: setup creation failed; aborting")
+        return _failed_result(sl_price, tp1_price, errors)
+
+    setup_id_short = str(setup_id)[:8]
+
+    try:
+        layer_1_ticket = mt5.place_market_order(
+            symbol=cfg.symbol,
+            direction=zone.direction,
+            lot_size=l1_lots,
+            sl=sl_price,
+            tp=tp1_price,  # broker-held TP (XAUTISM)
+            comment=f"bot:L1:s={setup_id_short}",
+        )
+    except Exception as e:
+        errors.append(f"Layer 1 market order failed: {e}")
+        logger.exception("order_manager: Layer 1 placement failed")
+        _try_log_event(
+            supabase, "ERROR", "Layer 1 placement failed",
+            context={"error": str(e)}, setup_id=setup_id,
+        )
+        return _failed_result(sl_price, tp1_price, errors, setup_id=setup_id)
+
+    layer_1_filled_price = _resolve_filled_price(mt5, cfg.symbol, layer_1_ticket)
+    if layer_1_filled_price is not None:
+        gap = _detect_gap_through(
+            zone, layer_1_filled_price, cfg.gap_tolerance_dollars
+        )
+        if gap is not None:
+            try:
+                mt5.close_position(layer_1_ticket)
+            except Exception as e:
+                errors.append(f"failed to close Layer 1 after gap: {e}")
+                logger.exception("order_manager: close-on-gap failed")
+            errors.append(gap)
+            _try_log_event(
+                supabase, "WARN", "Setup skipped: gap through zone",
+                context={
+                    "filled_price": layer_1_filled_price,
+                    "zone_top": zone.top,
+                    "zone_bottom": zone.bottom,
+                    "tolerance": cfg.gap_tolerance_dollars,
+                },
+                setup_id=setup_id,
+            )
+            return OrderPlacementResult(
+                setup_id=setup_id,
+                layer_1_ticket=layer_1_ticket,
+                layer_2_trade_id=None,
+                layer_3_trade_id=None,
+                layer_1_filled_price=layer_1_filled_price,
+                sl_price=sl_price,
+                tp1_price=tp1_price,
+                status="SKIPPED",
+                error_messages=errors,
+            )
+
+    try:
+        supabase.log_trade(TradeInput(
+            setup_id=setup_id,
+            layer_number=1,
+            direction=zone.direction,
+            order_type="MARKET",
+            mt5_ticket=layer_1_ticket,
+            entry_price=(
+                Decimal(str(layer_1_filled_price))
+                if layer_1_filled_price is not None else None
+            ),
+            lot_size=Decimal(str(l1_lots)),
+            sl_price=Decimal(str(sl_price)),
+            tp_price=Decimal(str(tp1_price)),
+            status="FILLED",
+        ))
+    except Exception as e:
+        errors.append(f"Layer 1 trade row write failed: {e}")
+        logger.exception(
+            "order_manager: Layer 1 trade row write failed — "
+            "broker has the order but Supabase doesn't; reconciliation needed"
+        )
+
+    layer_2_trade_id: UUID | None = None
+    if l2_lots > 0:
+        try:
+            row = supabase.log_trade(TradeInput(
+                setup_id=setup_id,
+                layer_number=2,
+                direction=zone.direction,
+                order_type="STOP",
+                mt5_ticket=None,
+                entry_price=None,
+                lot_size=Decimal(str(l2_lots)),
+                sl_price=Decimal(str(sl_price)),
+                tp_price=Decimal(str(tp1_price)),
+                status="WAITING",
+            ))
+            layer_2_trade_id = UUID(str(row["id"]))
+        except Exception as e:
+            errors.append(f"Layer 2 STOP trade row failed: {e}")
+            logger.exception("order_manager: Layer 2 STOP row write failed")
+
+    try:
+        tracker.update_setup_status(setup_id, "ACTIVE")
+    except Exception:
+        errors.append(
+            "Setup PENDING → ACTIVE transition failed; layer 2 won't be "
+            "placed until status is corrected. Reconciliation needed."
+        )
+        logger.exception(
+            f"order_manager: failed to promote setup {setup_id} to ACTIVE"
+        )
+
+    logger.info(
+        f"XAUTISM setup {setup_id_short}: L1 {l1_lots} lots @ market "
+        f"(edge {edge}), L2 {l2_lots} lots STOP @ {edge} pending, "
+        f"sl={sl_price} tp={tp1_price}"
+    )
+    return OrderPlacementResult(
+        setup_id=setup_id,
+        layer_1_ticket=layer_1_ticket,
+        layer_2_trade_id=layer_2_trade_id,
+        layer_3_trade_id=None,
+        layer_1_filled_price=layer_1_filled_price,
+        sl_price=sl_price,
+        tp1_price=tp1_price,
+        status="PLACED",
+        error_messages=errors,
+    )
+
+
+def _floor_lots(value: float, step: float) -> float:
+    """Floor to the lot step, guarding float noise (0.03 - 0.01 = 0.0199..)."""
+    if value <= 0:
+        return 0.0
+    n = int(value / step + 1e-9)
+    return round(n * step, 2)
+
+
 # --------------------------------------------------------------------------- #
 # Internals
 # --------------------------------------------------------------------------- #

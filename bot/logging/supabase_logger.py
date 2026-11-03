@@ -85,7 +85,7 @@ SetupStatus = Literal[
 TradeStatus = Literal[
     "WAITING", "FILLED", "PARTIALLY_CLOSED", "CLOSED", "CANCELLED"
 ]
-OrderType = Literal["MARKET", "LIMIT"]
+OrderType = Literal["MARKET", "LIMIT", "STOP"]
 CloseReason = Literal[
     # Per-layer TPs (PR #41; see migration 009).
     "TP1", "TP2", "TP3",
@@ -95,6 +95,9 @@ CloseReason = Literal[
     # previous layer's TP fired (cascade close on the parent setup).
     # Distinguishes the cascade path from MANUAL_CLOSE for analytics.
     "CASCADE_CANCELLED",
+    # Migration 015 (XAUTISM entries): an M5 candle closed beyond the far
+    # edge of the zone, so every layer was closed / cancelled.
+    "M5_CLOSE_EXIT",
     # PR #47 / migration 012: body-close-out-of-zone confirmation on
     # an M5 bar after entry. ZONE_EXIT = the shallowest FILLED layer
     # was closed at the trigger. ZONE_EXIT_CANCELLED = a WAITING
