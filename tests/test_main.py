@@ -196,6 +196,14 @@ def bot(
 # --------------------------------------------------------------------------- #
 
 
+def _disable_levels(bot_fixture: tuple[Bot, dict[str, MagicMock]]) -> None:
+    """Legacy SL/TP tests run with the XAUTISM levels switched off."""
+    from dataclasses import replace
+    from bot.strategy.levels import LevelsConfig
+    b, _ = bot_fixture
+    b.config = replace(b.config, levels=LevelsConfig(enabled=False))
+
+
 def _enable_flips(bot_fixture: tuple[Bot, dict[str, MagicMock]]) -> None:
     """Flip trading is off by default; flip tests switch it on."""
     from dataclasses import replace
@@ -1617,6 +1625,7 @@ class TestLoosenedRulesEntry:
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mocker: MockerFixture,
     ) -> None:
+        _disable_levels(bot)
         # Loosened-rules SL = zone.bottom - sl_buffer_points (BUY).
         # Default buffer 17.5 → SL = 1900.0 - 17.5 = 1882.5
         # (zone built by _make_validated_for_persistence: 1900.0 - 1900.5).
@@ -2016,6 +2025,7 @@ class TestFlippedZoneTrading:
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mock_supabase: MagicMock, mocker: MockerFixture,
     ) -> None:
+        _disable_levels(bot)
         _enable_flips(bot)
         b, _ = bot
         b.state.last_config_refresh = NOW
@@ -3410,3 +3420,34 @@ class TestDirectionGateIntegration:
         gate, place = self._run(bot, mock_mt5, mocker, allowed=True)
         gate.assert_called()
         place.assert_called_once()
+
+
+
+class TestXautismLevelsInPlacement:
+    def test_sl_is_30pct_and_tp1_is_bos_level(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        from dataclasses import replace
+        from bot.strategy.structure import Swing
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1900.4, "ask": 1900.5, "time": NOW, "time_msc": 0,
+        }
+        zone = _make_validated_for_persistence(_PT.DBR)
+        zone = replace(
+            zone,
+            broken_swing=Swing(index=0, time=pd.Timestamp(NOW), price=1910.0, kind="HIGH"),
+        )
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1920.0)
+        place = mocker.patch("bot.main.place_layered_orders")
+        b.run_iteration(NOW)
+        place.assert_called_once()
+        kw = place.call_args.kwargs
+        # Zone 1900.0-1900.5: 30% of 0.5 = 0.15 below the bottom.
+        assert kw["sl_price"] == pytest.approx(1899.85)
+        # BOS 1910.0 less the 0.3 spread buffer.
+        assert kw["tp1_price"] == pytest.approx(1909.7)
