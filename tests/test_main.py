@@ -3562,3 +3562,78 @@ class TestXautismMode:
         args, kw = run.call_args
         assert args[2] == df.index[-2]   # last *closed* bar
         assert kw["zone_bottom"] == 1895.0
+
+
+class TestStackedInMain:
+    def _setup_tick(self, b: Bot, mock_mt5: MagicMock, bid: float, ask: float) -> None:
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": bid, "ask": ask, "time": NOW, "time_msc": 0,
+        }
+
+    def test_stacked_setup_passes_plan_and_outer_sl(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        from dataclasses import replace
+        from bot.strategy.structure import Swing
+        from tests.test_order_manager import make_zone_for_test
+        b, _ = bot
+        _xautism(b)
+        self._setup_tick(b, mock_mt5, 1900.4, 1900.5)
+        first = replace(
+            _make_validated_for_persistence(_PT.DBR),
+            broken_swing=Swing(index=0, time=pd.Timestamp(NOW), price=1910.0, kind="HIGH"),
+        )
+        outer = make_zone_for_test(direction="BUY", top=1897.0, bottom=1895.0)
+        mocker.patch("bot.main.run_strategy_pipeline", side_effect=[[first, outer], []])
+        xa = mocker.patch("bot.main.place_xautism_orders")
+        b.run_iteration(NOW)
+        kw = xa.call_args.kwargs
+        assert kw["stacked"] is not None
+        assert kw["stacked"].outer_entry == 1897.0
+        assert kw["sl_price"] == pytest.approx(1894.4)   # 30% of 2 below 1895
+
+    def test_no_neighbour_means_normal_setup(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        from dataclasses import replace
+        from bot.strategy.structure import Swing
+        b, _ = bot
+        _xautism(b)
+        self._setup_tick(b, mock_mt5, 1900.4, 1900.5)
+        first = replace(
+            _make_validated_for_persistence(_PT.DBR),
+            broken_swing=Swing(index=0, time=pd.Timestamp(NOW), price=1910.0, kind="HIGH"),
+        )
+        mocker.patch("bot.main.run_strategy_pipeline", side_effect=[[first], []])
+        xa = mocker.patch("bot.main.place_xautism_orders")
+        b.run_iteration(NOW)
+        assert xa.call_args.kwargs["stacked"] is None
+
+    def test_m1_zones_are_scanned_as_outer_candidates(
+        self, bot: tuple[Bot, dict[str, MagicMock]], mocker: MockerFixture,
+    ) -> None:
+        from tests.test_order_manager import make_zone_for_test
+        b, mgrs = bot
+        _xautism(b)
+        m1 = make_zone_for_test(direction="SELL", top=1910.0, bottom=1908.0)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[m1])
+        b._refresh_stack_candidates([])
+        assert b._stack_candidates == [("M1", m1)]
+        tfs = [c.args[1] for c in mgrs["ohlc_provider"].get.call_args_list]
+        assert "M1" in tfs
+
+    def test_outer_zone_not_opened_on_its_own(
+        self, bot: tuple[Bot, dict[str, MagicMock]], mock_mt5: MagicMock,
+    ) -> None:
+        from bot.main import _stack_key
+        b, _ = bot
+        _xautism(b)
+        zone = _make_validated_for_persistence(_PT.DBR)
+        b._stacked_outer_keys.add(_stack_key(zone))
+        assert b._try_place_setup(
+            zone, make_ohlc(n=30), uuid4(), bid=1900.4, ask=1900.5,
+        ) is False
