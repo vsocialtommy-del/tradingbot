@@ -81,6 +81,7 @@ from bot.logging.supabase_logger import (
     SupabaseLogger,
     TradeInput,
 )
+from bot.strategy.stacked import StackedPlan
 from bot.strategy.strong_point import ValidatedZone
 
 PlacementStatus = Literal["PLACED", "FAILED", "SKIPPED"]
@@ -309,6 +310,7 @@ def place_xautism_orders(
     *,
     first_touch_lots: float = 0.01,
     lot_step: float = 0.01,
+    stacked: StackedPlan | None = None,
     mt5: MT5Connector,
     supabase: SupabaseLogger,
     tracker: PositionTracker,
@@ -333,6 +335,12 @@ def place_xautism_orders(
 
     edge = zone.top if zone.direction == "BUY" else zone.bottom
     far_edge = zone.bottom if zone.direction == "BUY" else zone.top
+    layer2_price = edge
+    layer2_type = "STOP"
+    if stacked is not None:
+        layer2_price = stacked.outer_entry
+        layer2_type = "LIMIT"
+        far_edge = stacked.outer_far_edge
 
     pre_check_error = _validate_inputs(zone, total_lots, sl_price, tp1_price)
     if pre_check_error is not None:
@@ -349,7 +357,7 @@ def place_xautism_orders(
             direction=zone.direction,
             entry_mode="STRONG_POINT_FIRST_TOUCH",
             planned_layer1_price=Decimal(str(edge)),
-            planned_layer2_price=Decimal(str(edge)),
+            planned_layer2_price=Decimal(str(layer2_price)),
             planned_layer3_price=Decimal(str(far_edge)),
             planned_sl_price=Decimal(str(sl_price)),
             planned_tp1_price=Decimal(str(tp1_price)),
@@ -445,7 +453,7 @@ def place_xautism_orders(
                 setup_id=setup_id,
                 layer_number=2,
                 direction=zone.direction,
-                order_type="STOP",
+                order_type=layer2_type,  # type: ignore[arg-type]
                 mt5_ticket=None,
                 entry_price=None,
                 lot_size=Decimal(str(l2_lots)),
@@ -455,8 +463,8 @@ def place_xautism_orders(
             ))
             layer_2_trade_id = UUID(str(row["id"]))
         except Exception as e:
-            errors.append(f"Layer 2 STOP trade row failed: {e}")
-            logger.exception("order_manager: Layer 2 STOP row write failed")
+            errors.append(f"Layer 2 {layer2_type} trade row failed: {e}")
+            logger.exception("order_manager: Layer 2 row write failed")
 
     try:
         tracker.update_setup_status(setup_id, "ACTIVE")
@@ -471,7 +479,8 @@ def place_xautism_orders(
 
     logger.info(
         f"XAUTISM setup {setup_id_short}: L1 {l1_lots} lots @ market "
-        f"(edge {edge}), L2 {l2_lots} lots STOP @ {edge} pending, "
+        f"(edge {edge}), L2 {l2_lots} lots {layer2_type} @ {layer2_price} "
+        f"pending{' (stacked)' if stacked else ''}, "
         f"sl={sl_price} tp={tp1_price}"
     )
     return OrderPlacementResult(

@@ -7,6 +7,8 @@ broker as a pending order:
 
 * BUY zone:  BUY STOP  at the zone top.
 * SELL zone: SELL STOP at the zone bottom.
+* Stacked setups (:mod:`bot.strategy.stacked`): a BUY / SELL LIMIT at
+  the outer zone's near edge instead, placed as soon as layer 1 is in.
 
 A buy stop has to sit above the current ask (a sell stop below the bid),
 so it can only be placed once price is inside the zone by at least the
@@ -112,7 +114,7 @@ class Layer2StopManager:
                 continue
             l2 = next(
                 (t for t in trades
-                 if t.layer_number == 2 and t.order_type == "STOP"
+                 if t.layer_number == 2 and t.order_type in ("STOP", "LIMIT")
                  and t.status == "WAITING"),
                 None,
             )
@@ -202,22 +204,30 @@ class Layer2StopManager:
         broker_min = self._safe(self._mt5.get_min_stop_distance, self._symbol) or 0.0
         min_dist = max(self._config.layer2_min_distance, broker_min)
 
-        if setup.direction == "BUY":
+        is_limit = l2.order_type == "LIMIT"
+        if is_limit:
+            # Stacked: buy limit below the market / sell limit above it.
+            if setup.direction == "BUY":
+                ready = ask >= stop_price + min_dist
+            else:
+                ready = bid <= stop_price - min_dist
+        elif setup.direction == "BUY":
             ready = ask <= stop_price - min_dist
         else:
             ready = bid >= stop_price + min_dist
         if not ready:
             return None
 
+        place = self._mt5.place_limit_order if is_limit else self._mt5.place_stop_order
         try:
-            ticket = self._mt5.place_stop_order(
+            ticket = place(
                 symbol=self._symbol,
                 direction=setup.direction,
                 lot_size=float(l2.lot_size),
                 price=stop_price,
                 sl=float(l2.sl_price),
                 tp=float(l2.tp_price) if l2.tp_price is not None else None,
-                comment=f"bot:L2stop:s={str(setup.id)[:8]}",
+                comment=f"bot:L2{'lim' if is_limit else 'stop'}:s={str(setup.id)[:8]}",
             )
         except Exception:
             logger.exception(
@@ -232,7 +242,7 @@ class Layer2StopManager:
                 f"(setup {setup.id}); reconciliation needed"
             )
         logger.info(
-            f"layer2 STOP placed: setup={setup.id} {setup.direction} "
+            f"layer2 {l2.order_type} placed: setup={setup.id} {setup.direction} "
             f"{l2.lot_size} lots @ {stop_price} ticket={ticket}"
         )
         return Layer2Event(setup.id, l2.id, "PLACED", ticket, stop_price)
@@ -256,8 +266,8 @@ class Layer2StopManager:
 
 
 def cancel_layer2_at_broker(mt5: MT5Connector, trade: Trade) -> None:
-    """Best-effort removal of a placed layer 2 stop (used by exits)."""
-    if trade.order_type == "STOP" and trade.mt5_ticket is not None:
+    """Best-effort removal of a placed layer 2 stop / limit (used by exits)."""
+    if trade.order_type in ("STOP", "LIMIT") and trade.mt5_ticket is not None:
         try:
             mt5.cancel_pending_order(trade.mt5_ticket)
         except Exception:

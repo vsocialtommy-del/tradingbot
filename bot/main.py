@@ -126,6 +126,7 @@ from bot.strategy.strong_point import (
 )
 from bot.strategy.direction_gate import DirectionGateConfig, check_direction
 from bot.strategy.levels import LevelsConfig, TradeLevels, compute_levels
+from bot.strategy.stacked import StackedConfig, StackedPlan, stacked_plan
 from bot.strategy.pipeline import (
     StrategyPipelineConfig,
     run_strategy_pipeline,
@@ -228,6 +229,11 @@ class BotLoopConfig:
     xautism_entries: XautismEntryConfig = field(default_factory=XautismEntryConfig)
     """0.01 first touch + layer 2 broker stop at the zone edge, SL and TP
     held at the broker, M5 close exit. See :mod:`bot.execution.layer2_stop`."""
+
+    stacked: StackedConfig = field(default_factory=StackedConfig)
+    """Two-zone layering: 0.01 at the first zone, main size as a limit at
+    a fresh zone just past it (M5 or M1, within 10 points), one SL 30 %
+    past the outer zone. See :mod:`bot.strategy.stacked`."""
 
     # Legacy trade management (Nov 2026: switched off for XAUTISM, code
     # kept). Turn these back on together with
@@ -362,6 +368,13 @@ class Bot:
         # successful placement; otherwise survive until the next M5
         # close refreshes the list (whatever the new pipeline output
         # plus current FLIPPED rows produce).
+        # Stacked layering: fresh zones that can act as the OUTER zone,
+        # refreshed on every M5 close. M1 zones only live here.
+        self._stack_candidates: list[tuple[str, ValidatedZone]] = []
+        # Outer zones already used by a placed stacked setup — never
+        # opened as their own setup.
+        self._stacked_outer_keys: set[tuple[str, float, float]] = set()
+
         self._pending_pipeline_zones: list[tuple[ValidatedZone, UUID]] = []
         self._pending_flipped_zones:  list[tuple[ValidatedZone, UUID]] = []
 
@@ -787,6 +800,12 @@ class Bot:
             logger.exception("main loop: strategy pipeline raised")
             return
 
+        try:
+            self._refresh_stack_candidates(zones)
+        except Exception:
+            logger.exception("stacked: candidate refresh raised; no stacking this bar")
+            self._stack_candidates = []
+
         # Persist every tradeable zone to Supabase. Each zone gets
         # exactly one row, regardless of how many times it's
         # re-detected in subsequent pipeline runs (idempotency via
@@ -845,6 +864,33 @@ class Bot:
                     "zone snapshot write raised; visualization will "
                     "be stale until the next M5 close"
                 )
+
+    def _refresh_stack_candidates(self, m5_zones: list[ValidatedZone]) -> None:
+        """Fresh M5 zones (+ M1 zones) that can be the outer zone of a
+        stacked setup."""
+        cfg = self.config.stacked
+        if not (cfg.enabled and self.config.xautism_entries.enabled):
+            self._stack_candidates = []
+            return
+        cands: list[tuple[str, ValidatedZone]] = [
+            ("M5", z) for z in m5_zones
+            if z.is_strong_point and z.refined_zone.is_tradeable
+        ]
+        if cfg.use_m1_zones:
+            try:
+                df_m1 = self.ohlc_provider.get(
+                    self.config.symbol, "M1", cfg.m1_ohlc_count,
+                )
+                m1_zones = run_strategy_pipeline(
+                    df_m1, self.strategy_pipeline_config,
+                )
+                cands.extend(
+                    ("M1", z) for z in m1_zones
+                    if z.is_strong_point and z.refined_zone.is_tradeable
+                )
+            except Exception:
+                logger.exception("stacked: M1 zone scan failed; M5 outer zones only")
+        self._stack_candidates = cands
 
     def _refresh_chart_zone_snapshot(self, df: pd.DataFrame) -> None:
         """Pull renderable zones from Supabase + push to the CSV file.
@@ -1019,17 +1065,16 @@ class Bot:
         self.state.last_exit_bar_time = bar_time
         bar = df.iloc[-2]
         for setup in setups:
-            try:
-                zone_row = self.supabase.get_zone_by_id(setup.zone_id)
-            except Exception:
-                logger.exception(f"m5 close exit: zone lookup failed for {setup.id}")
-                continue
-            if zone_row is None:
-                continue
+            # planned_layer3_price is the far edge of the setup: the
+            # zone's own far edge, or the OUTER zone's on a stacked setup
+            # (price closing past the first zone on its way to the outer
+            # zone is the plan, not an exit).
+            edge = float(setup.planned_layer1_price)
+            far = float(setup.planned_layer3_price)
             run_m5_close_exit(
                 setup, bar, bar_time,
-                zone_top=float(zone_row.top),
-                zone_bottom=float(zone_row.bottom),
+                zone_top=max(edge, far),
+                zone_bottom=min(edge, far),
                 mt5=self.mt5,
                 tracker=self.position_tracker,
             )
@@ -1458,6 +1503,16 @@ class Bot:
             )
             return False
 
+        # 0-stacked: this zone is already the outer half of a placed
+        # stacked setup; its layer 2 limit covers it.
+        if _stack_key(zone) in self._stacked_outer_keys:
+            logger.info(
+                f"new setup skipped: {zone.direction} zone "
+                f"{zone.bottom:.2f}-{zone.top:.2f} is the outer zone of a "
+                f"stacked setup"
+            )
+            return False
+
         # 0a. PR #48: zone-visibility gate (pipeline path only).
         # Refuse to place a fresh setup if any candle since formation
         # has bodied through the zone — the zone has been obscured /
@@ -1556,6 +1611,25 @@ class Bot:
                 f"{'' if levels.swing_price is None else f' swing {levels.swing_price:.2f}'}) "
                 f"tp1={levels.tp1}"
             )
+        # 1b. Stacked (Nov 2026): fresh zone just past this one → split
+        # the layers across both, one SL 30 % past the outer zone.
+        stack: StackedPlan | None = None
+        if (
+            self.config.xautism_entries.enabled
+            and self.config.stacked.enabled
+            and not is_flipped_retrade
+        ):
+            stack = stacked_plan(zone, self._stack_candidates, self.config.stacked)
+            if stack is not None:
+                sl_price = stack.sl
+                logger.info(
+                    f"stacked: {zone.direction} {zone.bottom:.2f}-{zone.top:.2f} "
+                    f"+ {stack.outer_timeframe} zone "
+                    f"{stack.outer_bottom:.2f}-{stack.outer_top:.2f} "
+                    f"(gap {stack.gap_points:.2f}); layer 2 limit "
+                    f"@ {stack.outer_entry:.2f}, sl={stack.sl:.2f}"
+                )
+
         sl_validation = self.sl_manager.validate_sl_distance(
             entry_price=entry_price,
             sl_price=sl_price,
@@ -1597,7 +1671,7 @@ class Bot:
         if self.config.xautism_entries.enabled:
             return self._place_xautism(
                 zone, zone_id, entry_price=entry_price,
-                sl_price=sl_price, tp1_price=tp1_price,
+                sl_price=sl_price, tp1_price=tp1_price, stack=stack,
             )
 
         tp2_price = find_nearest_local_peak(
@@ -1675,8 +1749,10 @@ class Bot:
     def _place_xautism(
         self, zone: ValidatedZone, zone_id: UUID, *,
         entry_price: float, sl_price: float, tp1_price: float,
+        stack: StackedPlan | None = None,
     ) -> bool:
-        """0.01 first touch now; the rest as a layer 2 broker stop."""
+        """0.01 first touch now; the rest as a layer 2 broker stop (or,
+        stacked, a limit at the outer zone)."""
         try:
             balance = self.mt5.get_balance()
         except Exception:
@@ -1684,7 +1760,8 @@ class Bot:
             return False
         lot_result = calculate_lot_size(
             balance=balance,
-            entry_price=entry_price,
+            # Stacked: the main size goes in at the outer zone.
+            entry_price=stack.outer_entry if stack is not None else entry_price,
             sl_price=sl_price,
             config=self.sizing_config,
         )
@@ -1702,6 +1779,7 @@ class Bot:
                 tp1_price=tp1_price,
                 first_touch_lots=xc.first_touch_lots,
                 lot_step=xc.lot_step,
+                stacked=stack,
                 mt5=self.mt5,
                 supabase=self.supabase,
                 tracker=self.position_tracker,
@@ -1712,6 +1790,12 @@ class Bot:
             return False
         if result.status == "PLACED":
             self.position_tracker.invalidate_active_setups_cache()
+            if stack is not None:
+                self._stacked_outer_keys.add((
+                    zone.direction,
+                    round(stack.outer_top, 2),
+                    round(stack.outer_bottom, 2),
+                ))
             logger.info(
                 f"new XAUTISM setup placed: id={result.setup_id} "
                 f"direction={zone.direction} "
@@ -1970,6 +2054,10 @@ def _parse_pause_until(raw: object) -> datetime | None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
     return None
+
+
+def _stack_key(zone: Any) -> tuple[str, float, float]:
+    return (zone.direction, round(float(zone.top), 2), round(float(zone.bottom), 2))
 
 
 def _zone_key_from_validated(
