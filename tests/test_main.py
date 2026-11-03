@@ -3372,3 +3372,41 @@ class TestFlipTradingDisabledByDefault:
         b.run_iteration(NOW)
         loader.assert_not_called()
         assert b._pending_flipped_zones == []
+
+
+class TestDirectionGateIntegration:
+    def _run(self, bot, mock_mt5, mocker, allowed: bool):
+        from bot.strategy.direction_gate import DirectionDecision
+        from bot.strategy.structure import StructureState
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1900.4, "ask": 1900.5, "time": NOW, "time_msc": 0,
+        }
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        gate = mocker.patch(
+            "bot.main.check_direction",
+            return_value=DirectionDecision(allowed, StructureState.DOWNTREND, "test"),
+        )
+        place = mocker.patch("bot.main.place_layered_orders")
+        b.run_iteration(NOW)
+        return gate, place
+
+    def test_blocked_direction_skips_placement(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        gate, place = self._run(bot, mock_mt5, mocker, allowed=False)
+        gate.assert_called()
+        place.assert_not_called()
+
+    def test_allowed_direction_reaches_placement(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        gate, place = self._run(bot, mock_mt5, mocker, allowed=True)
+        gate.assert_called()
+        place.assert_called_once()
