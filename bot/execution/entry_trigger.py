@@ -117,6 +117,10 @@ class EntryTrigger:
             for trade in self._supabase.get_trades_for_setup(setup.id):
                 if trade.status != "WAITING":
                     continue
+                if trade.order_type == "STOP":
+                    # XAUTISM layer 2 lives at the broker as a stop
+                    # order; layer2_stop owns it. Never market-fire it.
+                    continue
                 trigger = _trigger_price(setup, trade)
                 if _trigger_met_live(setup, trigger, bid, ask):
                     result = self._fire_layer(setup, trade)
@@ -141,6 +145,10 @@ class EntryTrigger:
             bars = _bars_since_activation(setup, df)
             for trade in self._supabase.get_trades_for_setup(setup.id):
                 if trade.status != "WAITING":
+                    continue
+                if trade.order_type == "STOP":
+                    # XAUTISM layer 2 lives at the broker as a stop
+                    # order; layer2_stop owns it. Never market-fire it.
                     continue
                 trigger = _trigger_price(setup, trade)
                 if _trigger_met_history(setup, trigger, bars):

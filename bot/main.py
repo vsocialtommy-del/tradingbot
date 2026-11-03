@@ -85,10 +85,17 @@ from bot.execution.mt5_connector import MT5Connector
 from bot.execution.order_manager import (
     OrderManagerConfig,
     place_layered_orders,
+    place_xautism_orders,
 )
 from bot.execution.position_tracker import PositionTracker
 from bot.exits.sl_manager import SLManager, SLManagerConfig
 from bot.exits.tp_manager import TPManager
+from bot.execution.layer2_stop import (
+    Layer2StopManager,
+    XautismEntryConfig,
+    cancel_layer2_at_broker,
+)
+from bot.exits.m5_close_exit import run_m5_close_exit
 from bot.exits.trailing_stop_manager import TrailingStopManager
 from bot.exits.zone_exit_manager import ZoneExitManager
 from bot.signals.next_signal_writer import NextSignalWriter
@@ -218,6 +225,24 @@ class BotLoopConfig:
     levels: LevelsConfig = field(default_factory=LevelsConfig)
     """Entry / SL / TP1 rules. See :mod:`bot.strategy.levels`."""
 
+    xautism_entries: XautismEntryConfig = field(default_factory=XautismEntryConfig)
+    """0.01 first touch + layer 2 broker stop at the zone edge, SL and TP
+    held at the broker, M5 close exit. See :mod:`bot.execution.layer2_stop`."""
+
+    # Legacy trade management (Nov 2026: switched off for XAUTISM, code
+    # kept). Turn these back on together with
+    # ``xautism_entries.enabled=False`` to run the old 3-layer model.
+    enable_bot_managed_tp: bool = False
+    """Per-layer bot-fired TPs with SL cascade to break even (PR #41)."""
+    enable_zone_exit_be: bool = False
+    """Zone-exit close + break even on body close out of zone (PR #47)."""
+    enable_trailing_stop: bool = False
+    """30 % activation trailing stop."""
+    enable_zone_death_cancel: bool = False
+    """Cancel WAITING layers once a candle body enters the zone (PR #48).
+    Off for XAUTISM: price going into the zone is how layer 2 gets set
+    up; the M5 close exit handles a zone that's been closed through."""
+
     enable_flip_trading: bool = False
     """Trade FLIPPED zones (SnD Flip, PR #38). Off by default: not part of
     the XAUTISM method for now. The lifecycle still records flips, and
@@ -240,6 +265,7 @@ class BotState:
     pause_until: datetime | None = None
     fired_layer_count: int = 0
     tp1_count: int = 0
+    last_exit_bar_time: pd.Timestamp | None = None
     placed_setup_count: int = 0
     iteration_count: int = 0
 
@@ -306,6 +332,10 @@ class Bot:
         )
         self.entry_trigger = EntryTrigger(
             mt5, supabase, self.position_tracker,
+        )
+        self.layer2_stop_manager = Layer2StopManager(
+            mt5, supabase, self.position_tracker,
+            self.config.xautism_entries, symbol=self.config.symbol,
         )
         self.news_filter = NewsFilter(
             supabase, config=self.news_filter_config,
@@ -469,7 +499,29 @@ class Bot:
         except Exception:
             logger.exception("main loop: entry_trigger.check_live failed")
 
+        # 3a. XAUTISM layer 2: place / track / cancel the broker stop.
+        if self.config.xautism_entries.enabled:
+            try:
+                self.layer2_stop_manager.check_live(
+                    bid, ask, self.config.xautism_entries,
+                )
+            except Exception:
+                logger.exception("main loop: layer2_stop.check_live failed")
+
+        # 3b. M5 close exit (runs even while news / halt block new setups).
+        if (
+            self.config.xautism_entries.enabled
+            and self.config.xautism_entries.m5_close_exit
+        ):
+            try:
+                self._run_m5_close_exit_pass()
+            except Exception:
+                logger.exception("main loop: m5 close exit pass raised")
+
         for setup in self._safe_get_active_setups():
+            if not self.config.enable_bot_managed_tp:
+                # XAUTISM: TP sits at the broker on every layer.
+                break
             if setup.status != "ACTIVE":
                 # PENDING: Layer 1 not yet filled. TP1_HIT: legacy state
                 # from the pre-PR-41 cascade — no new transitions to it,
@@ -528,13 +580,15 @@ class Bot:
                 # lifecycle pass inside _detect_new_zones) are already
                 # accounted for. Setups still ACTIVE here are the ones
                 # whose body-close-out-of-zone should fire.
-                self._run_zone_exit_pass(bid=bid, ask=ask)
+                if self.config.enable_zone_exit_be:
+                    self._run_zone_exit_pass(bid=bid, ask=ask)
                 # Trailing-stop pass: locks in progressive profit on
                 # L1-only setups. Runs AFTER zone-exit so the
                 # comparison is against the (possibly just-BE'd) SL,
                 # and only tightens further when the 30 % activation
                 # threshold is reached.
-                self._run_trailing_stop_pass(bid=bid, ask=ask)
+                if self.config.enable_trailing_stop:
+                    self._run_trailing_stop_pass(bid=bid, ask=ask)
                 # PR #51: refresh the dashboard signal snapshot.
                 # Strictly operator-facing — wrapped so any failure
                 # is logged and the trading loop continues.
@@ -546,7 +600,7 @@ class Bot:
         # underlying body-cross count only changes on M5 close (the
         # df we use is the post-M5-close snapshot), so per-tick is
         # cheap repeated work that catches state changes promptly.
-        if not self._is_paused(now):
+        if self.config.enable_zone_death_cancel and not self._is_paused(now):
             try:
                 self._run_zone_death_pass()
             except Exception:
@@ -939,6 +993,47 @@ class Bot:
             f"SELL={outcome.get('SELL')}"
         )
 
+    def _run_m5_close_exit_pass(self) -> None:
+        """XAUTISM: close everything on a setup once an M5 candle closes
+        beyond the far edge of its zone. Once per closed bar."""
+        setups = [s for s in self._safe_get_active_setups() if s.status == "ACTIVE"]
+        if not setups:
+            return
+        try:
+            df = self.ohlc_provider.get(
+                self.config.symbol, self.config.ohlc_timeframe,
+                self.config.ohlc_count,
+            )
+        except Exception:
+            logger.exception("m5 close exit: OHLC fetch failed")
+            return
+        if len(df) < 2:
+            return
+        # Last row is the forming bar; the one before it just closed.
+        bar_time = df.index[-2]
+        if (
+            self.state.last_exit_bar_time is not None
+            and bar_time <= self.state.last_exit_bar_time
+        ):
+            return
+        self.state.last_exit_bar_time = bar_time
+        bar = df.iloc[-2]
+        for setup in setups:
+            try:
+                zone_row = self.supabase.get_zone_by_id(setup.zone_id)
+            except Exception:
+                logger.exception(f"m5 close exit: zone lookup failed for {setup.id}")
+                continue
+            if zone_row is None:
+                continue
+            run_m5_close_exit(
+                setup, bar, bar_time,
+                zone_top=float(zone_row.top),
+                zone_bottom=float(zone_row.bottom),
+                mt5=self.mt5,
+                tracker=self.position_tracker,
+            )
+
     def _run_zone_death_pass(self) -> None:
         """PR #48: per-tick zone-visibility check for ACTIVE setups.
 
@@ -1012,6 +1107,7 @@ class Bot:
                           # by other paths
 
             for trade in waiting:
+                cancel_layer2_at_broker(self.mt5, trade)
                 try:
                     self.position_tracker.update_trade_status(
                         trade.id,
@@ -1498,6 +1594,12 @@ class Bot:
                 f"entry {entry_price:.2f}"
             )
             return False
+        if self.config.xautism_entries.enabled:
+            return self._place_xautism(
+                zone, zone_id, entry_price=entry_price,
+                sl_price=sl_price, tp1_price=tp1_price,
+            )
+
         tp2_price = find_nearest_local_peak(
             ohlc_df,
             entry_price=tp1_price,
@@ -1559,6 +1661,59 @@ class Bot:
             self.position_tracker.invalidate_active_setups_cache()
             logger.info(
                 f"new setup placed: id={result.setup_id} "
+                f"direction={zone.direction} "
+                f"layer1_ticket={result.layer_1_ticket} "
+                f"sl={result.sl_price} tp1={result.tp1_price}"
+            )
+            return True
+        logger.warning(
+            f"new setup not placed: status={result.status} "
+            f"errors={result.error_messages}"
+        )
+        return False
+
+    def _place_xautism(
+        self, zone: ValidatedZone, zone_id: UUID, *,
+        entry_price: float, sl_price: float, tp1_price: float,
+    ) -> bool:
+        """0.01 first touch now; the rest as a layer 2 broker stop."""
+        try:
+            balance = self.mt5.get_balance()
+        except Exception:
+            logger.exception("new setup: get_balance failed; skipping zone")
+            return False
+        lot_result = calculate_lot_size(
+            balance=balance,
+            entry_price=entry_price,
+            sl_price=sl_price,
+            config=self.sizing_config,
+        )
+        if lot_result.lot_size <= 0:
+            logger.warning(
+                f"new setup skipped: zero lot size ({lot_result.reason})"
+            )
+            return False
+        xc = self.config.xautism_entries
+        try:
+            result = place_xautism_orders(
+                zone, zone_id,
+                total_lots=lot_result.lot_size,
+                sl_price=sl_price,
+                tp1_price=tp1_price,
+                first_touch_lots=xc.first_touch_lots,
+                lot_step=xc.lot_step,
+                mt5=self.mt5,
+                supabase=self.supabase,
+                tracker=self.position_tracker,
+                config=self.order_manager_config,
+            )
+        except Exception:
+            logger.exception("new setup: place_xautism_orders raised")
+            return False
+        if result.status == "PLACED":
+            self.position_tracker.invalidate_active_setups_cache()
+            logger.info(
+                f"new XAUTISM setup placed: id={result.setup_id} "
                 f"direction={zone.direction} "
                 f"layer1_ticket={result.layer_1_ticket} "
                 f"sl={result.sl_price} tp1={result.tp1_price}"

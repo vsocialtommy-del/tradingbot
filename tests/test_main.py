@@ -33,6 +33,7 @@ from bot.filters.news_filter import (
     NewsFilter,
 )
 from bot.logging.supabase_logger import Setup, SupabaseLogger
+from bot.execution.layer2_stop import Layer2StopManager, XautismEntryConfig
 from bot.main import (
     Bot,
     BotLoopConfig,
@@ -167,6 +168,9 @@ def _replace_managers(
     bot.news_filter = mocker.MagicMock(spec=NewsFilter)
     bot.news_filter.check.return_value = NewsCheckResult(is_blocked=False)
 
+    bot.layer2_stop_manager = mocker.MagicMock(spec=Layer2StopManager)
+    bot.layer2_stop_manager.check_live.return_value = []
+
     return {
         "position_tracker": bot.position_tracker,
         "ohlc_provider": bot.ohlc_provider,
@@ -174,6 +178,7 @@ def _replace_managers(
         "sl_manager": bot.sl_manager,
         "entry_trigger": bot.entry_trigger,
         "news_filter": bot.news_filter,
+        "layer2_stop_manager": bot.layer2_stop_manager,
     }
 
 
@@ -184,6 +189,9 @@ def bot(
 ) -> tuple[Bot, dict[str, MagicMock]]:
     b = Bot(mt5=mock_mt5, supabase=mock_supabase)
     mgrs = _replace_managers(b, mocker)
+    # The pre-XAUTISM suite exercises the legacy 3-layer model with bot
+    # management on. XAUTISM tests switch back with ``_xautism(...)``.
+    _legacy_management(b)
     # Initialise the runtime state as if startup ran (without actually
     # calling .initialize() — tests should be able to drive a single
     # iteration without the connect/reconcile side effects).
@@ -194,6 +202,32 @@ def bot(
 # --------------------------------------------------------------------------- #
 # Module-level helpers
 # --------------------------------------------------------------------------- #
+
+
+def _legacy_management(b: Bot) -> None:
+    from dataclasses import replace
+    b.config = replace(
+        b.config,
+        xautism_entries=XautismEntryConfig(enabled=False),
+        enable_bot_managed_tp=True,
+        enable_zone_exit_be=True,
+        enable_trailing_stop=True,
+        enable_zone_death_cancel=True,
+    )
+
+
+def _xautism(b: Bot) -> None:
+    """Back to the shipped defaults: XAUTISM entries, legacy management off."""
+    from dataclasses import replace
+    d = BotLoopConfig()
+    b.config = replace(
+        b.config,
+        xautism_entries=d.xautism_entries,
+        enable_bot_managed_tp=d.enable_bot_managed_tp,
+        enable_zone_exit_be=d.enable_zone_exit_be,
+        enable_trailing_stop=d.enable_trailing_stop,
+        enable_zone_death_cancel=d.enable_zone_death_cancel,
+    )
 
 
 def _disable_levels(bot_fixture: tuple[Bot, dict[str, MagicMock]]) -> None:
@@ -3451,3 +3485,80 @@ class TestXautismLevelsInPlacement:
         assert kw["sl_price"] == pytest.approx(1899.85)
         # BOS 1910.0 less the 0.3 spread buffer.
         assert kw["tp1_price"] == pytest.approx(1909.7)
+
+
+class TestXautismMode:
+    def test_defaults(self) -> None:
+        c = BotLoopConfig()
+        assert c.xautism_entries.enabled is True
+        assert c.xautism_entries.first_touch_lots == 0.01
+        assert c.xautism_entries.m5_close_exit is True
+        assert c.enable_bot_managed_tp is False
+        assert c.enable_zone_exit_be is False
+        assert c.enable_trailing_stop is False
+        assert c.enable_zone_death_cancel is False
+
+    def test_legacy_managers_not_run(
+        self, bot: tuple[Bot, dict[str, MagicMock]], mocker: MockerFixture,
+    ) -> None:
+        b, mgrs = bot
+        _xautism(b)
+        mgrs["position_tracker"].get_active_setups.return_value = [make_setup()]
+        zx = mocker.patch.object(b, "_run_zone_exit_pass")
+        tr = mocker.patch.object(b, "_run_trailing_stop_pass")
+        zd = mocker.patch.object(b, "_run_zone_death_pass")
+        mocker.patch.object(b, "_run_m5_close_exit_pass")
+        b.run_iteration(NOW)
+        mgrs["tp_manager"].check.assert_not_called()
+        mgrs["layer2_stop_manager"].check_live.assert_called_once()
+        zx.assert_not_called()
+        tr.assert_not_called()
+        zd.assert_not_called()
+
+    def test_placement_uses_first_touch_plus_stop(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        from dataclasses import replace
+        from bot.strategy.structure import Swing
+        b, _ = bot
+        _xautism(b)
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1900.4, "ask": 1900.5, "time": NOW, "time_msc": 0,
+        }
+        zone = replace(
+            _make_validated_for_persistence(_PT.DBR),
+            broken_swing=Swing(index=0, time=pd.Timestamp(NOW), price=1910.0, kind="HIGH"),
+        )
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        legacy = mocker.patch("bot.main.place_layered_orders")
+        xa = mocker.patch("bot.main.place_xautism_orders")
+        b.run_iteration(NOW)
+        legacy.assert_not_called()
+        xa.assert_called_once()
+        kw = xa.call_args.kwargs
+        assert kw["sl_price"] == pytest.approx(1899.85)
+        assert kw["tp1_price"] == pytest.approx(1909.7)
+        assert kw["first_touch_lots"] == 0.01
+        assert kw["total_lots"] > 0
+
+    def test_m5_close_exit_pass_once_per_bar(
+        self, bot: tuple[Bot, dict[str, MagicMock]], mocker: MockerFixture,
+    ) -> None:
+        b, mgrs = bot
+        _xautism(b)
+        s = make_setup()
+        mgrs["position_tracker"].get_active_setups.return_value = [s]
+        df = make_ohlc(n=30)
+        mgrs["ohlc_provider"].get.return_value = df
+        zone_row = MagicMock(top=1900.0, bottom=1895.0)
+        b.supabase.get_zone_by_id.return_value = zone_row
+        run = mocker.patch("bot.main.run_m5_close_exit")
+        b._run_m5_close_exit_pass()
+        b._run_m5_close_exit_pass()   # same bar: no second call
+        run.assert_called_once()
+        args, kw = run.call_args
+        assert args[2] == df.index[-2]   # last *closed* bar
+        assert kw["zone_bottom"] == 1895.0
