@@ -1509,8 +1509,9 @@ class TestFlippedRetradeDedupSkip:
         mock_supabase: MagicMock, mock_mt5: MagicMock,
         mocker: MockerFixture,
     ) -> None:
-        # Pipeline (fresh-detection) path is unchanged: a CONSUMED
-        # same-direction zone at the same band still blocks placement.
+        # Pipeline (fresh-detection) path: a CONSUMED same-direction
+        # zone at the same band still blocks a re-detection of the SAME
+        # structure (base formed before that zone was consumed).
         b, _ = bot
         b.state.last_config_refresh = NOW
         b.state.last_m5_bar_time = None
@@ -1519,7 +1520,7 @@ class TestFlippedRetradeDedupSkip:
             "bid": 1900.5, "ask": 1900.6, "time": NOW, "time_msc": 0,
         }
 
-        zone = _make_validated_for_persistence(_PT.RBR)
+        zone = _make_candidate_with_base_at(NOW - timedelta(hours=2))
         existing_consumed = _make_zone_row(
             direction="BUY",  # same direction as the candidate
             top=1900.5, bottom=1900.0,
@@ -3264,3 +3265,79 @@ class TestZoneDeathPass:
             if c.kwargs.get("close_reason") == "ZONE_DEAD_CANCELLED"
         ]
         assert cancel_calls == []
+
+
+# --------------------------------------------------------------------------- #
+# Dedup only blocks re-detections of the SAME structure. A new base that
+# forms after an overlapping zone was used / broken is a new zone and must
+# be allowed through, even inside the freshness window.
+# --------------------------------------------------------------------------- #
+
+
+def _make_candidate_with_base_at(base_after: datetime) -> _ValidatedZone:
+    from dataclasses import replace
+    c = _make_validated_for_persistence(_PT.RBR)
+    ts = pd.Timestamp(base_after)
+    imp = replace(c.source_pattern.impulse_before, start_time=ts, end_time=ts)
+    pattern = replace(c.source_pattern, impulse_before=imp)
+    return replace(c, source_pattern=pattern)
+
+
+class TestDedupNewStructure:
+    def test_new_base_after_consumed_zone_is_allowed(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        b, _ = bot
+        old = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONSUMED", consumed_at=_hours_ago(2),
+            created_at=_hours_ago(3),
+        )
+        mock_supabase.get_zones_by_status.return_value = [old]
+        candidate = _make_candidate_with_base_at(_hours_ago(1))
+        assert b._zone_already_used(candidate) is False
+
+    def test_same_structure_redetected_still_blocks(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        b, _ = bot
+        old = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONSUMED", consumed_at=_hours_ago(1),
+            created_at=_hours_ago(3),
+        )
+        mock_supabase.get_zones_by_status.return_value = [old]
+        # Base formed before the old zone was touched -> same structure.
+        candidate = _make_candidate_with_base_at(_hours_ago(2))
+        assert b._zone_already_used(candidate) is True
+
+    def test_new_base_after_violated_zone_is_allowed(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        b, _ = bot
+        old = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="VIOLATED", consumed_at=_hours_ago(4),
+            violated_at=_hours_ago(3), created_at=_hours_ago(5),
+        )
+        mock_supabase.get_zones_by_status.return_value = [old]
+        candidate = _make_candidate_with_base_at(_hours_ago(1))
+        assert b._zone_already_used(candidate) is False
+
+    def test_live_confirmed_overlap_still_blocks_new_base(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        # A live (CONFIRMED) overlapping zone is the duplicate case from
+        # PR #59 and keeps blocking regardless of base time.
+        b, _ = bot
+        live = _make_zone_row(
+            direction="BUY", top=1905.0, bottom=1900.0,
+            status="CONFIRMED", created_at=_hours_ago(1),
+        )
+        mock_supabase.get_zones_by_status.return_value = [live]
+        candidate = _make_candidate_with_base_at(_hours_ago(0.5))
+        assert b._zone_already_used(candidate) is True

@@ -138,6 +138,41 @@ from bot.strategy.zone_lifecycle import (
 )
 
 
+def _zone_dead_at(zone: Any) -> datetime | None:
+    """When an existing zone stopped being fresh (first touch, break or
+    flip), or ``None`` if it is still live (CONFIRMED / ACTIVE)."""
+    times = [
+        t for t in (
+            getattr(zone, "consumed_at", None),
+            getattr(zone, "violated_at", None),
+            getattr(zone, "flipped_at", None),
+        )
+        if t is not None
+    ]
+    return min(times) if times else None
+
+
+def _base_formed_after(candidate: Any, dead_at: datetime) -> bool:
+    """True iff the candidate's base started after ``dead_at``.
+
+    The base begins on the bar after ``impulse_before`` ends, so an
+    ``impulse_before.end_time`` strictly after ``dead_at`` means the
+    whole base formed once the old zone was used. A tie (same bar) is
+    treated as the same structure. Missing pattern data -> ``False``
+    (keep the conservative block).
+    """
+    try:
+        base_ref = pd.Timestamp(candidate.source_pattern.impulse_before.end_time)
+        dead = pd.Timestamp(dead_at)
+        if base_ref.tzinfo is None:
+            base_ref = base_ref.tz_localize("UTC")
+        if dead.tzinfo is None:
+            dead = dead.tz_localize("UTC")
+        return bool(base_ref > dead)
+    except Exception:
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # Config + state
 # --------------------------------------------------------------------------- #
@@ -1648,8 +1683,23 @@ class Bot:
                 top=float(z.top),
                 bottom=float(z.bottom),
             )
-            if zone_bounds_overlap(candidate_ref, existing_ref):
-                return True
+            if not zone_bounds_overlap(candidate_ref, existing_ref):
+                continue
+            # A used / broken zone only blocks re-detections of the
+            # SAME structure. If the candidate's base formed after the
+            # old zone died, it is a new zone with its own base, BOS
+            # and first retest, and must be allowed through even
+            # though it sits in the same price band.
+            dead_at = _zone_dead_at(z)
+            if dead_at is not None and _base_formed_after(candidate, dead_at):
+                logger.info(
+                    "dedup: candidate {}-{} overlaps dead zone {} but its "
+                    "base formed after that zone died ({}); allowing as "
+                    "a new structure",
+                    candidate.bottom, candidate.top, z.id, dead_at,
+                )
+                continue
+            return True
         return False
 
     def _safe_get_active_setups(self) -> list[Setup]:
