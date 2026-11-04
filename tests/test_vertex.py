@@ -114,3 +114,19 @@ def test_zigzag_foot_skips_small_pullback() -> None:
 
 def test_default_foot_is_zigzag_quarter() -> None:
     assert StrategyPipelineConfig().vertex_foot_zigzag_frac == 0.25
+
+
+def test_bos_must_close_beyond_the_wick() -> None:
+    zs = run_strategy_pipeline(frame(M_TOP), StrategyPipelineConfig(pattern_detector="vertex"))
+    assert [z for z in zs if z.direction == "SELL"][0].broken_swing is not None
+    # Foot close 4014.2 but wicks down to 4013.6: the leg out closes 4011.5,
+    # beyond both, so the BOS still holds with the wick rule.
+    zs = run_strategy_pipeline(frame(M_TOP), StrategyPipelineConfig(
+        pattern_detector="vertex", vertex_bos_beyond_wick=True))
+    z = [z for z in zs if z.direction == "SELL"][0]
+    assert z.broken_swing is not None and z.broken_swing.price == pytest.approx(4014.2)  # TP stays at the body
+    # A leg out that closes between the body (4014.2) and the wick (4013.6) is not a BOS.
+    rows = M_TOP[:-1] + [(4015.6, 4016.0, 4013.7, 4013.9)]
+    zs = run_strategy_pipeline(frame(rows), StrategyPipelineConfig(
+        pattern_detector="vertex", vertex_bos_beyond_wick=True, vertex_leg_min_frac=0.0))
+    assert all(z.validation_failures for z in zs if z.direction == "SELL")

@@ -94,6 +94,10 @@ class StrongPointConfig:
     breaking bar's time is ``broken_at`` (the zone's birth)."""
 
     bos_swing_strength: int = 2
+    bos_beyond_wick: bool = False
+    """Vertex zones: the BOS candle must CLOSE beyond the wick of the high
+    (buy) / low (sell) before the zone, not just beyond its body close.
+    TP stays at the body level."""
     """Swing pivot strength on closes (the line-chart W / M points)."""
 
     require_fresh_since_bos: bool = True
@@ -184,6 +188,7 @@ def validate_strong_point(
     if cfg.require_bos:
         bos = find_bos(
             refined, df, swing_strength=cfg.bos_swing_strength, swings=swings,
+            beyond_wick=cfg.bos_beyond_wick,
         )
         if bos is None:
             failures.append("NO_BOS")
@@ -221,6 +226,7 @@ def find_bos(
     *,
     swing_strength: int = 2,
     swings: list[Swing] | None = None,
+    beyond_wick: bool = False,
 ) -> tuple[Swing, int] | None:
     """Find the first break of structure out of the base.
 
@@ -253,12 +259,21 @@ def find_bos(
     if not before:
         return None
     ref = before[-1]
+    level = ref.price
+    if beyond_wick and foot is not None and 0 <= foot < len(df):
+        # Wick extreme of the swing: from just before the foot up to the
+        # start of the vertex (the leg in, wicks included).
+        lo = max(0, foot - 2)
+        if refined.direction == "BUY":
+            level = max(level, float(df["high"].iloc[lo:base_start].max()))
+        else:
+            level = min(level, float(df["low"].iloc[lo:base_start].min()))
     closes = df["close"].to_numpy()
     for i in range(base_end + 1, len(df)):
         c = float(closes[i])
-        if refined.direction == "BUY" and c > ref.price:
+        if refined.direction == "BUY" and c > level:
             return ref, i
-        if refined.direction == "SELL" and c < ref.price:
+        if refined.direction == "SELL" and c < level:
             return ref, i
     return None
 

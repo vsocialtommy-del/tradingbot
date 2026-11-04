@@ -128,6 +128,7 @@ class StrategyPipelineConfig:
     vertex_exit_frac: float = 0.5
     vertex_leg_min_frac: float = 1.0
     vertex_tp_zigzag_frac: float | None = None
+    vertex_bos_beyond_wick: bool = False
     vertex_foot_zigzag_frac: float = 0.25
     """Zigzag foot: ignore pullbacks whose bounce is under 25 % of the zone
     height when finding the BOS / TP level (Nov 2026 backtest: +£1,788 vs
@@ -230,6 +231,7 @@ def run_strategy_pipeline(
         require_bos=cfg.require_bos,
         bos_swing_strength=cfg.bos_swing_strength,
         require_fresh_since_bos=cfg.require_fresh_since_bos,
+        bos_beyond_wick=cfg.vertex_bos_beyond_wick,
     )
 
     # Swings are needed by every pattern's BOS check; compute them once.
