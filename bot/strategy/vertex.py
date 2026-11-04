@@ -53,6 +53,9 @@ class VertexConfig:
     > 0 = 'zigzag' foot: keep walking back past dips whose bounce is
     smaller than this many zone heights, so the foot is where the whole
     move into the zone started."""
+    tp_zigzag_frac: float | None = None
+    """None = TP at the BOS foot. A number = TP uses its own zigzag foot
+    with this bounce size (e.g. BOS 0.5, TP 0.25)."""
     foot_max_lookback: int = 120
     exit_frac: float = 0.5
     """The leg out must close beyond the zone by at least this fraction
@@ -91,9 +94,9 @@ def detect_vertex_patterns(df: pd.DataFrame, config: VertexConfig | None = None)
                          leg_in_dir, leg_out_dir, cfg, n)
                 if p is None:
                     continue
-                (in_s, in_e), (out_s, out_e), foot = p
+                (in_s, in_e), (out_s, out_e), foot, tp_foot = p
                 found.append(_pattern(direction, idx, o, h, l, c, in_s, in_e, s, e,
-                                      out_s, out_e, top, bottom, foot))
+                                      out_s, out_e, top, bottom, foot, tp_foot))
                 break
     return _dedupe(found)
 
@@ -119,6 +122,7 @@ def _try(direction, s, e, out_start, top, bottom, o, h, l, c,
     if foot < 0:
         return None
     height = top - bottom
+    first_dip = foot
     if cfg.foot_zigzag_frac > 0:
         foot = _zigzag_foot(c, foot, sell, cfg.foot_zigzag_frac * height, cfg.foot_max_lookback)
     elif sell:
@@ -129,13 +133,16 @@ def _try(direction, s, e, out_start, top, bottom, o, h, l, c,
             foot -= 1
     if abs(c[in_e] - c[foot]) < cfg.leg_min_frac * height:
         return None
+    tp_foot = None
+    if cfg.tp_zigzag_frac is not None:
+        tp_foot = _zigzag_foot(c, first_dip, sell, cfg.tp_zigzag_frac * height, cfg.foot_max_lookback)
     # Leg out: consecutive same-colour candles from out_start; one closes beyond.
     k = out_start
     margin = cfg.exit_frac * height
     while k < n and leg_out_dir[k] and k - out_start < cfg.max_leg:
         beyond = (sell and c[k] < bottom - margin) or (not sell and c[k] > top + margin)
         if beyond and abs(c[e] - c[k]) >= cfg.leg_min_frac * height:
-            return (in_s, in_e), (out_start, k), foot
+            return (in_s, in_e), (out_start, k), foot, tp_foot
         k += 1
     return None
 
@@ -170,7 +177,7 @@ def _impulse(direction, idx, o, h, l, c, a, b) -> Impulse:
     )
 
 
-def _pattern(direction, idx, o, h, l, c, in_s, in_e, s, e, out_s, out_e, top, bottom, foot) -> Pattern:
+def _pattern(direction, idx, o, h, l, c, in_s, in_e, s, e, out_s, out_e, top, bottom, foot, tp_foot=None) -> Pattern:
     sell = direction == "SELL"
     leg_in = _impulse("RALLY" if sell else "DROP", idx, o, h, l, c, in_s, in_e)
     leg_out = _impulse("DROP" if sell else "RALLY", idx, o, h, l, c, out_s, out_e)
@@ -185,6 +192,7 @@ def _pattern(direction, idx, o, h, l, c, in_s, in_e, s, e, out_s, out_e, top, bo
         direction=direction,  # type: ignore[arg-type]
         formed_at=leg_out.end_time,
         foot_index=foot,
+        tp_foot_index=tp_foot,
     )
 
 

@@ -81,7 +81,13 @@ def compute_levels(
             sl, method, swing_price = cand, "SWING", swing
 
     tp1: float | None = None
-    if zone.broken_swing is not None:
+    tp_idx = getattr(getattr(zone, "source_pattern", None), "tp_foot_index", None)
+    if zone.broken_swing is not None and tp_idx is not None and 0 <= tp_idx < len(df):
+        lvl = float(df["close"].iloc[tp_idx])   # separate (tighter) TP foot
+        tp1 = lvl - cfg.tp_spread_buffer if buy else lvl + cfg.tp_spread_buffer
+        if (buy and tp1 <= entry) or (not buy and tp1 >= entry):
+            tp1 = None
+    elif zone.broken_swing is not None:
         lvl = float(zone.broken_swing.price)
         tp1 = lvl - cfg.tp_spread_buffer if buy else lvl + cfg.tp_spread_buffer
         if (buy and tp1 <= entry) or (not buy and tp1 >= entry):

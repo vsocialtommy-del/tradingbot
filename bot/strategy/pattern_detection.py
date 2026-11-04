@@ -198,6 +198,9 @@ class Pattern:
     """Vertex patterns: the line-chart low (sell) / high (buy) the leg in
     started from. It is the BOS level the leg out must break and the TP.
     None for classic patterns (BOS uses the last close swing instead)."""
+    tp_foot_index: int | None = None
+    """Optional separate TP level (a tighter zigzag foot than the BOS
+    one). None = TP at the BOS foot."""
 
     @property
     def base_start_index(self) -> int:

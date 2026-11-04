@@ -232,6 +232,7 @@ class XautismBacktest:
                     if p.impulse_after.end_index < i and p.base.start_index >= off
                     and p.impulse_before.start_index >= off and dead > i
                     and (p.foot_index is None or p.foot_index >= off)
+                    and (p.tp_foot_index is None or p.tp_foot_index >= off)
                 ]
             zones = run_strategy_pipeline(closed, self.cfg.pipeline, patterns=pats)
             self._m5_zones = [z for z in zones if z.is_strong_point and z.refined_zone.is_tradeable]
@@ -489,7 +490,8 @@ def _precompute_vertex(m5: pd.DataFrame, pcfg: StrategyPipelineConfig) -> list:
         min_base=pcfg.vertex_min_base, max_base=pcfg.vertex_max_base,
         max_leg=pcfg.vertex_max_leg, exit_frac=pcfg.vertex_exit_frac,
         leg_min_frac=pcfg.vertex_leg_min_frac,
-        foot_zigzag_frac=pcfg.vertex_foot_zigzag_frac))
+        foot_zigzag_frac=pcfg.vertex_foot_zigzag_frac,
+        tp_zigzag_frac=pcfg.vertex_tp_zigzag_frac))
     c = m5["close"].to_numpy(float)
     out = []
     for p in pats:
@@ -513,6 +515,7 @@ def _shift(p: Any, off: int) -> Any:
         impulse_after=_r(p.impulse_after, start_index=p.impulse_after.start_index - off,
                          end_index=p.impulse_after.end_index - off),
         foot_index=None if p.foot_index is None else p.foot_index - off,
+        tp_foot_index=None if p.tp_foot_index is None else p.tp_foot_index - off,
     )
 
 
