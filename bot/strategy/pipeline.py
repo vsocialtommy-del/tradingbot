@@ -44,6 +44,7 @@ from dataclasses import dataclass
 import pandas as pd
 from loguru import logger
 
+from bot.strategy.vertex import VertexConfig, detect_vertex_patterns
 from bot.strategy.pattern_detection import (
     PatternConfig,
     detect_patterns,
@@ -117,6 +118,13 @@ class StrategyPipelineConfig:
 
     # XAUTISM zone rules (see StrongPointConfig for details).
     allowed_pattern_types: tuple[str, ...] = ("DBR", "RBD")
+    pattern_detector: str = "classic"
+    """``classic`` = ERC leg / small-candle base detector; ``vertex`` =
+    M / W vertex zones (see :mod:`bot.strategy.vertex`)."""
+    vertex_min_base: int = 3
+    vertex_max_base: int = 8
+    vertex_max_leg: int = 5
+    vertex_exit_frac: float = 0.5
     require_bos: bool = True
     bos_swing_strength: int = 2
     require_fresh_since_bos: bool = True
@@ -172,6 +180,8 @@ class StrategyPipelineConfig:
 def run_strategy_pipeline(
     df: pd.DataFrame,
     config: StrategyPipelineConfig | None = None,
+    *,
+    patterns: list | None = None,
 ) -> list[ValidatedZone]:
     """Run all strategy stages; return tradeable zones."""
     cfg = config or StrategyPipelineConfig()
@@ -187,7 +197,18 @@ def run_strategy_pipeline(
         base_max_body_to_impulse_body_ratio=cfg.base_max_body_to_impulse_body_ratio,
         lookback_bars=cfg.pattern_lookback_bars,
     )
-    patterns = detect_patterns(df, pattern_cfg)
+    if patterns is not None:
+        # Pre-detected patterns (backtest cache); indices are df-relative.
+        wick_extend = 0 if cfg.pattern_detector == "vertex" else cfg.zone_wick_extend_bars
+    elif cfg.pattern_detector == "vertex":
+        patterns = detect_vertex_patterns(df, VertexConfig(
+            min_base=cfg.vertex_min_base, max_base=cfg.vertex_max_base,
+            max_leg=cfg.vertex_max_leg, exit_frac=cfg.vertex_exit_frac,
+        ))
+        wick_extend = 0   # vertex zones are exactly wick to wick
+    else:
+        patterns = detect_patterns(df, pattern_cfg)
+        wick_extend = cfg.zone_wick_extend_bars
 
     refinement_cfg = RefinementConfig(
         zone_min_size_points=cfg.zone_min_size_points,
@@ -212,7 +233,7 @@ def run_strategy_pipeline(
         try:
             zone = mark_zone(
                 pattern, df,
-                wick_extend_bars=cfg.zone_wick_extend_bars,
+                wick_extend_bars=wick_extend,
             )
             refined = refine_zone(zone, df, refinement_cfg)
             vz = validate_strong_point(refined, df, sp_cfg, swings=swings)

@@ -170,6 +170,9 @@ class XautismBacktest:
         self.blocked_days: set[str] = set()
         self.open: Trade | None = None
         self._m1_cache: tuple[pd.Timestamp, list] | None = None
+        self._vertex: list | None = None
+        if self.cfg.pipeline.pattern_detector == "vertex":
+            self._vertex = _precompute_vertex(m5, self.cfg.pipeline)
 
     # ------------------------------------------------------------------ #
 
@@ -214,7 +217,15 @@ class XautismBacktest:
 
         m5_zones: list[ValidatedZone] = []
         if self.open is None and not self._blocked(t):
-            zones = run_strategy_pipeline(closed, self.cfg.pipeline)
+            pats = None
+            if self._vertex is not None:
+                off = max(0, i - self.cfg.window_bars)
+                pats = [
+                    _shift(p, off) for p, dead in self._vertex
+                    if p.impulse_after.end_index < i and p.base.start_index >= off
+                    and p.impulse_before.start_index >= off and dead > i
+                ]
+            zones = run_strategy_pipeline(closed, self.cfg.pipeline, patterns=pats)
             self._m5_zones = [z for z in zones if z.is_strong_point and z.refined_zone.is_tradeable]
             m5_zones = [z for z in self._m5_zones if _key(z) not in self.traded_keys]
 
@@ -448,6 +459,38 @@ class XautismBacktest:
         assert tr is not None
         price = bid_close if tr.direction == "BUY" else bid_close + spread
         self._close_at(price, t, reason)
+
+
+def _precompute_vertex(m5: pd.DataFrame, pcfg: StrategyPipelineConfig) -> list:
+    """Vertex patterns over the whole history + the bar index where each
+    zone is closed through (after that it can never be traded)."""
+    from bot.strategy.vertex import VertexConfig, detect_vertex_patterns
+    pats = detect_vertex_patterns(m5, VertexConfig(
+        min_base=pcfg.vertex_min_base, max_base=pcfg.vertex_max_base,
+        max_leg=pcfg.vertex_max_leg, exit_frac=pcfg.vertex_exit_frac))
+    c = m5["close"].to_numpy(float)
+    out = []
+    for p in pats:
+        start = p.impulse_after.end_index + 1
+        seg = c[start:]
+        hit = np.nonzero(seg > p.base.top)[0] if p.direction == "SELL" else np.nonzero(seg < p.base.bottom)[0]
+        dead = start + int(hit[0]) + 1 if len(hit) else len(c) + 1
+        out.append((p, dead))
+    return out
+
+
+def _shift(p: Any, off: int) -> Any:
+    from dataclasses import replace as _r
+    if off == 0:
+        return p
+    return _r(
+        p,
+        impulse_before=_r(p.impulse_before, start_index=p.impulse_before.start_index - off,
+                          end_index=p.impulse_before.end_index - off),
+        base=_r(p.base, start_index=p.base.start_index - off, end_index=p.base.end_index - off),
+        impulse_after=_r(p.impulse_after, start_index=p.impulse_after.start_index - off,
+                         end_index=p.impulse_after.end_index - off),
+    )
 
 
 def _touched(zones: list[ValidatedZone], bar: Any, spread: float) -> list[ValidatedZone]:
