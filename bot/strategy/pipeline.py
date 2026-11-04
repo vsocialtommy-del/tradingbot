@@ -125,6 +125,7 @@ class StrategyPipelineConfig:
     vertex_max_base: int = 8
     vertex_max_leg: int = 5
     vertex_exit_frac: float = 0.5
+    vertex_leg_min_frac: float = 1.0
     require_bos: bool = True
     bos_swing_strength: int = 2
     require_fresh_since_bos: bool = True
@@ -204,6 +205,7 @@ def run_strategy_pipeline(
         patterns = detect_vertex_patterns(df, VertexConfig(
             min_base=cfg.vertex_min_base, max_base=cfg.vertex_max_base,
             max_leg=cfg.vertex_max_leg, exit_frac=cfg.vertex_exit_frac,
+            leg_min_frac=cfg.vertex_leg_min_frac,
         ))
         wick_extend = 0   # vertex zones are exactly wick to wick
     else:

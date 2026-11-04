@@ -194,6 +194,10 @@ class Pattern:
     impulse_after: Impulse
     direction: ZoneDirection        # BUY (RBR/DBR) or SELL (DBD/RBD)
     formed_at: pd.Timestamp         # impulse_after.end_time
+    foot_index: int | None = None
+    """Vertex patterns: the line-chart low (sell) / high (buy) the leg in
+    started from. It is the BOS level the leg out must break and the TP.
+    None for classic patterns (BOS uses the last close swing instead)."""
 
     @property
     def base_start_index(self) -> int:

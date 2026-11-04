@@ -26,7 +26,7 @@ M_TOP = FLAT + [
     (4020.2, 4021.0, 4018.8, 4019.4),   # vertex
     (4019.4, 4021.1, 4018.0, 4019.45),  # vertex (doji-ish)
     (4019.4, 4019.5, 4015.4, 4015.6),   # leg out (bear) closes below 4018.0
-    (4015.6, 4016.2, 4012.0, 4013.5),
+    (4015.6, 4016.2, 4011.0, 4011.5),   # leg out continues: a full zone height below
 ]
 
 
@@ -65,3 +65,18 @@ def test_pipeline_uses_vertex_detector() -> None:
     zs = run_strategy_pipeline(frame(M_TOP), StrategyPipelineConfig(pattern_detector="vertex", require_bos=False))
     sells = [z for z in zs if z.direction == "SELL"]
     assert sells and sells[0].top == pytest.approx(4025.3) and sells[0].bottom == pytest.approx(4018.0)
+
+
+def test_foot_is_the_bos_level_and_tp() -> None:
+    p = [p for p in detect_vertex_patterns(frame(M_TOP)) if p.direction == "SELL"][0]
+    # Leg in started from the flat area: close 4014.2 is the foot.
+    assert p.foot_index is not None
+    assert frame(M_TOP)["close"].iloc[p.foot_index] == pytest.approx(4014.2)
+    zs = run_strategy_pipeline(frame(M_TOP), StrategyPipelineConfig(pattern_detector="vertex"))
+    z = [z for z in zs if z.direction == "SELL"][0]
+    assert z.broken_swing is not None and z.broken_swing.price == pytest.approx(4014.2)
+
+
+def test_small_leg_out_rejected() -> None:
+    rows = M_TOP[:-1] + [(4015.6, 4016.0, 4014.0, 4014.2)]  # only 5.25 below the vertex close
+    assert [p for p in detect_vertex_patterns(frame(rows)) if p.direction == "SELL"] == []

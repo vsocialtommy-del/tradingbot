@@ -224,6 +224,7 @@ class XautismBacktest:
                     _shift(p, off) for p, dead in self._vertex
                     if p.impulse_after.end_index < i and p.base.start_index >= off
                     and p.impulse_before.start_index >= off and dead > i
+                    and (p.foot_index is None or p.foot_index >= off)
                 ]
             zones = run_strategy_pipeline(closed, self.cfg.pipeline, patterns=pats)
             self._m5_zones = [z for z in zones if z.is_strong_point and z.refined_zone.is_tradeable]
@@ -343,7 +344,7 @@ class XautismBacktest:
         entry, sl = lv.entry, lv.sl
         stack = None
         if cfg.stacked.enabled:
-            cands = [("M5", c) for c in getattr(self, "_m5_zones", [])]
+            cands = [("M5", c) for c in getattr(self, "_m5_zones", [])] if cfg.stacked.allow_m5_outer else []
             if cfg.trade_m1_zones and self.m1 is not None:
                 cands += [("M1", c) for c in getattr(self, "_cur_m1_zones", [])]
             else:
@@ -467,7 +468,8 @@ def _precompute_vertex(m5: pd.DataFrame, pcfg: StrategyPipelineConfig) -> list:
     from bot.strategy.vertex import VertexConfig, detect_vertex_patterns
     pats = detect_vertex_patterns(m5, VertexConfig(
         min_base=pcfg.vertex_min_base, max_base=pcfg.vertex_max_base,
-        max_leg=pcfg.vertex_max_leg, exit_frac=pcfg.vertex_exit_frac))
+        max_leg=pcfg.vertex_max_leg, exit_frac=pcfg.vertex_exit_frac,
+        leg_min_frac=pcfg.vertex_leg_min_frac))
     c = m5["close"].to_numpy(float)
     out = []
     for p in pats:
@@ -490,6 +492,7 @@ def _shift(p: Any, off: int) -> Any:
         base=_r(p.base, start_index=p.base.start_index - off, end_index=p.base.end_index - off),
         impulse_after=_r(p.impulse_after, start_index=p.impulse_after.start_index - off,
                          end_index=p.impulse_after.end_index - off),
+        foot_index=None if p.foot_index is None else p.foot_index - off,
     )
 
 

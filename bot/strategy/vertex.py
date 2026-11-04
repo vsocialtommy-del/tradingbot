@@ -20,6 +20,9 @@ Supply (RBD), mirrored for demand (DBR):
   after the vertex (up to ``max_leg``). One of them must close below the
   zone bottom by at least ``exit_frac`` (50 %) of the zone height:
   price clearly left the vertex.
+* **Foot**: the line-chart low (sell) / high (buy) the leg in started
+  from. Leg in and leg out must each move at least one zone height
+  (``leg_min_frac``). The foot is the BOS level and the TP.
 * When several vertex lengths fit, the shortest one (latest start) is
   used: the candles after the last leg-in candle.
 
@@ -42,6 +45,9 @@ class VertexConfig:
     min_base: int = 3
     max_base: int = 8
     max_leg: int = 5
+    leg_min_frac: float = 1.0
+    """Leg in and leg out must each move at least this many zone heights
+    on the line chart (cuts flat, dead-market 'zones')."""
     exit_frac: float = 0.5
     """The leg out must close beyond the zone by at least this fraction
     of the zone height. Stops a small dip just under the vertex low from
@@ -79,9 +85,9 @@ def detect_vertex_patterns(df: pd.DataFrame, config: VertexConfig | None = None)
                          leg_in_dir, leg_out_dir, cfg, n)
                 if p is None:
                     continue
-                (in_s, in_e), (out_s, out_e) = p
+                (in_s, in_e), (out_s, out_e), foot = p
                 found.append(_pattern(direction, idx, o, h, l, c, in_s, in_e, s, e,
-                                      out_s, out_e, top, bottom))
+                                      out_s, out_e, top, bottom, foot))
                 break
     return _dedupe(found)
 
@@ -102,12 +108,26 @@ def _try(direction, s, e, out_start, top, bottom, o, h, l, c,
     else:
         if o[in_s:in_e + 1].max() <= top or c[in_e] >= top:
             return None
+    # Foot: the line-chart low (sell) / high (buy) the leg in came from.
+    foot = in_s - 1
+    if foot < 0:
+        return None
+    if sell:
+        while foot - 1 >= 0 and c[foot - 1] < c[foot]:
+            foot -= 1
+    else:
+        while foot - 1 >= 0 and c[foot - 1] > c[foot]:
+            foot -= 1
+    height = top - bottom
+    if abs(c[in_e] - c[foot]) < cfg.leg_min_frac * height:
+        return None
     # Leg out: consecutive same-colour candles from out_start; one closes beyond.
     k = out_start
-    margin = cfg.exit_frac * (top - bottom)
+    margin = cfg.exit_frac * height
     while k < n and leg_out_dir[k] and k - out_start < cfg.max_leg:
-        if (sell and c[k] < bottom - margin) or (not sell and c[k] > top + margin):
-            return (in_s, in_e), (out_start, k)
+        beyond = (sell and c[k] < bottom - margin) or (not sell and c[k] > top + margin)
+        if beyond and abs(c[e] - c[k]) >= cfg.leg_min_frac * height:
+            return (in_s, in_e), (out_start, k), foot
         k += 1
     return None
 
@@ -125,7 +145,7 @@ def _impulse(direction, idx, o, h, l, c, a, b) -> Impulse:
     )
 
 
-def _pattern(direction, idx, o, h, l, c, in_s, in_e, s, e, out_s, out_e, top, bottom) -> Pattern:
+def _pattern(direction, idx, o, h, l, c, in_s, in_e, s, e, out_s, out_e, top, bottom, foot) -> Pattern:
     sell = direction == "SELL"
     leg_in = _impulse("RALLY" if sell else "DROP", idx, o, h, l, c, in_s, in_e)
     leg_out = _impulse("DROP" if sell else "RALLY", idx, o, h, l, c, out_s, out_e)
@@ -139,6 +159,7 @@ def _pattern(direction, idx, o, h, l, c, in_s, in_e, s, e, out_s, out_e, top, bo
         impulse_before=leg_in, base=base, impulse_after=leg_out,
         direction=direction,  # type: ignore[arg-type]
         formed_at=leg_out.end_time,
+        foot_index=foot,
     )
 
 

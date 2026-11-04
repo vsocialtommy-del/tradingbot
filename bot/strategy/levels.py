@@ -47,6 +47,9 @@ class LevelsConfig:
     swing_lookback_bars: int = 50
     swing_strength: int = 2
     tp_spread_buffer: float = 0.3
+    swing_adjust: bool = True
+    """Push the SL beyond a nearby swing (+1 point). False = SL exactly
+    ``sl_zone_pct`` past the zone (0 = right at the zone edge)."""
 
 
 @dataclass(frozen=True)
@@ -71,7 +74,7 @@ def compute_levels(
     method: SlMethod = "PCT_30"
     swing_price: float | None = None
 
-    swing = _swing_beyond_zone(zone, df, cfg, sl30=sl)
+    swing = _swing_beyond_zone(zone, df, cfg, sl30=sl) if cfg.swing_adjust else None
     if swing is not None:
         cand = swing - cfg.swing_buffer_points if buy else swing + cfg.swing_buffer_points
         if (buy and cand < sl) or (not buy and cand > sl):
