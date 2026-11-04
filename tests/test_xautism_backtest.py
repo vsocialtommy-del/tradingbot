@@ -96,3 +96,16 @@ def test_load_mt5_csv(tmp_path) -> None:
     d = load_mt5_csv(str(p))
     assert d.index[0] == pd.Timestamp("2026-10-01 01:05", tz="UTC")
     assert d["spread"].iloc[0] == pytest.approx(0.40)
+
+
+def test_layer2_waits_for_candle_close_inside() -> None:
+    from dataclasses import replace
+    from bot.backtest.xautism import XBacktestConfig
+    b = bt(); b.cfg = XBacktestConfig(layer2_arm="M5_CLOSE")
+    b.open = buy_trade()
+    feed(b, [3998.0, 4000.0])           # dipped and back out, no close inside yet
+    assert b.open.l2.state == "UNPLACED"
+    b._candle_close("M5", 3999.0)       # M5 candle closes inside the zone
+    feed(b, [3998.0, 4000.0, 4010.0])
+    tr = b.trades[0]
+    assert tr.l2.entry == 4000.0 and tr.exit_reason == "TP"

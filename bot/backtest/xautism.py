@@ -53,6 +53,10 @@ class XBacktestConfig:
     min_sl_distance: float = 1.0
     max_sl_distance: float = 200.0
     use_spread_filter: bool = True
+    layer2_arm: str = "TOUCH"
+    """When the layer 2 stop may be placed: TOUCH = as soon as price is
+    0.10 inside the zone (live bot today); M1_CLOSE / M5_CLOSE = only
+    after a candle of that timeframe closes inside the zone."""
     trade_m1_zones: bool = False
     """Also trade M1 zones as their own setups (same rules as M5 zones;
     M15 direction gate, 30 % SL, TP at the BOS, M5 close exit). Needs
@@ -94,6 +98,7 @@ class Trade:
     trend: str
     planned_risk: float
     tf: str = "M5"
+    l2_armed: bool = False
     closed_at: pd.Timestamp | None = None
     exit_reason: str | None = None
 
@@ -214,7 +219,7 @@ class XautismBacktest:
             m5_zones = [z for z in self._m5_zones if _key(z) not in self.traded_keys]
 
         minutes = None
-        if self.cfg.trade_m1_zones and self.m1 is not None:
+        if self.m1 is not None:
             minutes = self.m1.loc[t: t + pd.Timedelta(minutes=4)]
             if len(minutes) == 0:
                 minutes = None
@@ -228,7 +233,7 @@ class XautismBacktest:
                 m_spread = float(row["spread"])
                 m1_zones: list[ValidatedZone] = []
                 m1_closed = None
-                if self.open is None and not self._blocked(ts):
+                if self.cfg.trade_m1_zones and self.open is None and not self._blocked(ts):
                     j = int(self.m1.index.searchsorted(ts))
                     if j >= 300:
                         m1_closed = self.m1.iloc[max(0, j - self.cfg.m1_window_bars):j]
@@ -241,6 +246,8 @@ class XautismBacktest:
                     continue
                 pts = self._stepped(_bar_path(row["open"], row["high"], row["low"], row["close"]))
                 self._walk(pts, cands, closed, m_spread, ts)
+                self._candle_close("M1", float(row["close"]))
+        self._candle_close("M5", float(bar["close"]))
 
         # M5 close exit on this bar's close.
         tr = self.open
@@ -249,6 +256,13 @@ class XautismBacktest:
             beyond = c < tr.far_edge if tr.direction == "BUY" else c > tr.far_edge
             if beyond:
                 self._close_all(c, spread, t, "M5_CLOSE_EXIT")
+
+    def _candle_close(self, tf: str, close: float) -> None:
+        tr = self.open
+        if tr is None or tr.l2_armed or self.cfg.layer2_arm != f"{tf}_CLOSE":
+            return
+        if tr.zone_bottom <= close <= tr.zone_top:
+            tr.l2_armed = True
 
     def _walk(self, pts: list[float], cands: list, m5_closed: pd.DataFrame,
               spread: float, t: pd.Timestamp) -> None:
@@ -393,6 +407,8 @@ class XautismBacktest:
         if l2.state == "UNPLACED":
             if tr.l2_kind == "LIMIT":
                 l2.state = "PENDING"
+            elif self.cfg.layer2_arm != "TOUCH" and not tr.l2_armed:
+                pass  # waiting for a candle to close inside the zone
             elif (buy and ask <= tr.l2_price - min_d) or (not buy and bid >= tr.l2_price + min_d):
                 l2.state = "PENDING"
         if l2.state == "PENDING":
