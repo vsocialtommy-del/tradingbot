@@ -128,6 +128,8 @@ def mock_supabase(mocker: MockerFixture) -> MagicMock:
     # Empty by default: no zones to dedup against, no zones to scan
     # for lifecycle transitions. Specific tests override this.
     m.get_zones_by_status.return_value = []
+    m.get_setups_by_status.return_value = []
+    m.get_trades_for_setup.return_value = []
     m.log_trade.side_effect = [
         {"id": str(uuid4())} for _ in range(20)
     ]
@@ -213,6 +215,9 @@ def _legacy_management(b: Bot) -> None:
         enable_zone_exit_be=True,
         enable_trailing_stop=True,
         enable_zone_death_cancel=True,
+        enable_old_zone_dedup=True,
+        enable_news_filter=True,
+        enable_balance_pct_halt=True,
     )
 
 
@@ -227,6 +232,9 @@ def _xautism(b: Bot) -> None:
         enable_zone_exit_be=d.enable_zone_exit_be,
         enable_trailing_stop=d.enable_trailing_stop,
         enable_zone_death_cancel=d.enable_zone_death_cancel,
+        enable_old_zone_dedup=d.enable_old_zone_dedup,
+        enable_news_filter=d.enable_news_filter,
+        enable_balance_pct_halt=d.enable_balance_pct_halt,
     )
 
 
@@ -3711,3 +3719,182 @@ class TestRiskGatesInMain:
         # L1 0.01 = 0.65; L2 = 99.35 / 65 = 1.52 lots.
         assert kw["layer2_lots"] == 1.52
         assert kw["total_lots"] == 1.53
+
+
+# --------------------------------------------------------------------------- #
+# Nov 2026: the live bot trades what the XAUTISM backtest traded. Old-bot
+# checks the backtest never had are off by default.
+# --------------------------------------------------------------------------- #
+
+
+class TestLiveMatchesBacktest:
+    def test_old_checks_off_by_default(self) -> None:
+        d = BotLoopConfig()
+        assert d.enable_old_zone_dedup is False
+        assert d.enable_news_filter is False
+        assert d.enable_balance_pct_halt is False
+
+    def _at_zone(self, b: Bot, mock_mt5: MagicMock) -> None:
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": 1900.4, "ask": 1900.5, "time": NOW, "time_msc": 0,
+        }
+
+    def test_untraded_overlapping_zones_do_not_block(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mock_mt5: MagicMock,
+        mocker: MockerFixture,
+    ) -> None:
+        # Demo bug 4 Nov: 127 historical zones saved on startup blocked
+        # every fresh zone through the overlap dedup.
+        b, _ = bot
+        _xautism(b)
+        self._at_zone(b, mock_mt5)
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mock_supabase.get_zones_by_status.return_value = [
+            _make_zone_row(direction="BUY", top=1900.5, bottom=1900.0, status=st)
+            for st in ("CONFIRMED", "ACTIVE", "CONSUMED", "VIOLATED")
+        ]
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        dedup = mocker.spy(b, "_zone_already_used")
+        place = mocker.patch.object(b, "_place_xautism", return_value=True)
+
+        b.run_iteration(NOW)
+
+        dedup.assert_not_called()
+        place.assert_called_once()
+
+    def test_zone_traded_once_never_again(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        _xautism(b)
+        zone = _make_validated_for_persistence(_PT.RBR)
+        zid = uuid4()
+        b._traded_zone_ids.add(zid)
+        place = mocker.patch.object(b, "_place_xautism", return_value=True)
+        df = pd.DataFrame(
+            {"open": [1901.0], "high": [1901.0], "low": [1900.4], "close": [1900.8]},
+            index=pd.DatetimeIndex([NOW]),
+        )
+        assert b._try_place_setup(zone, df, zid, bid=1900.4, ask=1900.5) is False
+        place.assert_not_called()
+
+    def test_placement_records_zone_as_traded(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        _xautism(b)
+        self._at_zone(b, mock_mt5)
+        zone = _make_validated_for_persistence(_PT.RBR)
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        mocker.patch.object(b, "_place_xautism", return_value=True)
+        b.run_iteration(NOW)
+        assert len(b._traded_zone_ids) == 1
+
+    def test_news_not_checked(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        b, mgrs = bot
+        _xautism(b)
+        b.state.last_config_refresh = NOW
+        mgrs["news_filter"].check.return_value = NewsCheckResult(
+            is_blocked=True, block_reason="HIGH USD NFP",
+        )
+        run_pipeline = mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        b.run_iteration(NOW)
+        mgrs["news_filter"].check.assert_not_called()
+        run_pipeline.assert_called_once()
+
+    def test_old_balance_pct_halt_not_applied(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        _xautism(b)
+        b.state.last_config_refresh = NOW
+        b.state.starting_balance = 10000.0
+        mock_mt5.get_balance.return_value = 8000.0
+        run_pipeline = mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        b.run_iteration(NOW)
+        run_pipeline.assert_called_once()
+
+
+class TestStartupLeftovers:
+    def _setup(self, status: str) -> Setup:
+        s = _make_setup_with_zone_id(zone_id=uuid4())
+        return s.model_copy(update={"status": status})
+
+    def test_setup_with_nothing_at_broker_is_closed(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mock_mt5: MagicMock,
+    ) -> None:
+        # The 20 May PENDING setup that blocked the new demo account.
+        b, _ = bot
+        stale = self._setup("PENDING")
+        mock_supabase.get_setups_by_status.return_value = [stale]
+        mock_supabase.get_trades_for_setup.return_value = []
+        mock_mt5.get_pending_orders.return_value = []
+        b._close_stale_setups()
+        b.position_tracker.update_setup_status.assert_called_once()
+        args, kwargs = b.position_tracker.update_setup_status.call_args
+        assert args == (stale.id, "SKIPPED")
+        assert kwargs["skip_reason"] == "STALE_ON_STARTUP"
+
+    def test_active_setup_without_positions_is_closed(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mock_mt5: MagicMock,
+    ) -> None:
+        b, _ = bot
+        stale = self._setup("ACTIVE")
+        mock_supabase.get_setups_by_status.return_value = [stale]
+        mock_supabase.get_trades_for_setup.return_value = [
+            _make_trade_for_death_pass(setup_id=stale.id, layer_number=1, status="CLOSED"),
+        ]
+        mock_mt5.get_pending_orders.return_value = []
+        b._close_stale_setups()
+        args, _ = b.position_tracker.update_setup_status.call_args
+        assert args == (stale.id, "CLOSED")
+
+    def test_live_setups_are_left_alone(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock, mock_mt5: MagicMock,
+    ) -> None:
+        b, _ = bot
+        filled = self._setup("ACTIVE")
+        waiting = self._setup("PENDING")
+        mock_supabase.get_setups_by_status.return_value = [filled, waiting]
+
+        def trades(setup_id):
+            if setup_id == filled.id:
+                return [_make_trade_for_death_pass(
+                    setup_id=filled.id, layer_number=1, status="FILLED",
+                    mt5_ticket=111,
+                )]
+            return [_make_trade_for_death_pass(
+                setup_id=waiting.id, layer_number=2, status="WAITING",
+                mt5_ticket=222,
+            )]
+
+        mock_supabase.get_trades_for_setup.side_effect = trades
+        mock_mt5.get_pending_orders.return_value = [{"ticket": 222}]
+        b._close_stale_setups()
+        b.position_tracker.update_setup_status.assert_not_called()
+
+    def test_traded_zones_hydrated(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_supabase: MagicMock,
+    ) -> None:
+        b, _ = bot
+        s = self._setup("CLOSED")
+        mock_supabase.get_setups_by_status.return_value = [s]
+        b._hydrate_traded_zone_ids()
+        assert b._traded_zone_ids == {s.zone_id}
+        statuses = mock_supabase.get_setups_by_status.call_args.args[0]
+        assert "SKIPPED" not in statuses
