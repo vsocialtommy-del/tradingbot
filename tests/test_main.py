@@ -942,7 +942,7 @@ class TestDefaults:
         assert c.detect_closed_seconds == 30
         assert c.reconcile_seconds == 300
         assert c.heartbeat_seconds == 300
-        assert c.max_simultaneous_setups == 3
+        assert c.max_simultaneous_setups == 1  # XAUTISM: one trade at a time
         assert c.daily_loss_limit_pct == 10.0
         # 5000 M5 bars ≈ 17 trading days: fresh zones stay tradeable
         # however old, within this window. See BotLoopConfig docstring.
@@ -3637,3 +3637,68 @@ class TestStackedInMain:
         assert b._try_place_setup(
             zone, make_ohlc(n=30), uuid4(), bid=1900.4, ask=1900.5,
         ) is False
+
+
+class TestRiskGatesInMain:
+    def _tick(self, b: Bot, mock_mt5: MagicMock, bid: float, ask: float) -> None:
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        mock_mt5.get_current_price.return_value = {
+            "bid": bid, "ask": ask, "time": NOW, "time_msc": 0,
+        }
+
+    def _zone(self):
+        from dataclasses import replace
+        from bot.strategy.structure import Swing
+        return replace(
+            _make_validated_for_persistence(_PT.DBR),
+            broken_swing=Swing(index=0, time=pd.Timestamp(NOW), price=1910.0, kind="HIGH"),
+        )
+
+    def test_blocked_day_places_nothing(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        from bot.risk.xautism_risk import RiskVerdict
+        b, _ = bot
+        _xautism(b)
+        self._tick(b, mock_mt5, 1900.4, 1900.5)
+        mocker.patch.object(b.daily_risk, "check",
+                            return_value=RiskVerdict(True, "2 losing trades today"))
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[self._zone()])
+        xa = mocker.patch("bot.main.place_xautism_orders")
+        b.run_iteration(NOW)
+        xa.assert_not_called()
+
+    def test_wide_spread_defers(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        from bot.risk.xautism_risk import RiskVerdict
+        b, _ = bot
+        _xautism(b)
+        self._tick(b, mock_mt5, 1900.0, 1900.8)   # 0.80 spread
+        mocker.patch.object(b.daily_risk, "check", return_value=RiskVerdict(False))
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[self._zone()])
+        xa = mocker.patch("bot.main.place_xautism_orders")
+        b.run_iteration(NOW)
+        xa.assert_not_called()
+
+    def test_fixed_risk_sizing(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        from bot.risk.xautism_risk import RiskVerdict
+        b, _ = bot
+        _xautism(b)
+        self._tick(b, mock_mt5, 1900.4, 1900.5)
+        mock_mt5.calc_loss_per_lot.side_effect = lambda sym, d, e, sl: abs(e - sl) * 100
+        mocker.patch.object(b.daily_risk, "check", return_value=RiskVerdict(False))
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[self._zone()])
+        xa = mocker.patch("bot.main.place_xautism_orders")
+        b.run_iteration(NOW)
+        kw = xa.call_args.kwargs
+        # Zone 1900.0-1900.5, SL 1899.85 → 0.65 pts → 65 per lot.
+        # L1 0.01 = 0.65; L2 = 99.35 / 65 = 1.52 lots.
+        assert kw["layer2_lots"] == 1.52
+        assert kw["total_lots"] == 1.53

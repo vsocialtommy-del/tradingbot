@@ -444,6 +444,37 @@ class MT5Connector:
         }
         return mapping.get(state)
 
+    def calc_loss_per_lot(
+        self, symbol: str, direction: Direction, entry: float, sl: float,
+    ) -> float | None:
+        """Loss in ACCOUNT currency for 1.0 lot from ``entry`` to ``sl``
+        (positive number), via ``order_calc_profit``. None if MT5 can't
+        price it; callers fall back to the instrument spec."""
+        order_type = (
+            mt5.ORDER_TYPE_BUY if direction == "BUY" else mt5.ORDER_TYPE_SELL
+        )
+        try:
+            profit = mt5.order_calc_profit(
+                order_type, symbol, 1.0, float(entry), float(sl),
+            )
+        except Exception:
+            return None
+        if profit is None:
+            return None
+        return abs(float(profit))
+
+    def get_deals(self, since: datetime, until: datetime) -> list[dict[str, Any]]:
+        """All account deals between ``since`` and ``until`` (any magic;
+        callers match them to the bot's positions)."""
+        deals = mt5.history_deals_get(since, until)
+        if deals is None:
+            return []
+        return [d._asdict() for d in deals]
+
+    @property
+    def magic(self) -> int:
+        return self._magic
+
     def get_min_stop_distance(self, symbol: str) -> float:
         """Broker minimum distance (price units) between market and a
         pending order / stop: ``trade_stops_level * point``. 0 if unknown."""

@@ -311,6 +311,7 @@ def place_xautism_orders(
     first_touch_lots: float = 0.01,
     lot_step: float = 0.01,
     stacked: StackedPlan | None = None,
+    layer2_lots: float | None = None,
     mt5: MT5Connector,
     supabase: SupabaseLogger,
     tracker: PositionTracker,
@@ -349,7 +350,10 @@ def place_xautism_orders(
         return _failed_result(sl_price, tp1_price, errors)
 
     l1_lots = min(first_touch_lots, total_lots)
-    l2_lots = _floor_lots(total_lots - l1_lots, lot_step)
+    l2_lots = (
+        _floor_lots(layer2_lots, lot_step) if layer2_lots is not None
+        else _floor_lots(total_lots - l1_lots, lot_step)
+    )
 
     try:
         setup_row = supabase.log_setup(SetupInput(

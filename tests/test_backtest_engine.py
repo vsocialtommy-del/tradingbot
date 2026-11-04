@@ -451,6 +451,9 @@ class TestDailyHalt:
             fixed_lot_size=10.0,  # exaggerated to force a >10% drawdown
             starting_balance=10_000.0,
             daily_loss_limit_pct=10.0,
+            # Pre-Nov-2026 floor: zone2's synthetic SL sits 2 pts away and
+            # this test relies on it being skipped once the halt lifts.
+            min_sl_distance_points=5.0,
         )
         result = BacktestEngine(cfg).run(df)
 
