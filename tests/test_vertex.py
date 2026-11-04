@@ -80,3 +80,7 @@ def test_foot_is_the_bos_level_and_tp() -> None:
 def test_small_leg_out_rejected() -> None:
     rows = M_TOP[:-1] + [(4015.6, 4016.0, 4014.0, 4014.2)]  # only 5.25 below the vertex close
     assert [p for p in detect_vertex_patterns(frame(rows)) if p.direction == "SELL"] == []
+
+
+def test_vertex_is_the_default_detector() -> None:
+    assert StrategyPipelineConfig().pattern_detector == "vertex"

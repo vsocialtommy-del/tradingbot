@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
+
+# Allow ``python scripts/backtest_xautism.py`` from the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pandas as pd
 from loguru import logger

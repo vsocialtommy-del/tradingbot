@@ -118,9 +118,10 @@ class StrategyPipelineConfig:
 
     # XAUTISM zone rules (see StrongPointConfig for details).
     allowed_pattern_types: tuple[str, ...] = ("DBR", "RBD")
-    pattern_detector: str = "classic"
-    """``classic`` = ERC leg / small-candle base detector; ``vertex`` =
-    M / W vertex zones (see :mod:`bot.strategy.vertex`)."""
+    pattern_detector: str = "vertex"
+    """``vertex`` (default, Nov 2026) = M / W vertex zones, see
+    :mod:`bot.strategy.vertex`. ``classic`` = the old ERC leg /
+    small-candle base detector (kept, switch back by setting this)."""
     vertex_min_base: int = 3
     vertex_max_base: int = 8
     vertex_max_leg: int = 5

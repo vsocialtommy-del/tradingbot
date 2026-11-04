@@ -3564,6 +3564,13 @@ class TestXautismMode:
         assert kw["zone_bottom"] == 1895.0
 
 
+def _wide_stacking(b: Bot) -> None:
+    from dataclasses import replace
+    from bot.strategy.stacked import StackedConfig
+    b.config = replace(b.config, stacked=StackedConfig(
+        enabled=True, max_gap_points=10.0, allow_m5_outer=True))
+
+
 class TestStackedInMain:
     def _setup_tick(self, b: Bot, mock_mt5: MagicMock, bid: float, ask: float) -> None:
         b.state.last_config_refresh = NOW
@@ -3581,6 +3588,7 @@ class TestStackedInMain:
         from tests.test_order_manager import make_zone_for_test
         b, _ = bot
         _xautism(b)
+        _wide_stacking(b)
         self._setup_tick(b, mock_mt5, 1900.4, 1900.5)
         first = replace(
             _make_validated_for_persistence(_PT.DBR),
@@ -3619,6 +3627,7 @@ class TestStackedInMain:
         from tests.test_order_manager import make_zone_for_test
         b, mgrs = bot
         _xautism(b)
+        _wide_stacking(b)
         m1 = make_zone_for_test(direction="SELL", top=1910.0, bottom=1908.0)
         mocker.patch("bot.main.run_strategy_pipeline", return_value=[m1])
         b._refresh_stack_candidates([])
