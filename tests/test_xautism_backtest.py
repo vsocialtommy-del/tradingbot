@@ -109,3 +109,20 @@ def test_layer2_waits_for_candle_close_inside() -> None:
     feed(b, [3998.0, 4000.0, 4010.0])
     tr = b.trades[0]
     assert tr.l2.entry == 4000.0 and tr.exit_reason == "TP"
+
+
+def test_layer2_depth_arm_needs_20pct_wick() -> None:
+    from bot.backtest.xautism import XBacktestConfig
+    b = bt(); b.cfg = XBacktestConfig(layer2_arm="DEPTH")
+    b.open = buy_trade(); b.open.depth_level = 3999.2     # 20% of a 4-pt zone
+    feed(b, [3999.5, 4000.0])          # only 0.5 in: not armed
+    assert b.open.l2.state == "UNPLACED"
+    feed(b, [3999.2, 4000.0, 4010.0])  # wick to 20%, back out, TP
+    assert b.trades[0].l2.entry == 4000.0
+
+
+def test_layer2_limit_at_depth() -> None:
+    b = bt(); b.open = buy_trade(l2_kind="LIMIT", l2_price=3999.2)
+    feed(b, [3999.6, 3998.8, 4010.0])  # ask reaches 3999.2 (bid 3998.9)
+    tr = b.trades[0]
+    assert tr.l2.entry == 3999.2 and tr.exit_reason == "TP"

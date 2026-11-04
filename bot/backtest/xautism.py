@@ -56,7 +56,13 @@ class XBacktestConfig:
     layer2_arm: str = "TOUCH"
     """When the layer 2 stop may be placed: TOUCH = as soon as price is
     0.10 inside the zone (live bot today); M1_CLOSE / M5_CLOSE = only
-    after a candle of that timeframe closes inside the zone."""
+    after a candle of that timeframe closes inside the zone; DEPTH = only
+    after price (a wick is enough) has been ``layer2_depth`` into the zone."""
+    layer2_mode: str = "STOP"
+    """STOP = stop at the edge on the way out (live bot today).
+    LIMIT_DEPTH = a limit inside the zone at ``layer2_depth`` of its
+    height (fills as soon as price, even a wick, gets there)."""
+    layer2_depth: float = 0.20
     trade_m1_zones: bool = False
     """Also trade M1 zones as their own setups (same rules as M5 zones;
     M15 direction gate, 30 % SL, TP at the BOS, M5 close exit). Needs
@@ -99,6 +105,7 @@ class Trade:
     planned_risk: float
     tf: str = "M5"
     l2_armed: bool = False
+    depth_level: float = 0.0
     closed_at: pd.Timestamp | None = None
     exit_reason: str | None = None
 
@@ -364,6 +371,13 @@ class XautismBacktest:
             self._skip(f"{tf}:tp_wrong_side"); return False
 
         l2_price = stack.outer_entry if stack else entry
+        depth_level = (
+            z.top - cfg.layer2_depth * (z.top - z.bottom) if z.direction == "BUY"
+            else z.bottom + cfg.layer2_depth * (z.top - z.bottom)
+        )
+        limit_depth = cfg.layer2_mode == "LIMIT_DEPTH" and not stack
+        if limit_depth:
+            l2_price = depth_level
         lots = split_lots(
             risk=cfg.risk.risk_per_trade, layer1_entry=entry, layer2_entry=l2_price, sl=sl,
             loss_per_lot=lambda e, s: abs(e - s) * USD_PER_POINT_PER_LOT,
@@ -385,7 +399,8 @@ class XautismBacktest:
             l1=Layer(lots.layer1, entry=fill),
             l2=Layer(lots.layer2, state="UNPLACED" if lots.layer2 > 0 else "NONE"),
             l2_price=float(l2_price),
-            l2_kind="NONE" if lots.layer2 <= 0 else ("LIMIT" if stack else "STOP"),
+            l2_kind="NONE" if lots.layer2 <= 0 else ("LIMIT" if (stack or limit_depth) else "STOP"),
+            depth_level=float(depth_level),
             trend=trend, planned_risk=lots.risk, tf=tf,
         )
         if stack:
@@ -416,11 +431,15 @@ class XautismBacktest:
         min_d = self.cfg.xautism.layer2_min_distance
 
         # Layer 2 placement / fill.
+        if self.cfg.layer2_arm == "DEPTH" and not tr.l2_armed:
+            # Chart price (bid) reaching the depth level, wick is enough.
+            if (buy and bid <= tr.depth_level) or (not buy and bid >= tr.depth_level):
+                tr.l2_armed = True
         if l2.state == "UNPLACED":
             if tr.l2_kind == "LIMIT":
                 l2.state = "PENDING"
             elif self.cfg.layer2_arm != "TOUCH" and not tr.l2_armed:
-                pass  # waiting for a candle to close inside the zone
+                pass  # waiting for a candle close inside / the depth level
             elif (buy and ask <= tr.l2_price - min_d) or (not buy and bid >= tr.l2_price + min_d):
                 l2.state = "PENDING"
         if l2.state == "PENDING":
