@@ -110,3 +110,7 @@ def test_zigzag_foot_skips_small_pullback() -> None:
     assert near and far
     assert df["close"].iloc[near[0].foot_index] == pytest.approx(4101.9)
     assert df["close"].iloc[far[0].foot_index] == pytest.approx(4092.6)
+
+
+def test_default_foot_is_zigzag_quarter() -> None:
+    assert StrategyPipelineConfig().vertex_foot_zigzag_frac == 0.25
