@@ -48,6 +48,12 @@ class VertexConfig:
     leg_min_frac: float = 1.0
     """Leg in and leg out must each move at least this many zone heights
     on the line chart (cuts flat, dead-market 'zones')."""
+    foot_zigzag_frac: float = 0.0
+    """0 = foot is the first line-chart dip before the leg in (current).
+    > 0 = 'zigzag' foot: keep walking back past dips whose bounce is
+    smaller than this many zone heights, so the foot is where the whole
+    move into the zone started."""
+    foot_max_lookback: int = 120
     exit_frac: float = 0.5
     """The leg out must close beyond the zone by at least this fraction
     of the zone height. Stops a small dip just under the vertex low from
@@ -112,13 +118,15 @@ def _try(direction, s, e, out_start, top, bottom, o, h, l, c,
     foot = in_s - 1
     if foot < 0:
         return None
-    if sell:
+    height = top - bottom
+    if cfg.foot_zigzag_frac > 0:
+        foot = _zigzag_foot(c, foot, sell, cfg.foot_zigzag_frac * height, cfg.foot_max_lookback)
+    elif sell:
         while foot - 1 >= 0 and c[foot - 1] < c[foot]:
             foot -= 1
     else:
         while foot - 1 >= 0 and c[foot - 1] > c[foot]:
             foot -= 1
-    height = top - bottom
     if abs(c[in_e] - c[foot]) < cfg.leg_min_frac * height:
         return None
     # Leg out: consecutive same-colour candles from out_start; one closes beyond.
@@ -130,6 +138,23 @@ def _try(direction, s, e, out_start, top, bottom, o, h, l, c,
             return (in_s, in_e), (out_start, k), foot
         k += 1
     return None
+
+
+def _zigzag_foot(c, start, sell, thr, max_back):
+    """Walk back from ``start``: track the lowest close (sell) / highest
+    (buy); stop once price before it was ``thr`` away (a real turn)."""
+    f = start
+    best = c[start]
+    j = start - 1
+    lo = max(0, start - max_back)
+    while j >= lo:
+        v = c[j]
+        if (sell and v < best) or (not sell and v > best):
+            best, f = v, j
+        elif (sell and v - best >= thr) or (not sell and best - v >= thr):
+            break
+        j -= 1
+    return f
 
 
 def _impulse(direction, idx, o, h, l, c, a, b) -> Impulse:

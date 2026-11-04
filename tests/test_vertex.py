@@ -84,3 +84,33 @@ def test_small_leg_out_rejected() -> None:
 
 def test_vertex_is_the_default_detector() -> None:
     assert StrategyPipelineConfig().pattern_detector == "vertex"
+
+
+def test_zigzag_foot_skips_small_pullback() -> None:
+    # Rally with a small dip part way up: 4092.6 start, dip to 4101.9.
+    rows = [
+        (4101.0, 4101.5, 4100.6, 4101.2),
+        (4101.2, 4101.3, 4092.0, 4092.6),   # real start of the move
+        (4092.6, 4098.0, 4092.4, 4097.6),
+        (4097.6, 4106.0, 4097.4, 4105.5),
+        (4105.5, 4105.7, 4101.5, 4101.9),   # small pullback (3.6 bounce before it)
+        (4101.9, 4106.2, 4101.8, 4106.0),   # leg in
+        (4106.0, 4110.6, 4105.8, 4110.4),
+        (4110.4, 4113.2, 4110.2, 4113.0),
+        (4113.0, 4114.8, 4111.0, 4111.3),   # vertex (zone ~4107.2-4115.3)
+        (4111.3, 4112.0, 4107.2, 4110.8),
+        (4110.8, 4115.3, 4110.5, 4114.3),
+        (4114.3, 4114.6, 4108.8, 4109.0),   # leg out
+        (4109.0, 4109.2, 4101.0, 4101.4),
+        (4101.4, 4101.6, 4097.0, 4097.5),
+    ]
+    df = frame(rows)
+    near = [p for p in detect_vertex_patterns(df) if p.direction == "SELL"]
+    far = [p for p in detect_vertex_patterns(df, VertexConfig(foot_zigzag_frac=0.5)) if p.direction == "SELL"]
+    assert near and far
+    assert df["close"].iloc[near[0].foot_index] == pytest.approx(4101.9)
+    assert df["close"].iloc[far[0].foot_index] == pytest.approx(4092.6)
+
+
+def test_default_foot_is_zigzag_quarter() -> None:
+    assert StrategyPipelineConfig().vertex_foot_zigzag_frac == 0.25

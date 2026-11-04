@@ -6,14 +6,15 @@
 |---|---|
 | Zones | M5 vertex zones: the M (sell) / W (buy) top, 3-8 candles, marked wick to wick. Leg in and leg out each move at least one zone height; the leg out closes beyond the zone by half its height. DBR / RBD only, minimum 3 points. |
 | Fresh | Untouched (wicks count) since the BOS, never closed through. |
-| BOS / TP1 | The foot: the last low (sell) / high (buy) before the zone, on the body close. The drop / rally out must close through it. TP1 = that level, 0.3 inside for spread. |
+| BOS / TP1 | The foot: the low (sell) / high (buy) the whole move into the zone started from, on the body close. Pullbacks that bounce less than 25 % of the zone height are skipped (zigzag). The drop / rally out must close through it. TP1 = that level, 0.3 inside for spread. |
 | Direction | M15 trend, or against it only when the M5 zone sits in a fresh H1 zone. |
 | Entry | 0.01 at the zone edge on first touch. Layer 2 (the rest) is a broker stop at the same edge, placed once price is 0.10 inside the zone, filling on the way back out. Same SL and TP on both. Layer 2 is cancelled if TP or SL hits first. |
 | SL | 30 % of the zone past the far edge (below for buys, above for sells), pushed beyond a swing just past it. Extra exit: an M5 candle closing beyond the far edge closes everything. |
 | Risk | £100 per trade (both layers together), -£300 a day, stop after 2 losing trades, one trade at a time, no entry above a 0.50 spread, news blackout. |
 | Off (code kept) | Stacked two-zone layering, flip trading, bot-managed TPs / break even / trailing / zone exit, the classic detector. |
 
-Backtest, 8 Jul - 21 Oct 2026 (M5, M1 from Sep): see the PR description.
+Backtest, 8 Jul - 21 Oct 2026 (M5, M1 from Sep, £100 risk): 229 trades,
+62.4 % win rate, +£1,788, profit factor 1.39, max drawdown -£365.
 
 ## Starting it on the Vantage demo (Windows PC)
 

@@ -127,6 +127,10 @@ class StrategyPipelineConfig:
     vertex_max_leg: int = 5
     vertex_exit_frac: float = 0.5
     vertex_leg_min_frac: float = 1.0
+    vertex_foot_zigzag_frac: float = 0.25
+    """Zigzag foot: ignore pullbacks whose bounce is under 25 % of the zone
+    height when finding the BOS / TP level (Nov 2026 backtest: +£1,788 vs
+    +£1,148 with the first-dip foot). 0 = old first-dip foot."""
     require_bos: bool = True
     bos_swing_strength: int = 2
     require_fresh_since_bos: bool = True
@@ -207,6 +211,7 @@ def run_strategy_pipeline(
             min_base=cfg.vertex_min_base, max_base=cfg.vertex_max_base,
             max_leg=cfg.vertex_max_leg, exit_frac=cfg.vertex_exit_frac,
             leg_min_frac=cfg.vertex_leg_min_frac,
+            foot_zigzag_frac=cfg.vertex_foot_zigzag_frac,
         ))
         wick_extend = 0   # vertex zones are exactly wick to wick
     else:
