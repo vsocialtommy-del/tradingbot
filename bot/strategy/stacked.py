@@ -30,11 +30,17 @@ Timeframe = Literal["M5", "M1"]
 
 @dataclass(frozen=True)
 class StackedConfig:
-    enabled: bool = True
-    max_gap_points: float = 10.0
+    enabled: bool = False
+    """Nov 2026: switched off. Every backtest where stacking happened
+    often lost money (-£489 to -£1,231 over Jul-Oct); with the M1-only /
+    3-point rule it almost never fires. Code kept to retest later."""
+    max_gap_points: float = 3.0
     """Max distance between the first zone's far edge and the outer
-    zone's near edge (10 points = $10 on gold)."""
+    zone's near edge (Nov 2026 backtest: 10 → 3 points)."""
     use_m1_zones: bool = True
+    allow_m5_outer: bool = False
+    """False = only an M1 zone can be the outer zone (Tommy's original
+    rule: an M5 zone with an M1 zone right next to it)."""
     m1_ohlc_count: int = 5000
     """M1 bars scanned for outer zones (5000 ≈ 3.5 trading days)."""
     sl_zone_pct: float = 0.30
@@ -65,6 +71,8 @@ def find_outer_zone(
     cfg = config or StackedConfig()
     best: tuple[Timeframe, ValidatedZone, float] | None = None
     for tf, z in candidates:
+        if tf == "M5" and not cfg.allow_m5_outer:
+            continue
         if z.direction != first.direction:
             continue
         if not (z.is_strong_point and z.refined_zone.is_tradeable):

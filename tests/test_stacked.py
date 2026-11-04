@@ -20,6 +20,11 @@ from tests.test_order_manager import make_zone_for_test
 from tests.test_xautism_entries import make_setup, make_trade
 
 
+# Stacking is off by default (Nov 2026); these tests exercise the logic
+# with the original wide rule.
+WIDE = StackedConfig(enabled=True, max_gap_points=10.0, allow_m5_outer=True)
+
+
 def z(direction: str, bottom: float, top: float, **kw):
     return make_zone_for_test(direction=direction, top=top, bottom=bottom, **kw)
 
@@ -28,7 +33,7 @@ class TestFindOuterZone:
     def test_29_oct_sell_example(self) -> None:
         first = z("SELL", 4018.0, 4025.5)
         m1 = z("SELL", 4030.4, 4033.7)
-        plan = stacked_plan(first, [("M1", m1)])
+        plan = stacked_plan(first, [("M1", m1)], WIDE)
         assert plan is not None
         assert plan.outer_timeframe == "M1"
         assert plan.gap_points == pytest.approx(4.9)
@@ -39,7 +44,7 @@ class TestFindOuterZone:
     def test_buy_mirror(self) -> None:
         first = z("BUY", 3995.0, 4000.0)
         outer = z("BUY", 3985.0, 3990.0)
-        plan = stacked_plan(first, [("M5", outer)])
+        plan = stacked_plan(first, [("M5", outer)], WIDE)
         assert plan is not None
         assert plan.outer_entry == 3990.0
         assert plan.sl == pytest.approx(3983.5)     # 30% of 5 below 3985
@@ -47,11 +52,11 @@ class TestFindOuterZone:
     def test_gap_over_10_points_is_not_stacked(self) -> None:
         first = z("SELL", 4018.0, 4025.5)
         far = z("SELL", 4035.6, 4038.0)             # gap 10.1
-        assert find_outer_zone(first, [("M5", far)]) is None
+        assert find_outer_zone(first, [("M5", far)], WIDE) is None
 
     def test_gap_of_exactly_10_counts(self) -> None:
         first = z("SELL", 4018.0, 4025.5)
-        assert find_outer_zone(first, [("M5", z("SELL", 4035.5, 4038.0))]) is not None
+        assert find_outer_zone(first, [("M5", z("SELL", 4035.5, 4038.0))], WIDE) is not None
 
     def test_ignores_wrong_side_overlap_direction_and_stale(self) -> None:
         first = z("SELL", 4018.0, 4025.5)
@@ -69,7 +74,7 @@ class TestFindOuterZone:
         near_m1 = z("BUY", 3990.0, 3993.0)          # gap 2
         tie_m5 = z("BUY", 3989.0, 3993.0)           # gap 2
         far_m5 = z("BUY", 3985.0, 3988.0)           # gap 7
-        tf, outer, gap = find_outer_zone(first, [("M1", near_m1), ("M5", far_m5), ("M5", tie_m5)])
+        tf, outer, gap = find_outer_zone(first, [("M1", near_m1), ("M5", far_m5), ("M5", tie_m5)], WIDE)
         assert gap == 2.0 and tf == "M5" and outer is tie_m5
 
     def test_custom_gap(self) -> None:
@@ -106,7 +111,7 @@ def tracker(mocker: MockerFixture) -> MagicMock:
 
 def test_stacked_orders(mt5, supa, tracker) -> None:
     first = z("SELL", 4018.0, 4025.5)
-    plan = stacked_plan(first, [("M1", z("SELL", 4030.4, 4033.7))])
+    plan = stacked_plan(first, [("M1", z("SELL", 4030.4, 4033.7))], WIDE)
     r = place_xautism_orders(first, uuid4(), total_lots=0.05,
                              sl_price=plan.sl, tp1_price=4012.87,
                              stacked=plan, mt5=mt5, supabase=supa, tracker=tracker)
@@ -138,3 +143,8 @@ def test_layer2_limit_placed_at_outer_zone(mt5, supa, tracker) -> None:
     kw = mt5.place_limit_order.call_args.kwargs
     assert kw["direction"] == "SELL" and kw["price"] == 4030.4
     mt5.place_stop_order.assert_not_called()
+
+
+def test_defaults_are_off_and_m1_only() -> None:
+    c = StackedConfig()
+    assert c.enabled is False and c.allow_m5_outer is False and c.max_gap_points == 3.0

@@ -239,7 +239,13 @@ def find_bos(
     base_start = pattern.base.start_index
     base_end = pattern.base.end_index
     want = "HIGH" if refined.direction == "BUY" else "LOW"
-    all_swings = swings if swings is not None else detect_swings(df, swing_strength)
+    foot = getattr(pattern, "foot_index", None)
+    if foot is not None and 0 <= foot < len(df):
+        # Vertex pattern: the BOS level is the foot of the leg in.
+        all_swings = [Swing(index=foot, time=df.index[foot],
+                            price=float(df["close"].iloc[foot]), kind=want)]
+    else:
+        all_swings = swings if swings is not None else detect_swings(df, swing_strength)
     before = [
         sw for sw in all_swings
         if sw.kind == want and sw.index < base_start

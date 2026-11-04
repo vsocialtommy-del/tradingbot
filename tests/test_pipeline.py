@@ -132,6 +132,11 @@ def patch_stages(
         "bot.strategy.pipeline.detect_patterns",
         return_value=patterns or [],
     )
+    # Nov 2026: vertex is the default detector; stub it the same way.
+    mocker.patch(
+        "bot.strategy.pipeline.detect_vertex_patterns",
+        return_value=patterns or [],
+    )
     stubs["mark"] = mocker.patch(
         "bot.strategy.pipeline.mark_zone",
         # PR #57: pipeline now passes ``wick_extend_bars=...`` from
