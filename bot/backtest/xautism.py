@@ -53,6 +53,10 @@ class XBacktestConfig:
     min_sl_distance: float = 1.0
     max_sl_distance: float = 200.0
     use_spread_filter: bool = True
+    trade_m1_zones: bool = False
+    """Also trade M1 zones as their own setups (same rules as M5 zones;
+    M15 direction gate, 30 % SL, TP at the BOS, M5 close exit). Needs
+    M1 data; M1 zones are refreshed every minute."""
     first_touch_lots: float = 0.01
     xautism: XautismEntryConfig = field(default_factory=XautismEntryConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -89,6 +93,7 @@ class Trade:
     l2_kind: str  # STOP / LIMIT / NONE
     trend: str
     planned_risk: float
+    tf: str = "M5"
     closed_at: pd.Timestamp | None = None
     exit_reason: str | None = None
 
@@ -99,7 +104,7 @@ class Trade:
     def row(self) -> dict[str, Any]:
         return {
             "opened_at": self.opened_at, "closed_at": self.closed_at,
-            "direction": self.direction,
+            "tf": self.tf, "direction": self.direction,
             "zone": f"{self.zone_bottom:.2f}-{self.zone_top:.2f}",
             "stacked": (
                 f"{self.stacked.outer_timeframe} {self.stacked.outer_bottom:.2f}-"
@@ -202,43 +207,40 @@ class XautismBacktest:
         spread = float(bar["spread"])
         closed = m5.iloc[max(0, i - self.cfg.window_bars):i]   # bars closed before this one
 
-        queue: list[ValidatedZone] = []
-        can_open = self.open is None and not self._blocked(t)
-        if can_open:
+        m5_zones: list[ValidatedZone] = []
+        if self.open is None and not self._blocked(t):
             zones = run_strategy_pipeline(closed, self.cfg.pipeline)
-            queue = [
-                z for z in zones
-                if z.is_strong_point and z.refined_zone.is_tradeable
-                and _key(z) not in self.traded_keys
-            ]
-            lo, hi = float(bar["low"]), float(bar["high"]) + spread
-            queue = [
-                z for z in queue
-                if (z.direction == "BUY" and lo <= z.top) or (z.direction == "SELL" and hi >= z.bottom)
-            ]
             self._m5_zones = [z for z in zones if z.is_strong_point and z.refined_zone.is_tradeable]
-        if self.open is None and not queue:
-            return
+            m5_zones = [z for z in self._m5_zones if _key(z) not in self.traded_keys]
 
-        failed: set[tuple] = set()
-        for p in self._path(i):
-            if self.open is not None:
-                self._manage(p, spread, t)
-                continue
-            if not can_open or self._blocked(t):
-                continue
-            for z in queue:
-                k = _key(z)
-                if k in failed or k in self.traded_keys:
+        minutes = None
+        if self.cfg.trade_m1_zones and self.m1 is not None:
+            minutes = self.m1.loc[t: t + pd.Timedelta(minutes=4)]
+            if len(minutes) == 0:
+                minutes = None
+
+        if minutes is None:
+            cands = [(z, "M5", closed) for z in _touched(m5_zones, bar, spread)]
+            if self.open is not None or cands:
+                self._walk(self._path(i), cands, closed, spread, t)
+        else:
+            for ts, row in minutes.iterrows():
+                m_spread = float(row["spread"])
+                m1_zones: list[ValidatedZone] = []
+                m1_closed = None
+                if self.open is None and not self._blocked(ts):
+                    j = int(self.m1.index.searchsorted(ts))
+                    if j >= 300:
+                        m1_closed = self.m1.iloc[max(0, j - self.cfg.m1_window_bars):j]
+                        zs = run_strategy_pipeline(m1_closed, self.cfg.pipeline)
+                        self._cur_m1_zones = [z for z in zs if z.is_strong_point and z.refined_zone.is_tradeable]
+                        m1_zones = [z for z in self._cur_m1_zones if _key(z) not in self.traded_keys]
+                cands = [(z, "M5", closed) for z in _touched(m5_zones, row, m_spread)]
+                cands += [(z, "M1", m1_closed) for z in _touched(m1_zones, row, m_spread)]
+                if self.open is None and not cands:
                     continue
-                touched = p <= z.top if z.direction == "BUY" else p + spread >= z.bottom
-                if not touched:
-                    continue
-                if self._try_open(z, closed, p, spread, t):
-                    break
-                failed.add(k)
-            if self.open is not None:
-                self._manage(p, spread, t)
+                pts = self._stepped(_bar_path(row["open"], row["high"], row["low"], row["close"]))
+                self._walk(pts, cands, closed, m_spread, ts)
 
         # M5 close exit on this bar's close.
         tr = self.open
@@ -247,6 +249,28 @@ class XautismBacktest:
             beyond = c < tr.far_edge if tr.direction == "BUY" else c > tr.far_edge
             if beyond:
                 self._close_all(c, spread, t, "M5_CLOSE_EXIT")
+
+    def _walk(self, pts: list[float], cands: list, m5_closed: pd.DataFrame,
+              spread: float, t: pd.Timestamp) -> None:
+        failed: set[tuple] = set()
+        for p in pts:
+            if self.open is not None:
+                self._manage(p, spread, t)
+                continue
+            if self._blocked(t):
+                continue
+            for z, tf, zdf in cands:
+                k = _key(z)
+                if k in failed or k in self.traded_keys:
+                    continue
+                touched = p <= z.top if z.direction == "BUY" else p + spread >= z.bottom
+                if not touched:
+                    continue
+                if self._try_open(z, m5_closed, p, spread, t, tf=tf, zone_df=zdf):
+                    break
+                failed.add(k)
+            if self.open is not None:
+                self._manage(p, spread, t)
 
     def _path(self, i: int) -> list[float]:
         t = self.m5.index[i]
@@ -259,6 +283,9 @@ class XautismBacktest:
         if not pts:
             r = self.m5.iloc[i]
             pts = _bar_path(r["open"], r["high"], r["low"], r["close"])
+        return self._stepped(pts)
+
+    def _stepped(self, pts: list[float]) -> list[float]:
         out: list[float] = [float(pts[0])]
         step = self.cfg.step
         for a, b in zip(pts, pts[1:]):
@@ -269,40 +296,46 @@ class XautismBacktest:
     # ------------------------------------------------------------------ #
 
     def _try_open(self, z: ValidatedZone, closed: pd.DataFrame, p: float,
-                  spread: float, t: pd.Timestamp) -> bool:
+                  spread: float, t: pd.Timestamp, *, tf: str = "M5",
+                  zone_df: pd.DataFrame | None = None) -> bool:
         cfg = self.cfg
+        m5_closed = closed
+        closed = zone_df if zone_df is not None else m5_closed   # the zone's own timeframe
         if count_bodies_through_zone(closed, zone_top=z.top, zone_bottom=z.bottom,
                                      since_time=pd.Timestamp(z.formed_at)) >= 1:
-            self._skip("obscured"); return False
+            self._skip(f"{tf}:obscured"); return False
         if cfg.use_spread_filter and spread > cfg.risk.max_spread:
-            self._skip("spread"); return False
+            self._skip(f"{tf}:spread"); return False
         trend = ""
         if cfg.direction_gate.enabled:
             dec = check_direction(direction=z.direction, zone_bottom=float(z.bottom),
-                                  zone_top=float(z.top), df_m5=closed,
+                                  zone_top=float(z.top), df_m5=m5_closed,
                                   config=cfg.direction_gate, pipeline_cfg=cfg.pipeline)
             if not dec.allowed:
-                self._skip("direction_gate"); return False
+                self._skip(f"{tf}:direction_gate"); return False
             trend = dec.reason
         lv = compute_levels(z, closed, cfg.levels)
         entry, sl = lv.entry, lv.sl
         stack = None
         if cfg.stacked.enabled:
             cands = [("M5", c) for c in getattr(self, "_m5_zones", [])]
-            cands += [("M1", c) for c in self._m1_zones(t)]
+            if cfg.trade_m1_zones and self.m1 is not None:
+                cands += [("M1", c) for c in getattr(self, "_cur_m1_zones", [])]
+            else:
+                cands += [("M1", c) for c in self._m1_zones(t)]
             stack = stacked_plan(z, cands, cfg.stacked)
             if stack is not None:
                 sl = stack.sl
         dist = abs(entry - sl)
         if dist < cfg.min_sl_distance or dist > cfg.max_sl_distance:
-            self._skip("sl_distance"); return False
+            self._skip(f"{tf}:sl_distance"); return False
         tp = lv.tp1 if lv.tp1 is not None else find_nearest_local_peak(
             closed, entry_price=entry, direction=z.direction,
             lookback_bars=cfg.pipeline.tp1_local_peak_lookback_bars)
         if tp is None:
-            self._skip("no_tp"); return False
+            self._skip(f"{tf}:no_tp"); return False
         if (z.direction == "BUY" and tp <= z.top) or (z.direction == "SELL" and tp >= z.bottom):
-            self._skip("tp_wrong_side"); return False
+            self._skip(f"{tf}:tp_wrong_side"); return False
 
         l2_price = stack.outer_entry if stack else entry
         lots = split_lots(
@@ -316,7 +349,7 @@ class XautismBacktest:
         far = stack.outer_far_edge if stack else (z.bottom if z.direction == "BUY" else z.top)
         z_far = z.bottom if z.direction == "BUY" else z.top
         if (z.direction == "BUY" and fill < z_far - 0.05) or (z.direction == "SELL" and fill > z_far + 0.05):
-            self._skip("gap_through"); return False
+            self._skip(f"{tf}:gap_through"); return False
 
         self.traded_keys.add(_key(z))
         self.open = Trade(
@@ -327,7 +360,7 @@ class XautismBacktest:
             l2=Layer(lots.layer2, state="UNPLACED" if lots.layer2 > 0 else "NONE"),
             l2_price=float(l2_price),
             l2_kind="NONE" if lots.layer2 <= 0 else ("LIMIT" if stack else "STOP"),
-            trend=trend, planned_risk=lots.risk,
+            trend=trend, planned_risk=lots.risk, tf=tf,
         )
         if stack:
             self.traded_keys.add((z.direction, round(stack.outer_top, 2), round(stack.outer_bottom, 2)))
@@ -399,6 +432,14 @@ class XautismBacktest:
         assert tr is not None
         price = bid_close if tr.direction == "BUY" else bid_close + spread
         self._close_at(price, t, reason)
+
+
+def _touched(zones: list[ValidatedZone], bar: Any, spread: float) -> list[ValidatedZone]:
+    lo, hi = float(bar["low"]), float(bar["high"]) + spread
+    return [
+        z for z in zones
+        if (z.direction == "BUY" and lo <= z.top) or (z.direction == "SELL" and hi >= z.bottom)
+    ]
 
 
 def _key(z: Any) -> tuple:
