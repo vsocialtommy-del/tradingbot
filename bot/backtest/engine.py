@@ -140,7 +140,7 @@ class BacktestConfig:
     """Swing detection strength — used by structure analysis for the
     Strong Point break / anchor swings. PR #31 default lowered to 2
     to catch sharp V-tip pivots."""
-    min_sl_distance_points: float = 5.0
+    min_sl_distance_points: float = 1.0
     max_sl_distance_points: float = 200.0
     layer_2_offset_points: float = 2.5
     layer_3_offset_points: float = 5.0

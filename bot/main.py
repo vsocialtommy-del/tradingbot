@@ -127,6 +127,7 @@ from bot.strategy.strong_point import (
 from bot.strategy.direction_gate import DirectionGateConfig, check_direction
 from bot.strategy.levels import LevelsConfig, TradeLevels, compute_levels
 from bot.strategy.stacked import StackedConfig, StackedPlan, stacked_plan
+from bot.risk.xautism_risk import DailyRiskTracker, RiskConfig, split_lots
 from bot.strategy.pipeline import (
     StrategyPipelineConfig,
     run_strategy_pipeline,
@@ -210,8 +211,12 @@ class BotLoopConfig:
     reconcile_seconds: int = 300
     heartbeat_seconds: int = 300
 
-    max_simultaneous_setups: int = 3
+    max_simultaneous_setups: int = 1
+    """Nov 2026 (XAUTISM): one trade at a time (was 3)."""
     daily_loss_limit_pct: float = 10.0
+    risk: RiskConfig = field(default_factory=RiskConfig)
+    """Fixed £ risk per trade, daily loss limit, two losses and done,
+    spread filter. See :mod:`bot.risk.xautism_risk`."""
     ohlc_count: int = 5000
     """Number of M5 bars to pull per pipeline run. 5000 ≈ 17 trading
     days (about 3.5 weeks). A zone stays tradeable for as long as it is
@@ -343,6 +348,7 @@ class Bot:
             mt5, supabase, self.position_tracker,
             self.config.xautism_entries, symbol=self.config.symbol,
         )
+        self.daily_risk = DailyRiskTracker(mt5, symbol=self.config.symbol)
         self.news_filter = NewsFilter(
             supabase, config=self.news_filter_config,
         )
@@ -515,9 +521,11 @@ class Bot:
         # 3a. XAUTISM layer 2: place / track / cancel the broker stop.
         if self.config.xautism_entries.enabled:
             try:
-                self.layer2_stop_manager.check_live(
+                for ev in self.layer2_stop_manager.check_live(
                     bid, ask, self.config.xautism_entries,
-                )
+                ) or []:
+                    if ev.action == "PLACED":
+                        self.daily_risk.register(ev.ticket, ev.setup_id)
             except Exception:
                 logger.exception("main loop: layer2_stop.check_live failed")
 
@@ -570,11 +578,22 @@ class Bot:
             self.state.last_detect_closed = now
 
         # 5. New-setup detection (gated by halt + news + kill + M5 close).
+        placement_blocked = False
         if self._is_paused(now):
-            pass  # skip new setups; existing managed above
+            placement_blocked = True  # skip new setups; existing managed above
         else:
             daily_halt_result = self._check_daily_halt(now)
             news_check = self.news_filter.check(now)
+            placement_blocked = (
+                daily_halt_result.is_halted or news_check.is_blocked
+            )
+            # XAUTISM risk gates: daily £ loss + two losses and done.
+            # Zone detection keeps running; only new trades are blocked.
+            if self._xautism_risk_on():
+                verdict = self.daily_risk.check(now, self.config.risk)
+                if verdict.blocked:
+                    placement_blocked = True
+                    logger.debug(f"new trades blocked: {verdict.reason}")
 
             if daily_halt_result.is_halted:
                 logger.debug(
@@ -625,7 +644,7 @@ class Bot:
         # On subsequent ticks (1 Hz) this still runs, catching mid-
         # bar wicks before the next M5 close's lifecycle scan
         # consumes the zone.
-        if not self._is_paused(now):
+        if not placement_blocked:
             try:
                 self._try_place_pending(bid=bid, ask=ask)
             except Exception:
@@ -1565,6 +1584,16 @@ class Bot:
             )
             return False
 
+        # 0b2. Spread filter (Nov 2026): don't open into a wide spread.
+        if self._xautism_risk_on():
+            spread = ask - bid
+            if spread > self.config.risk.max_spread:
+                logger.info(
+                    f"new setup deferred: spread {spread:.2f} > "
+                    f"{self.config.risk.max_spread:.2f}"
+                )
+                return False
+
         # 0c. Direction gate (Nov 2026): with the M15 trend, or against it
         # only when the zone sits inside / touches a fresh H1 zone in the
         # same direction. Runs after the price gate so it's only computed
@@ -1746,6 +1775,20 @@ class Bot:
         )
         return False
 
+    def _xautism_risk_on(self) -> bool:
+        return self.config.risk.enabled and self.config.xautism_entries.enabled
+
+    def _loss_per_lot(self, direction: str, entry: float, sl: float) -> float:
+        """Account-currency loss for 1.0 lot entry→SL (broker-priced,
+        falling back to $100 per point per lot on gold)."""
+        try:
+            v = self.mt5.calc_loss_per_lot(self.config.symbol, direction, entry, sl)
+            if isinstance(v, (int, float)) and v > 0:
+                return float(v)
+        except Exception:
+            logger.exception("sizing: calc_loss_per_lot failed; using USD fallback")
+        return abs(entry - sl) * 100.0
+
     def _place_xautism(
         self, zone: ValidatedZone, zone_id: UUID, *,
         entry_price: float, sl_price: float, tp1_price: float,
@@ -1753,28 +1796,51 @@ class Bot:
     ) -> bool:
         """0.01 first touch now; the rest as a layer 2 broker stop (or,
         stacked, a limit at the outer zone)."""
-        try:
-            balance = self.mt5.get_balance()
-        except Exception:
-            logger.exception("new setup: get_balance failed; skipping zone")
-            return False
-        lot_result = calculate_lot_size(
-            balance=balance,
-            # Stacked: the main size goes in at the outer zone.
-            entry_price=stack.outer_entry if stack is not None else entry_price,
-            sl_price=sl_price,
-            config=self.sizing_config,
-        )
-        if lot_result.lot_size <= 0:
-            logger.warning(
-                f"new setup skipped: zero lot size ({lot_result.reason})"
-            )
-            return False
         xc = self.config.xautism_entries
+        # Stacked: the main size goes in at the outer zone.
+        layer2_entry = stack.outer_entry if stack is not None else entry_price
+        layer2_lots: float | None = None
+        if self.config.risk.enabled:
+            lots = split_lots(
+                risk=self.config.risk.risk_per_trade,
+                layer1_entry=entry_price,
+                layer2_entry=layer2_entry,
+                sl=sl_price,
+                loss_per_lot=lambda e, sl, d=zone.direction: self._loss_per_lot(d, e, sl),
+                first_touch_lots=xc.first_touch_lots,
+                lot_step=self.config.risk.lot_step,
+                max_lot=self.config.risk.max_lot,
+            )
+            layer2_lots = lots.layer2
+            total_lots = round(lots.layer1 + lots.layer2, 2)
+            logger.info(
+                f"sizing: risk {self.config.risk.risk_per_trade:.0f} → "
+                f"L1 {lots.layer1} + L2 {lots.layer2} lots "
+                f"(actual risk {lots.risk:.2f})"
+            )
+        else:
+            try:
+                balance = self.mt5.get_balance()
+            except Exception:
+                logger.exception("new setup: get_balance failed; skipping zone")
+                return False
+            lot_result = calculate_lot_size(
+                balance=balance,
+                entry_price=layer2_entry,
+                sl_price=sl_price,
+                config=self.sizing_config,
+            )
+            if lot_result.lot_size <= 0:
+                logger.warning(
+                    f"new setup skipped: zero lot size ({lot_result.reason})"
+                )
+                return False
+            total_lots = lot_result.lot_size
         try:
             result = place_xautism_orders(
                 zone, zone_id,
-                total_lots=lot_result.lot_size,
+                total_lots=total_lots,
+                layer2_lots=layer2_lots,
                 sl_price=sl_price,
                 tp1_price=tp1_price,
                 first_touch_lots=xc.first_touch_lots,
@@ -1790,6 +1856,8 @@ class Bot:
             return False
         if result.status == "PLACED":
             self.position_tracker.invalidate_active_setups_cache()
+            self.daily_risk.register(result.layer_1_ticket, result.setup_id)
+            self.daily_risk.invalidate()
             if stack is not None:
                 self._stacked_outer_keys.add((
                     zone.direction,

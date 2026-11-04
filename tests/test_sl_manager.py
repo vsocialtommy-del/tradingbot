@@ -301,11 +301,11 @@ class TestValidateSLDistance:
 
     def test_too_close_flagged(self, manager: SLManager) -> None:
         result = manager.validate_sl_distance(
-            entry_price=4500.0, sl_price=4497.0, direction="BUY",
+            entry_price=4500.0, sl_price=4499.5, direction="BUY",
         )
         assert result.is_valid is False
         assert result.is_too_close is True
-        assert result.distance_points == pytest.approx(3.0)
+        assert result.distance_points == pytest.approx(0.5)
 
     def test_too_far_flagged(self, manager: SLManager) -> None:
         result = manager.validate_sl_distance(
@@ -442,7 +442,7 @@ class TestDataclassDefaults:
         c = SLManagerConfig()
         assert c.symbol == "XAUUSD"
         assert c.sl_buffer_points == 17.5
-        assert c.min_sl_distance_points == 5.0
+        assert c.min_sl_distance_points == 1.0
         assert c.max_sl_distance_points == 200.0
 
     def test_sl_validation_default_error_is_none(self) -> None:

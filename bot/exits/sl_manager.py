@@ -116,9 +116,11 @@ class SLManagerConfig:
     sl_buffer_points: float = 17.5
     """Buffer applied to the anchor swing's price. Default $17.50 is
     the midpoint of the spec's 15-20 point band."""
-    min_sl_distance_points: float = 5.0
+    min_sl_distance_points: float = 1.0
     """SL closer than this is rejected — slippage / spread would
-    routinely stop us out before the trade breathes."""
+    routinely stop us out before the trade breathes. Nov 2026: 5 → 1;
+    with the 30 % SL a 3-point zone is a 3.9-point stop and must not be
+    skipped."""
     max_sl_distance_points: float = 200.0
     """SL farther than this is flagged as suspicious; the caller's
     policy (skip / clip / warn) decides what to do."""
