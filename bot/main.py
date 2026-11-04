@@ -149,6 +149,13 @@ from bot.strategy.zone_lifecycle import (
 )
 
 
+TRADED_SETUP_STATUSES: frozenset[str] = frozenset(
+    {"PENDING", "ACTIVE", "TP1_HIT", "CLOSED", "STOPPED_OUT"}
+)
+"""Setup statuses that mean the bot really placed orders on a zone
+(SKIPPED setups never placed anything, so they don't count)."""
+
+
 def _zone_dead_at(zone: Any) -> datetime | None:
     """When an existing zone stopped being fresh (first touch, break or
     flip), or ``None`` if it is still live (CONFIRMED / ACTIVE)."""
@@ -258,6 +265,20 @@ class BotLoopConfig:
     """Trade FLIPPED zones (SnD Flip, PR #38). Off by default: not part of
     the XAUTISM method for now. The lifecycle still records flips, and
     the code is kept so it can be switched back on later."""
+
+    # Nov 2026: old-bot checks the XAUTISM backtest never had. Off so the
+    # live bot trades exactly what the backtest traded. Code kept.
+    enable_old_zone_dedup: bool = False
+    """Old Supabase overlap dedup (PRs #56 / #59): blocked any zone that
+    overlapped another saved zone. On startup it blocked nearly every
+    fresh vertex zone. Replaced by the backtest's rule: never trade the
+    same zone twice (``Bot._traded_zone_ids``)."""
+    enable_news_filter: bool = False
+    """High-impact USD news blackout. Not in the backtest (no historical
+    news data)."""
+    enable_balance_pct_halt: bool = False
+    """Old % of balance daily halt. XAUTISM uses the -£300 / 2 losses
+    rule in ``risk`` instead."""
     ohlc_timeframe: Literal["M5"] = "M5"
     error_backoff_seconds: float = 5.0
 
@@ -384,6 +405,11 @@ class Bot:
         self._pending_pipeline_zones: list[tuple[ValidatedZone, UUID]] = []
         self._pending_flipped_zones:  list[tuple[ValidatedZone, UUID]] = []
 
+        # Zones the bot has placed a setup on. Same rule as the
+        # backtest's ``traded_keys``: a zone is traded once, ever.
+        # Hydrated from Supabase on startup.
+        self._traded_zone_ids: set[UUID] = set()
+
     # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #
@@ -432,6 +458,19 @@ class Bot:
                 "scanner reconciles)"
             )
 
+        try:
+            self._close_stale_setups()
+        except Exception:
+            logger.exception("bot startup: stale setup check failed; continuing")
+
+        try:
+            self._hydrate_traded_zone_ids()
+        except Exception:
+            logger.exception(
+                "bot startup: traded-zone hydration failed; zones traded "
+                "before this restart could be traded again"
+            )
+
         now = datetime.now(timezone.utc)
         self.state.last_reconcile = now
         self._refresh_runtime_config(now)
@@ -452,6 +491,56 @@ class Bot:
             f"bot startup: hydrated zone cache from DB "
             f"({len(self._persisted_zone_keys)} existing zones)"
         )
+
+    def _hydrate_traded_zone_ids(self) -> None:
+        """Every zone that already had a setup placed on it."""
+        setups = self.supabase.get_setups_by_status(list(TRADED_SETUP_STATUSES))
+        self._traded_zone_ids = {s.zone_id for s in setups or []}
+        logger.info(
+            f"bot startup: {len(self._traded_zone_ids)} zones already traded"
+        )
+
+    def _close_stale_setups(self) -> None:
+        """Open setups with nothing live at the broker are leftovers
+        (e.g. from an old account). They'd count against the one-trade
+        limit forever, so mark them SKIPPED.
+
+        Live = a trade row that's FILLED / PARTIALLY_CLOSED, or one whose
+        ticket is a pending order on MT5 right now.
+        """
+        try:
+            pending_tickets = {
+                int(o["ticket"]) for o in (self.mt5.get_pending_orders() or [])
+            }
+        except Exception:
+            logger.exception(
+                "stale setups: get_pending_orders failed; skipping the check"
+            )
+            return
+        for setup in self.supabase.get_setups_by_status(
+            ["PENDING", "ACTIVE", "TP1_HIT"],
+        ):
+            trades = self.supabase.get_trades_for_setup(setup.id)
+            live = any(
+                t.status in ("FILLED", "PARTIALLY_CLOSED")
+                or (t.mt5_ticket is not None and int(t.mt5_ticket) in pending_tickets)
+                for t in trades
+            )
+            if live:
+                continue
+            new_status = "SKIPPED" if setup.status == "PENDING" else "CLOSED"
+            try:
+                self.position_tracker.update_setup_status(
+                    setup.id, new_status,  # type: ignore[arg-type]
+                    skip_reason="STALE_ON_STARTUP",
+                )
+                logger.warning(
+                    f"stale setup {setup.id} ({setup.status} {setup.direction} "
+                    f"created {setup.created_at}) has nothing live at the "
+                    f"broker; marked {new_status}"
+                )
+            except Exception:
+                logger.exception(f"stale setups: failed to close {setup.id}")
 
     def shutdown(self) -> None:
         """Best-effort disconnect. Idempotent. Never raises."""
@@ -582,10 +671,16 @@ class Bot:
         if self._is_paused(now):
             placement_blocked = True  # skip new setups; existing managed above
         else:
-            daily_halt_result = self._check_daily_halt(now)
-            news_check = self.news_filter.check(now)
-            placement_blocked = (
-                daily_halt_result.is_halted or news_check.is_blocked
+            daily_halt_result = (
+                self._check_daily_halt(now)
+                if self.config.enable_balance_pct_halt else _NotHalted()
+            )
+            news_check = (
+                self.news_filter.check(now)
+                if self.config.enable_news_filter else None
+            )
+            placement_blocked = daily_halt_result.is_halted or bool(
+                news_check is not None and news_check.is_blocked
             )
             # XAUTISM risk gates: daily £ loss + two losses and done.
             # Zone detection keeps running; only new trades are blocked.
@@ -601,7 +696,7 @@ class Bot:
                     f"(drawdown {daily_halt_result.current_drawdown_pct:.2f}%, "
                     f"threshold {daily_halt_result.threshold_pct:.2f}%)"
                 )
-            elif news_check.is_blocked:
+            elif news_check is not None and news_check.is_blocked:
                 logger.debug(
                     f"new setups blocked: news → {news_check.block_reason}"
                 )
@@ -1247,6 +1342,7 @@ class Bot:
                     bid=bid, ask=ask,
                     is_flipped_retrade=is_flipped_retrade,
                 ):
+                    self._traded_zone_ids.add(zid)
                     active_count += 1
                     self.state.placed_setup_count += 1
                     logger.info(
@@ -1512,8 +1608,16 @@ class Bot:
         # across consecutive M5 closes with shifting ``formed_at``.
         # ``zone_id`` is excluded from the overlap scan so the
         # candidate doesn't dedup against itself.
-        if not is_flipped_retrade and self._zone_already_used(
-            zone, candidate_zone_id=zone_id,
+        if not is_flipped_retrade and zone_id in self._traded_zone_ids:
+            logger.info(
+                f"new setup skipped: zone {zone.direction} "
+                f"{zone.bottom:.2f}-{zone.top:.2f} already traded"
+            )
+            return False
+        if (
+            not is_flipped_retrade
+            and self.config.enable_old_zone_dedup
+            and self._zone_already_used(zone, candidate_zone_id=zone_id)
         ):
             logger.info(
                 f"new setup skipped: zone {zone.direction} "
