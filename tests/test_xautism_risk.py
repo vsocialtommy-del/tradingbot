@@ -145,3 +145,71 @@ class TestTracker:
         mt5 = MagicMock()
         assert not DailyRiskTracker(mt5).check(datetime.now(timezone.utc), RiskConfig(enabled=False)).blocked
         mt5.get_deals.assert_not_called()
+
+
+class TestServerClock:
+    """MT5 stamps deals in broker server time (MetaQuotes-Demo is UTC+2).
+    A loss closed 30 min ago in real time carries a timestamp 1.5 h in
+    the "future" as far as UTC is concerned; it must still count."""
+
+    def _mt5(self, now, offset_h, deals):
+        from datetime import timedelta
+        mt5 = MagicMock()
+        mt5.magic = MAGIC
+        mt5.get_open_positions.return_value = []
+        mt5.get_current_price.return_value = {
+            "bid": 1.0, "ask": 1.0, "time": now + timedelta(hours=offset_h, seconds=5),
+        }
+
+        def get_deals(since, until):
+            return [d for d in deals if since.timestamp() <= d["time"] <= until.timestamp()]
+
+        mt5.get_deals.side_effect = get_deals
+        return mt5
+
+    def _two_losses(self, now, offset_h):
+        from datetime import timedelta
+        out = []
+        for pos, mins in ((1, 90), (2, 30)):
+            server_t = (now - timedelta(minutes=mins) + timedelta(hours=offset_h)).timestamp()
+            out.append(deal(pos, DEAL_ENTRY_IN, t=server_t - 600))
+            out.append(deal(pos, DEAL_ENTRY_OUT, profit=-100.0, t=server_t, magic=0))
+        return out
+
+    def test_recent_losses_counted_with_utc_plus_2_server(self) -> None:
+        now = datetime(2026, 11, 4, 19, 30, tzinfo=timezone.utc)
+        mt5 = self._mt5(now, 2, self._two_losses(now, 2))
+        v = DailyRiskTracker(mt5).check(now, RiskConfig())
+        assert v.daily.losing_trades == 2
+        assert v.blocked
+
+    def test_utc_server_still_works(self) -> None:
+        now = datetime(2026, 11, 4, 19, 30, tzinfo=timezone.utc)
+        mt5 = self._mt5(now, 0, self._two_losses(now, 0))
+        v = DailyRiskTracker(mt5).check(now, RiskConfig())
+        assert v.daily.losing_trades == 2
+
+    def test_day_boundary_in_server_time(self) -> None:
+        # Loss closed at 16:30 New York (before the 17:00 reset) belongs
+        # to yesterday even though its server timestamp reads 23:30.
+        from datetime import timedelta
+        now = datetime(2026, 11, 4, 23, 0, tzinfo=timezone.utc)   # 18:00 NY
+        start = trading_day_start(now)
+        before_reset = (start - timedelta(minutes=30) + timedelta(hours=2)).timestamp()
+        deals = [deal(1, DEAL_ENTRY_IN, t=before_reset - 600),
+                 deal(1, DEAL_ENTRY_OUT, profit=-100.0, t=before_reset, magic=0)]
+        mt5 = self._mt5(now, 2, deals)
+        v = DailyRiskTracker(mt5).check(now, RiskConfig())
+        assert v.daily.losing_trades == 0
+
+    def test_stale_tick_keeps_last_offset(self) -> None:
+        from datetime import timedelta
+        now = datetime(2026, 11, 4, 19, 30, tzinfo=timezone.utc)
+        mt5 = self._mt5(now, 2, [])
+        t = DailyRiskTracker(mt5, cache_seconds=0)
+        t.check(now, RiskConfig())
+        assert t._offset == timedelta(hours=2)
+        # Weekend: last tick is days old -> ignore, keep +2h.
+        mt5.get_current_price.return_value = {"bid": 1, "ask": 1, "time": now - timedelta(days=2)}
+        t.check(now, RiskConfig())
+        assert t._offset == timedelta(hours=2)

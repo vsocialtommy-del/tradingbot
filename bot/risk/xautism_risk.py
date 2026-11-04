@@ -210,6 +210,9 @@ class DailyRiskTracker:
         self._lookback = timedelta(days=lookback_days)
         self._cached: tuple[float, RiskVerdict] | None = None
         self._known: dict[int, str] = {}
+        self._offset = timedelta(0)
+        """Broker server clock minus real UTC. MT5 stamps deals in server
+        time (MetaQuotes-Demo / Vantage run 2-3 h ahead of UTC)."""
 
     def register(self, ticket: int | None, setup_id: Any) -> None:
         """Remember which setup a broker ticket belongs to, so layer 1
@@ -227,21 +230,45 @@ class DailyRiskTracker:
         if self._cached is not None and mono - self._cached[0] < self._cache_seconds:
             return self._cached[1]
         start = trading_day_start(now)
+        self._update_offset(now)
         try:
-            deals = self._mt5.get_deals(start - self._lookback, now + timedelta(minutes=1))
+            # Deal times are server time, so "up to now" in UTC would miss
+            # the last few hours of trades. Ask up to a day ahead instead
+            # (there are no future deals, so nothing extra comes back).
+            deals = self._mt5.get_deals(
+                start - self._lookback + self._offset, now + timedelta(days=1),
+            )
             positions = self._mt5.get_open_positions(symbol=self._symbol)
             magic = self._mt5.magic
         except Exception:
             logger.exception("risk: MT5 history read failed; blocking new trades this tick")
             return RiskVerdict(True, "MT5 history unavailable")
         daily = summarise_day(
-            deals, positions, magic=magic, day_start=start,
+            deals, positions, magic=magic, day_start=start + self._offset,
             trading_day=str(current_trading_date(now)),
             known=self._known,
         )
         verdict = check_risk(daily, config)
         self._cached = (mono, verdict)
         return verdict
+
+
+    def _update_offset(self, now: datetime) -> None:
+        """Server clock offset from the latest tick, to the nearest hour.
+
+        Keeps the last good value if the tick is unreadable or looks
+        stale / nonsense (weekend, terminal starting up)."""
+        try:
+            tick_time = self._mt5.get_current_price(self._symbol)["time"]
+            diff = float((tick_time - now).total_seconds())
+            hours = int(round(diff / 3600))
+        except Exception:
+            return
+        if -12 <= hours <= 14 and abs(diff - hours * 3600) <= 20 * 60:
+            new = timedelta(hours=hours)
+            if new != self._offset:
+                logger.info(f"risk: broker server clock is UTC{hours:+d}h")
+            self._offset = new
 
 
 def _floor(value: float, step: float) -> float:
