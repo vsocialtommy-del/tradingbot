@@ -63,6 +63,15 @@ class XBacktestConfig:
     LIMIT_DEPTH = a limit inside the zone at ``layer2_depth`` of its
     height (fills as soon as price, even a wick, gets there)."""
     layer2_depth: float = 0.20
+    zone_timeframes: tuple[str, ...] = ("M5",)
+    """Which zone timeframes are traded: ("M5",), ("M15",) or ("M5", "M15").
+    Still one trade at a time across all of them."""
+    m15_window_bars: int = 1600
+    """M15 bars scanned for M15 zones (1600 ≈ 17 trading days, same span
+    as 5000 M5 bars)."""
+    m15_direction_gate: DirectionGateConfig = field(
+        default_factory=lambda: DirectionGateConfig(trend_timeframe="30min"))
+    """M15 zones take their direction from M30 (H1 fresh-zone exception)."""
     trade_m1_zones: bool = False
     """Also trade M1 zones as their own setups (same rules as M5 zones;
     M15 direction gate, 30 % SL, TP at the BOS, M5 close exit). Needs
@@ -178,8 +187,22 @@ class XautismBacktest:
         self.open: Trade | None = None
         self._m1_cache: tuple[pd.Timestamp, list] | None = None
         self._vertex: list | None = None
-        if self.cfg.pipeline.pattern_detector == "vertex":
+        if self.cfg.pipeline.pattern_detector == "vertex" and "M5" in self.cfg.zone_timeframes:
             self._vertex = _precompute_vertex(m5, self.cfg.pipeline)
+        self.m15: pd.DataFrame | None = None
+        self._vertex15: list | None = None
+        self._m15_j = -1
+        self._m15_zones: list = []
+        self._closed15: pd.DataFrame | None = None
+        if "M15" in self.cfg.zone_timeframes:
+            agg = {"open": "first", "high": "max", "low": "min", "close": "last",
+                   "volume": "sum", "spread": "mean"}
+            m15 = m5.resample("15min", label="left", closed="left").agg(agg).dropna(subset=["open"])
+            counts = m5["close"].resample("15min", label="left", closed="left").count()
+            self.m15 = m15[counts.reindex(m15.index).fillna(0) >= 3]
+            self._m15_avail = (self.m15.index + pd.Timedelta(minutes=15)).asi8
+            if self.cfg.pipeline.pattern_detector == "vertex":
+                self._vertex15 = _precompute_vertex(self.m15, self.cfg.pipeline)
 
     # ------------------------------------------------------------------ #
 
@@ -223,7 +246,9 @@ class XautismBacktest:
         closed = m5.iloc[max(0, i - self.cfg.window_bars):i]   # bars closed before this one
 
         m5_zones: list[ValidatedZone] = []
-        if self.open is None and not self._blocked(t):
+        m15_zones = self._m15_candidates(t)
+        closed15 = self._closed15
+        if "M5" in self.cfg.zone_timeframes and self.open is None and not self._blocked(t):
             pats = None
             if self._vertex is not None:
                 off = max(0, i - self.cfg.window_bars)
@@ -245,6 +270,7 @@ class XautismBacktest:
 
         if minutes is None:
             cands = [(z, "M5", closed) for z in _touched(m5_zones, bar, spread)]
+            cands += [(z, "M15", closed15) for z in _touched(m15_zones, bar, spread)]
             if self.open is not None or cands:
                 self._walk(self._path(i), cands, closed, spread, t)
         else:
@@ -260,6 +286,7 @@ class XautismBacktest:
                         self._cur_m1_zones = [z for z in zs if z.is_strong_point and z.refined_zone.is_tradeable]
                         m1_zones = [z for z in self._cur_m1_zones if _key(z) not in self.traded_keys]
                 cands = [(z, "M5", closed) for z in _touched(m5_zones, row, m_spread)]
+                cands += [(z, "M15", closed15) for z in _touched(m15_zones, row, m_spread)]
                 cands += [(z, "M1", m1_closed) for z in _touched(m1_zones, row, m_spread)]
                 if self.open is None and not cands:
                     continue
@@ -268,13 +295,42 @@ class XautismBacktest:
                 self._candle_close("M1", float(row["close"]))
         self._candle_close("M5", float(bar["close"]))
 
-        # M5 close exit on this bar's close.
+        # Candle close exit on the zone's own timeframe: M5 zones on every
+        # M5 close, M15 zones only when an M15 candle closes.
         tr = self.open
-        if tr is not None and self.cfg.xautism.m5_close_exit:
+        m15_close_now = (t.minute + 5) % 15 == 0
+        if tr is not None and self.cfg.xautism.m5_close_exit and (tr.tf != "M15" or m15_close_now):
             c = float(bar["close"])
             beyond = c < tr.far_edge if tr.direction == "BUY" else c > tr.far_edge
             if beyond:
-                self._close_all(c, spread, t, "M5_CLOSE_EXIT")
+                self._close_all(c, spread, t, "M15_CLOSE_EXIT" if tr.tf == "M15" else "M5_CLOSE_EXIT")
+
+    def _m15_candidates(self, t: pd.Timestamp) -> list:
+        if self.m15 is None:
+            return []
+        j = int(np.searchsorted(self._m15_avail, t.value, side="right"))
+        if j != self._m15_j:
+            self._m15_j = j
+            W = self.cfg.m15_window_bars
+            off = max(0, j - W)
+            closed15 = self.m15.iloc[off:j]
+            self._closed15 = closed15
+            self._m15_zones = []
+            if j >= 300:
+                pats = None
+                if self._vertex15 is not None:
+                    pats = [
+                        _shift(p, off) for p, dead in self._vertex15
+                        if p.impulse_after.end_index < j and p.base.start_index >= off
+                        and p.impulse_before.start_index >= off and dead > j
+                        and (p.foot_index is None or p.foot_index >= off)
+                        and (getattr(p, "tp_foot_index", None) is None or p.tp_foot_index >= off)
+                    ]
+                zs = run_strategy_pipeline(closed15, self.cfg.pipeline, patterns=pats)
+                self._m15_zones = [z for z in zs if z.is_strong_point and z.refined_zone.is_tradeable]
+        if self.open is not None or self._blocked(t):
+            return []
+        return [z for z in self._m15_zones if _key(z) not in self.traded_keys]
 
     def _candle_close(self, tf: str, close: float) -> None:
         tr = self.open
@@ -343,7 +399,8 @@ class XautismBacktest:
         if cfg.direction_gate.enabled:
             dec = check_direction(direction=z.direction, zone_bottom=float(z.bottom),
                                   zone_top=float(z.top), df_m5=m5_closed,
-                                  config=cfg.direction_gate, pipeline_cfg=cfg.pipeline)
+                                  config=cfg.m15_direction_gate if tf == "M15" else cfg.direction_gate,
+                                  pipeline_cfg=cfg.pipeline)
             if not dec.allowed:
                 self._skip(f"{tf}:direction_gate"); return False
             trend = dec.reason
