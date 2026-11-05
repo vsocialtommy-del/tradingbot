@@ -149,6 +149,13 @@ from bot.strategy.zone_lifecycle import (
 )
 
 
+MAX_SANE_SPREAD: float = 10.0
+"""A gold spread wider than this (points) is a broken tick, not a market."""
+MAX_TICK_JUMP_PCT: float = 0.015
+"""A tick more than 1.5 % (~60 points) from the last M5 close is broken..."""
+TICK_JUMP_ACCEPT_SECONDS: float = 300.0
+"""...unless it holds that far away for 5 minutes (a real gap)."""
+
 TRADED_SETUP_STATUSES: frozenset[str] = frozenset(
     {"PENDING", "ACTIVE", "TP1_HIT", "CLOSED", "STOPPED_OUT"}
 )
@@ -409,6 +416,11 @@ class Bot:
         # backtest's ``traded_keys``: a zone is traded once, ever.
         # Hydrated from Supabase on startup.
         self._traded_zone_ids: set[UUID] = set()
+        # Zones whose order MT5 refused this M5 bar: not retried until
+        # the next M5 close (like the backtest's per-bar ``failed`` set).
+        self._failed_zone_ids: set[UUID] = set()
+        self._last_bad_tick_log: datetime | None = None
+        self._jump_since: datetime | None = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -491,6 +503,36 @@ class Bot:
             f"bot startup: hydrated zone cache from DB "
             f"({len(self._persisted_zone_keys)} existing zones)"
         )
+
+    def _bad_tick_reason(
+        self, bid: float, ask: float, now: datetime | None = None,
+    ) -> str | None:
+        """Why a tick can't be trusted, or None if it looks fine.
+
+        A price far from the last M5 close is ignored until it has held
+        for ``TICK_JUMP_ACCEPT_SECONDS`` (a real gap, e.g. after the
+        weekend, keeps the price there; a broken tick doesn't)."""
+        if not (bid > 0 and ask > 0):
+            return "zero / negative price"
+        if ask < bid:
+            return "ask below bid"
+        if ask - bid > MAX_SANE_SPREAD:
+            return f"spread {ask - bid:.2f} > {MAX_SANE_SPREAD}"
+        df = getattr(self, "_latest_ohlc", None)
+        if df is not None and len(df):
+            last = float(df["close"].iloc[-1])
+            if last > 0 and abs(bid - last) / last > MAX_TICK_JUMP_PCT:
+                now = now or datetime.now(timezone.utc)
+                if self._jump_since is None:
+                    self._jump_since = now
+                if _elapsed(self._jump_since, now) < TICK_JUMP_ACCEPT_SECONDS:
+                    return (
+                        f"{abs(bid - last):.2f} away from the last M5 close "
+                        f"{last:.2f}"
+                    )
+                return None  # held long enough: a real gap
+        self._jump_since = None
+        return None
 
     def _hydrate_traded_zone_ids(self) -> None:
         """Every zone that already had a setup placed on it."""
@@ -598,6 +640,20 @@ class Bot:
             ask = float(tick["ask"])
         except Exception:
             logger.exception("main loop: get_current_price failed")
+            return
+
+        # 2a. Ignore broken ticks (5 Nov 2026: at the 23:00 reopen MT5
+        # gave a price that put the bot "inside" buy zones 100+ points
+        # below the market; every order was rejected). Nothing that
+        # reacts to price runs on a tick like that.
+        bad = self._bad_tick_reason(bid, ask, now)
+        if bad is not None:
+            if (
+                self._last_bad_tick_log is None
+                or _elapsed(self._last_bad_tick_log, now) >= 60.0
+            ):
+                logger.warning(f"ignoring bad tick bid={bid} ask={ask}: {bad}")
+                self._last_bad_tick_log = now
             return
 
         # 3. Per-tick: entry triggers + per-layer TP checks.
@@ -897,6 +953,7 @@ class Bot:
         df: pd.DataFrame | None = getattr(self, "_latest_ohlc", None)
         if df is None:
             return
+        self._failed_zone_ids.clear()
 
         # Lifecycle pass first: consumption / violation / flip on the
         # just-closed M5 bar, BEFORE detecting new Strong Points. This
@@ -1326,6 +1383,9 @@ class Bot:
             # Iterate over a copy so we can mutate the underlying list.
             remaining: list[tuple[ValidatedZone, UUID]] = []
             for zone, zid in queue:
+                if zid in self._failed_zone_ids:
+                    remaining.append((zone, zid))
+                    continue
                 exp = check_exposure(
                     active_count=active_count,
                     max_simultaneous=self.config.max_simultaneous_setups,
@@ -1957,6 +2017,7 @@ class Bot:
             )
         except Exception:
             logger.exception("new setup: place_xautism_orders raised")
+            self._failed_zone_ids.add(zone_id)
             return False
         if result.status == "PLACED":
             self.position_tracker.invalidate_active_setups_cache()
@@ -1975,9 +2036,11 @@ class Bot:
                 f"sl={result.sl_price} tp1={result.tp1_price}"
             )
             return True
+        self._failed_zone_ids.add(zone_id)
         logger.warning(
             f"new setup not placed: status={result.status} "
-            f"errors={result.error_messages}"
+            f"errors={result.error_messages}; zone not retried until the "
+            f"next M5 close"
         )
         return False
 

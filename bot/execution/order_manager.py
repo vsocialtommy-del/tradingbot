@@ -391,6 +391,10 @@ def place_xautism_orders(
             supabase, "ERROR", "Layer 1 placement failed",
             context={"error": str(e)}, setup_id=setup_id,
         )
+        # Nothing reached the broker: close the setup off so it can't
+        # count against the one-trade limit (5 Nov 2026: 8 rejected
+        # setups stayed PENDING and blocked the bot all night).
+        _skip_setup(tracker, setup_id, f"L1_REJECTED: {e}")
         return _failed_result(sl_price, tp1_price, errors, setup_id=setup_id)
 
     layer_1_filled_price = _resolve_filled_price(mt5, cfg.symbol, layer_1_ticket)
@@ -415,6 +419,7 @@ def place_xautism_orders(
                 },
                 setup_id=setup_id,
             )
+            _skip_setup(tracker, setup_id, "GAP_THROUGH")
             return OrderPlacementResult(
                 setup_id=setup_id,
                 layer_1_ticket=layer_1_ticket,
@@ -686,6 +691,15 @@ def _try_log_event(
         )
     except Exception:
         logger.exception("order_manager: log_event failed (non-fatal)")
+
+
+def _skip_setup(tracker: PositionTracker, setup_id: UUID, reason: str) -> None:
+    """Best-effort PENDING -> SKIPPED for a setup whose layer 1 never
+    stayed open. Never raises."""
+    try:
+        tracker.update_setup_status(setup_id, "SKIPPED", skip_reason=reason[:200])
+    except Exception:
+        logger.exception(f"order_manager: could not mark setup {setup_id} SKIPPED")
 
 
 def _failed_result(

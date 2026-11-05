@@ -125,6 +125,43 @@ class TestPlaceXautismOrders:
         assert r.status == "PLACED" and r.layer_2_trade_id is None
         assert supa.log_trade.call_count == 1
 
+    def test_rejected_layer1_skips_setup(self, mt5, supa, tracker) -> None:
+        # 5 Nov 2026: MT5 rejected 8 orders ("Invalid stops"); each setup
+        # stayed PENDING and blocked the one-trade limit all night.
+        mt5.place_market_order.side_effect = RuntimeError(
+            "order_send rejected: retcode=10016 comment='Invalid stops'")
+        zone = make_zone_for_test(direction="BUY", top=1900.0, bottom=1895.0)
+        r = place_xautism_orders(zone, uuid4(), total_lots=0.05,
+                                 sl_price=1893.5, tp1_price=1910.0,
+                                 mt5=mt5, supabase=supa, tracker=tracker)
+        assert r.status == "FAILED"
+        args, kwargs = tracker.update_setup_status.call_args
+        assert args == (r.setup_id, "SKIPPED")
+        assert kwargs["skip_reason"].startswith("L1_REJECTED")
+        supa.log_trade.assert_not_called()
+
+    def test_gap_through_skips_setup(self, mt5, supa, tracker) -> None:
+        # Filled well below a buy zone's bottom -> closed straight away.
+        mt5.get_open_positions.return_value = [{"ticket": 111, "price_open": 1890.0}]
+        zone = make_zone_for_test(direction="BUY", top=1900.0, bottom=1895.0)
+        r = place_xautism_orders(zone, uuid4(), total_lots=0.05,
+                                 sl_price=1893.5, tp1_price=1910.0,
+                                 mt5=mt5, supabase=supa, tracker=tracker)
+        assert r.status == "SKIPPED"
+        mt5.close_position.assert_called_once_with(111)
+        args, kwargs = tracker.update_setup_status.call_args
+        assert args == (r.setup_id, "SKIPPED")
+        assert kwargs["skip_reason"] == "GAP_THROUGH"
+
+    def test_skip_failure_never_raises(self, mt5, supa, tracker) -> None:
+        mt5.place_market_order.side_effect = RuntimeError("rejected")
+        tracker.update_setup_status.side_effect = RuntimeError("supabase down")
+        zone = make_zone_for_test(direction="BUY", top=1900.0, bottom=1895.0)
+        r = place_xautism_orders(zone, uuid4(), total_lots=0.05,
+                                 sl_price=1893.5, tp1_price=1910.0,
+                                 mt5=mt5, supabase=supa, tracker=tracker)
+        assert r.status == "FAILED"
+
     def test_floor_lots_float_noise(self) -> None:
         assert _floor_lots(0.03 - 0.01, 0.01) == 0.02
         assert _floor_lots(0.0, 0.01) == 0.0

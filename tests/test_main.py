@@ -3898,3 +3898,92 @@ class TestStartupLeftovers:
         assert b._traded_zone_ids == {s.zone_id}
         statuses = mock_supabase.get_setups_by_status.call_args.args[0]
         assert "SKIPPED" not in statuses
+
+
+# --------------------------------------------------------------------------- #
+# 5 Nov 2026: bad tick at the 23:00 reopen + rejected orders blocking the bot.
+# --------------------------------------------------------------------------- #
+
+
+class TestBadTicks:
+    def _with_last_close(self, b: Bot, close: float) -> None:
+        b._latest_ohlc = pd.DataFrame(  # type: ignore[attr-defined]
+            {"open": [close], "high": [close], "low": [close], "close": [close]},
+            index=pd.DatetimeIndex([NOW]),
+        )
+
+    def test_sane_tick(self, bot: tuple[Bot, dict[str, MagicMock]]) -> None:
+        b, _ = bot
+        self._with_last_close(b, 4060.0)
+        assert b._bad_tick_reason(4059.9, 4060.1) is None
+
+    @pytest.mark.parametrize("bid,ask", [
+        (0.0, 0.0), (0.0, 4060.1), (4060.1, 4059.9), (4050.0, 4070.0),
+        (3942.0, 3942.2),   # 118 points off the last close
+    ])
+    def test_broken_ticks(self, bot, bid, ask) -> None:
+        b, _ = bot
+        self._with_last_close(b, 4060.0)
+        assert b._bad_tick_reason(bid, ask) is not None
+
+    def test_real_gap_accepted_after_five_minutes(self, bot) -> None:
+        b, _ = bot
+        self._with_last_close(b, 4060.0)
+        assert b._bad_tick_reason(3990.0, 3990.2, NOW) is not None
+        assert b._bad_tick_reason(3990.0, 3990.2, NOW + timedelta(minutes=4)) is not None
+        assert b._bad_tick_reason(3990.0, 3990.2, NOW + timedelta(minutes=5)) is None
+
+    def test_one_off_jump_resets(self, bot) -> None:
+        b, _ = bot
+        self._with_last_close(b, 4060.0)
+        assert b._bad_tick_reason(3942.0, 3942.2, NOW) is not None
+        assert b._bad_tick_reason(4060.0, 4060.2, NOW + timedelta(seconds=2)) is None
+        # A new bad tick later starts its own 5-minute clock.
+        assert b._bad_tick_reason(3942.0, 3942.2, NOW + timedelta(minutes=6)) is not None
+
+    def test_bad_tick_skips_everything_that_reacts_to_price(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, mgrs = bot
+        _xautism(b)
+        b.state.last_config_refresh = NOW
+        mock_mt5.get_current_price.return_value = {
+            "bid": 0.0, "ask": 0.0, "time": NOW, "time_msc": 0,
+        }
+        l2 = mocker.patch.object(b.layer2_stop_manager, "check_live", return_value=[])
+        pending = mocker.patch.object(b, "_try_place_pending")
+        b.run_iteration(NOW)
+        mgrs["entry_trigger"].check_live.assert_not_called()
+        l2.assert_not_called()
+        pending.assert_not_called()
+
+
+class TestRejectedZoneCooldown:
+    def test_rejected_zone_not_retried_until_next_m5_close(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        _xautism(b)
+        zone = _make_validated_for_persistence(_PT.RBR)
+        zid = uuid4()
+        b._pending_pipeline_zones = [(zone, zid)]
+        b._latest_ohlc = pd.DataFrame(  # type: ignore[attr-defined]
+            {"open": [1900.0], "high": [1900.0], "low": [1900.0], "close": [1900.0]},
+            index=pd.DatetimeIndex([NOW]),
+        )
+
+        def fail(*a, **k):
+            b._failed_zone_ids.add(zid)
+            return False
+
+        tries = mocker.patch.object(b, "_try_place_setup", side_effect=fail)
+        b._try_place_pending(bid=1900.4, ask=1900.5)
+        b._try_place_pending(bid=1900.4, ask=1900.5)
+        assert tries.call_count == 1
+        assert b._pending_pipeline_zones == [(zone, zid)]   # still queued
+
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        b._detect_new_zones(NOW)                             # next M5 close
+        assert b._failed_zone_ids == set()
