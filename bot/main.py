@@ -416,9 +416,6 @@ class Bot:
         # backtest's ``traded_keys``: a zone is traded once, ever.
         # Hydrated from Supabase on startup.
         self._traded_zone_ids: set[UUID] = set()
-        # Zones whose order MT5 refused this M5 bar: not retried until
-        # the next M5 close (like the backtest's per-bar ``failed`` set).
-        self._failed_zone_ids: set[UUID] = set()
         self._last_bad_tick_log: datetime | None = None
         self._jump_since: datetime | None = None
 
@@ -953,7 +950,6 @@ class Bot:
         df: pd.DataFrame | None = getattr(self, "_latest_ohlc", None)
         if df is None:
             return
-        self._failed_zone_ids.clear()
 
         # Lifecycle pass first: consumption / violation / flip on the
         # just-closed M5 bar, BEFORE detecting new Strong Points. This
@@ -1383,9 +1379,6 @@ class Bot:
             # Iterate over a copy so we can mutate the underlying list.
             remaining: list[tuple[ValidatedZone, UUID]] = []
             for zone, zid in queue:
-                if zid in self._failed_zone_ids:
-                    remaining.append((zone, zid))
-                    continue
                 exp = check_exposure(
                     active_count=active_count,
                     max_simultaneous=self.config.max_simultaneous_setups,
@@ -2017,7 +2010,6 @@ class Bot:
             )
         except Exception:
             logger.exception("new setup: place_xautism_orders raised")
-            self._failed_zone_ids.add(zone_id)
             return False
         if result.status == "PLACED":
             self.position_tracker.invalidate_active_setups_cache()
@@ -2036,11 +2028,9 @@ class Bot:
                 f"sl={result.sl_price} tp1={result.tp1_price}"
             )
             return True
-        self._failed_zone_ids.add(zone_id)
         logger.warning(
             f"new setup not placed: status={result.status} "
-            f"errors={result.error_messages}; zone not retried until the "
-            f"next M5 close"
+            f"errors={result.error_messages}"
         )
         return False
 

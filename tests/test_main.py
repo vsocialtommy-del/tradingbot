@@ -3957,33 +3957,3 @@ class TestBadTicks:
         mgrs["entry_trigger"].check_live.assert_not_called()
         l2.assert_not_called()
         pending.assert_not_called()
-
-
-class TestRejectedZoneCooldown:
-    def test_rejected_zone_not_retried_until_next_m5_close(
-        self, bot: tuple[Bot, dict[str, MagicMock]],
-        mocker: MockerFixture,
-    ) -> None:
-        b, _ = bot
-        _xautism(b)
-        zone = _make_validated_for_persistence(_PT.RBR)
-        zid = uuid4()
-        b._pending_pipeline_zones = [(zone, zid)]
-        b._latest_ohlc = pd.DataFrame(  # type: ignore[attr-defined]
-            {"open": [1900.0], "high": [1900.0], "low": [1900.0], "close": [1900.0]},
-            index=pd.DatetimeIndex([NOW]),
-        )
-
-        def fail(*a, **k):
-            b._failed_zone_ids.add(zid)
-            return False
-
-        tries = mocker.patch.object(b, "_try_place_setup", side_effect=fail)
-        b._try_place_pending(bid=1900.4, ask=1900.5)
-        b._try_place_pending(bid=1900.4, ask=1900.5)
-        assert tries.call_count == 1
-        assert b._pending_pipeline_zones == [(zone, zid)]   # still queued
-
-        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
-        b._detect_new_zones(NOW)                             # next M5 close
-        assert b._failed_zone_ids == set()
