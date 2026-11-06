@@ -11,8 +11,9 @@
 | Entry | 0.01 at the zone edge on first touch. Layer 2 (the rest) is a broker stop at the same edge, placed once price is 0.10 inside the zone, filling on the way back out. Same SL and TP on both. Layer 2 is cancelled if TP or SL hits first. |
 | SL | 30 % of the zone past the far edge (below for buys, above for sells), pushed beyond a swing just past it. Extra exit: an M5 candle closing beyond the far edge closes everything. |
 | Risk | £100 per trade (both layers together), -£300 a day, stop after 2 losing trades, one trade at a time, no entry above a 0.50 spread. |
+| News | USD red folder events (Forex Factory calendar, downloaded by the bot every hour): no new trades from 15 min before to 15 min after; any open trade is closed and a pending layer 2 cancelled 15 min before. Zones keep being found. Not in the backtest. |
 | Never twice | A zone is traded once. Nothing else blocks a fresh zone (same as the backtest). |
-| Off (code kept) | Stacked two-zone layering, flip trading, bot-managed TPs / break even / trailing / zone exit, the classic detector, the old overlap dedup, the news blackout, the old % daily halt. |
+| Off (code kept) | Stacked two-zone layering, flip trading, bot-managed TPs / break even / trailing / zone exit, the classic detector, the old overlap dedup, the old Supabase/Vercel news table, the old % daily halt. |
 
 Backtest, 8 Jul - 21 Oct 2026 (M5, M1 from Sep, £100 risk): 229 trades,
 62.4 % win rate, +£1,788, profit factor 1.39, max drawdown -£365.

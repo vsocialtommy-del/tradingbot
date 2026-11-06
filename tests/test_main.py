@@ -527,18 +527,22 @@ class TestPauseGating:
 
 
 class TestNewsBlock:
-    def test_news_blocked_skips_strategy_pipeline(
+    def test_news_blocked_keeps_finding_zones_but_blocks_placement(
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mocker: MockerFixture,
     ) -> None:
+        # Nov 2026: zones keep being detected during a blackout; only
+        # new trades are blocked.
         b, mgrs = bot
         b.state.last_config_refresh = NOW
         mgrs["news_filter"].check.return_value = NewsCheckResult(
             is_blocked=True, block_reason="HIGH USD NFP at 13:30Z",
         )
-        run_pipeline = mocker.patch("bot.main.run_strategy_pipeline")
+        run_pipeline = mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        pending = mocker.patch.object(b, "_try_place_pending")
         b.run_iteration(NOW)
-        run_pipeline.assert_not_called()
+        run_pipeline.assert_called_once()
+        pending.assert_not_called()
 
     def test_news_blocked_does_not_skip_existing_setup_management(
         self, bot: tuple[Bot, dict[str, MagicMock]],
@@ -3731,7 +3735,9 @@ class TestLiveMatchesBacktest:
     def test_old_checks_off_by_default(self) -> None:
         d = BotLoopConfig()
         assert d.enable_old_zone_dedup is False
-        assert d.enable_news_filter is False
+        assert d.enable_news_filter is True     # red folder USD (Forex Factory)
+        assert d.enable_news_close is True
+        assert d.news_source == "forexfactory"
         assert d.enable_balance_pct_halt is False
 
     def _at_zone(self, b: Bot, mock_mt5: MagicMock) -> None:
@@ -3797,7 +3803,7 @@ class TestLiveMatchesBacktest:
         b.run_iteration(NOW)
         assert len(b._traded_zone_ids) == 1
 
-    def test_news_not_checked(
+    def test_news_blackout_blocks_new_trades_not_zones(
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mocker: MockerFixture,
     ) -> None:
@@ -3808,9 +3814,69 @@ class TestLiveMatchesBacktest:
             is_blocked=True, block_reason="HIGH USD NFP",
         )
         run_pipeline = mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        pending = mocker.patch.object(b, "_try_place_pending")
         b.run_iteration(NOW)
-        mgrs["news_filter"].check.assert_not_called()
+        mgrs["news_filter"].check.assert_called_once()
         run_pipeline.assert_called_once()
+        pending.assert_not_called()
+
+    def test_no_news_trades_normally(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        b, mgrs = bot
+        _xautism(b)
+        b.state.last_config_refresh = NOW
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        pending = mocker.patch.object(b, "_try_place_pending")
+        b.run_iteration(NOW)
+        pending.assert_called_once()
+
+    def test_news_closes_open_trades_and_cancels_layer2(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        b, mgrs = bot
+        _xautism(b)
+        b.state.last_config_refresh = NOW
+        mgrs["news_filter"].check.return_value = NewsCheckResult(
+            is_blocked=True, block_reason="HIGH USD NFP",
+        )
+        s = make_setup(status="ACTIVE")
+        mgrs["position_tracker"].get_active_setups.return_value = [s]
+        filled = _make_trade_for_death_pass(setup_id=s.id, layer_number=1,
+                                            status="FILLED", mt5_ticket=111)
+        waiting = _make_trade_for_death_pass(setup_id=s.id, layer_number=2,
+                                             status="WAITING", mt5_ticket=222)
+        mgrs["position_tracker"].get_trades_for_setup.return_value = [filled, waiting]
+        cancel = mocker.patch("bot.main.cancel_layer2_at_broker")
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        b.run_iteration(NOW)
+        mock_mt5.close_position.assert_called_once_with(111)
+        cancel.assert_called_once()
+        calls = mgrs["position_tracker"].update_trade_status.call_args_list
+        assert any(c.args[:2] == (filled.id, "CLOSED") and c.kwargs["close_reason"] == "NEWS_CLOSE" for c in calls)
+        assert any(c.args[:2] == (waiting.id, "CANCELLED") and c.kwargs["close_reason"] == "NEWS_CLOSE" for c in calls)
+        # Next tick of the same blackout: not closed twice.
+        mock_mt5.close_position.reset_mock()
+        b.run_iteration(NOW + timedelta(seconds=1))
+        mock_mt5.close_position.assert_not_called()
+
+    def test_news_close_off_leaves_trades(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mock_mt5: MagicMock, mocker: MockerFixture,
+    ) -> None:
+        from dataclasses import replace
+        b, mgrs = bot
+        _xautism(b)
+        b.config = replace(b.config, enable_news_close=False)
+        b.state.last_config_refresh = NOW
+        mgrs["news_filter"].check.return_value = NewsCheckResult(is_blocked=True)
+        s = make_setup(status="ACTIVE")
+        mgrs["position_tracker"].get_active_setups.return_value = [s]
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        b.run_iteration(NOW)
+        mock_mt5.close_position.assert_not_called()
 
     def test_old_balance_pct_halt_not_applied(
         self, bot: tuple[Bot, dict[str, MagicMock]],

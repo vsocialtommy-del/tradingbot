@@ -132,9 +132,14 @@ class NewsFilter:
         self,
         supabase: SupabaseLogger,
         config: NewsFilterConfig | None = None,
+        *,
+        warn_when_empty: bool = True,
     ) -> None:
+        # ``supabase`` is any object with ``get_news_events_in_window``:
+        # the Supabase table (old Vercel cron) or the Forex Factory feed.
         self._supabase = supabase
         self._config = config or NewsFilterConfig()
+        self._warn_when_empty = warn_when_empty
         self._cache: list[NewsEvent] | None = None
         self._cache_fetched_at: datetime | None = None
 
@@ -240,7 +245,7 @@ class NewsFilter:
             )
             return None, False
 
-        if not events:
+        if not events and self._warn_when_empty:
             # Empty result is a valid (but suspicious) state — log once
             # per cache refresh, not every tick.
             logger.warning(
