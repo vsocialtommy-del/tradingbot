@@ -87,7 +87,7 @@ from bot.execution.order_manager import (
     place_layered_orders,
     place_xautism_orders,
 )
-from bot.execution.position_tracker import PositionTracker
+from bot.execution.position_tracker import OPEN_TRADE_STATUSES, PositionTracker
 from bot.exits.sl_manager import SLManager, SLManagerConfig
 from bot.exits.tp_manager import TPManager
 from bot.execution.layer2_stop import (
@@ -99,6 +99,7 @@ from bot.exits.m5_close_exit import run_m5_close_exit
 from bot.exits.trailing_stop_manager import TrailingStopManager
 from bot.exits.zone_exit_manager import ZoneExitManager
 from bot.signals.next_signal_writer import NextSignalWriter
+from bot.filters.forex_factory import ForexFactoryCalendar
 from bot.filters.news_filter import NewsFilter, NewsFilterConfig
 from bot.logging.supabase_logger import (
     Setup,
@@ -280,9 +281,15 @@ class BotLoopConfig:
     overlapped another saved zone. On startup it blocked nearly every
     fresh vertex zone. Replaced by the backtest's rule: never trade the
     same zone twice (``Bot._traded_zone_ids``)."""
-    enable_news_filter: bool = False
-    """High-impact USD news blackout. Not in the backtest (no historical
-    news data)."""
+    enable_news_filter: bool = True
+    """Red folder USD news (Forex Factory): no new trades from 15 min
+    before to 15 min after. Not in the backtest (no historical news)."""
+    enable_news_close: bool = True
+    """Close every open trade (and cancel a pending layer 2) when a
+    news blackout starts, i.e. 15 min before the release."""
+    news_source: Literal["forexfactory", "supabase"] = "forexfactory"
+    """Where news comes from: the bot downloads Forex Factory's weekly
+    calendar itself, or the old Supabase ``news_events`` table."""
     enable_balance_pct_halt: bool = False
     """Old % of balance daily halt. XAUTISM uses the -£300 / 2 losses
     rule in ``risk`` instead."""
@@ -337,7 +344,10 @@ class Bot:
         # Per-manager configs — startup-time snapshot from bot_config.
         self.order_manager_config = order_manager_config or OrderManagerConfig()
         self.sl_manager_config = sl_manager_config or SLManagerConfig()
-        self.news_filter_config = news_filter_config or NewsFilterConfig()
+        self.news_filter_config = news_filter_config or NewsFilterConfig(
+            blackout_before_minutes=15, blackout_after_minutes=15,
+            impact_threshold="HIGH", currencies=("USD",),
+        )
         self.strategy_pipeline_config = (
             strategy_pipeline_config or StrategyPipelineConfig()
         )
@@ -377,9 +387,18 @@ class Bot:
             self.config.xautism_entries, symbol=self.config.symbol,
         )
         self.daily_risk = DailyRiskTracker(mt5, symbol=self.config.symbol)
-        self.news_filter = NewsFilter(
-            supabase, config=self.news_filter_config,
-        )
+        if self.config.news_source == "forexfactory":
+            self.news_source = ForexFactoryCalendar()
+            self.news_filter = NewsFilter(
+                self.news_source, config=self.news_filter_config,  # type: ignore[arg-type]
+                warn_when_empty=False,
+            )
+        else:
+            self.news_source = None
+            self.news_filter = NewsFilter(
+                supabase, config=self.news_filter_config,
+            )
+        self._news_closed: set[UUID] = set()
 
         self.state = BotState()
         self._stopped = False
@@ -479,6 +498,23 @@ class Bot:
                 "bot startup: traded-zone hydration failed; zones traded "
                 "before this restart could be traded again"
             )
+
+        if self.config.enable_news_filter and self.news_source is not None:
+            try:
+                self.news_source.refresh(force=True)
+                nxt = [
+                    e for e in self.news_source.events
+                    if e.currency == "USD" and e.impact_level == "HIGH"
+                    and e.event_time >= datetime.now(timezone.utc)
+                ]
+                if nxt:
+                    e = nxt[0]
+                    logger.info(
+                        f"news: next USD red folder: {e.title} at "
+                        f"{e.event_time:%a %d %b %H:%M} UTC"
+                    )
+            except Exception:
+                logger.exception("bot startup: news calendar load failed")
 
         now = datetime.now(timezone.utc)
         self.state.last_reconcile = now
@@ -720,6 +756,19 @@ class Bot:
             self.state.last_detect_closed = now
 
         # 5. New-setup detection (gated by halt + news + kill + M5 close).
+        # News first: it also closes open trades, paused or not.
+        news_check = None
+        if self.config.enable_news_filter:
+            try:
+                news_check = self.news_filter.check(now)
+            except Exception:
+                logger.exception("main loop: news check raised")
+            if news_check is not None and news_check.is_blocked:
+                if self.config.enable_news_close:
+                    self._run_news_close(news_check.block_reason or "news")
+            else:
+                self._news_closed.clear()
+
         placement_blocked = False
         if self._is_paused(now):
             placement_blocked = True  # skip new setups; existing managed above
@@ -727,10 +776,6 @@ class Bot:
             daily_halt_result = (
                 self._check_daily_halt(now)
                 if self.config.enable_balance_pct_halt else _NotHalted()
-            )
-            news_check = (
-                self.news_filter.check(now)
-                if self.config.enable_news_filter else None
             )
             placement_blocked = daily_halt_result.is_halted or bool(
                 news_check is not None and news_check.is_blocked
@@ -749,11 +794,9 @@ class Bot:
                     f"(drawdown {daily_halt_result.current_drawdown_pct:.2f}%, "
                     f"threshold {daily_halt_result.threshold_pct:.2f}%)"
                 )
-            elif news_check is not None and news_check.is_blocked:
-                logger.debug(
-                    f"new setups blocked: news → {news_check.block_reason}"
-                )
             elif self._has_new_m5_close(now):
+                # Zones keep being found during a news blackout; only
+                # new trades are blocked (placement_blocked above).
                 self._detect_new_zones(now)
                 # PR #47: zone-exit BE on the same M5 close. Runs AFTER
                 # detection so freshly-CONSUMED zones (this bar's
@@ -1205,6 +1248,44 @@ class Bot:
             f"next-signal: BUY={outcome.get('BUY')} "
             f"SELL={outcome.get('SELL')}"
         )
+
+    def _run_news_close(self, reason: str) -> None:
+        """News blackout started: close every open bot trade at market
+        and cancel pending layer 2 stops (``close_reason='NEWS_CLOSE'``).
+        Each setup once per blackout; retried next tick if a close
+        failed (the broker SL still protects it meanwhile)."""
+        for setup in self._safe_get_active_setups():
+            if setup.id in self._news_closed:
+                continue
+            ok = True
+            closed = cancelled = 0
+            for trade in self.position_tracker.get_trades_for_setup(setup.id):
+                if trade.status in OPEN_TRADE_STATUSES and trade.mt5_ticket is not None:
+                    try:
+                        self.mt5.close_position(trade.mt5_ticket)
+                    except Exception:
+                        ok = False
+                        logger.exception(
+                            f"news close: close of {trade.mt5_ticket} failed "
+                            f"(setup {setup.id}); will retry"
+                        )
+                        continue
+                    self.position_tracker.update_trade_status(
+                        trade.id, "CLOSED", close_reason="NEWS_CLOSE",
+                    )
+                    closed += 1
+                elif trade.status == "WAITING":
+                    cancel_layer2_at_broker(self.mt5, trade)
+                    self.position_tracker.update_trade_status(
+                        trade.id, "CANCELLED", close_reason="NEWS_CLOSE",
+                    )
+                    cancelled += 1
+            if ok:
+                self._news_closed.add(setup.id)
+            logger.warning(
+                f"NEWS_CLOSE: setup={setup.id} {setup.direction}: closed "
+                f"{closed}, cancelled {cancelled} ({reason})"
+            )
 
     def _run_m5_close_exit_pass(self) -> None:
         """XAUTISM: close everything on a setup once an M5 candle closes
