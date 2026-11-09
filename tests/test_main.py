@@ -3555,6 +3555,21 @@ class TestXautismMode:
         assert kw["tp1_price"] == pytest.approx(1909.7)
         assert kw["first_touch_lots"] == 0.01
         assert kw["total_lots"] > 0
+        # 75/25 runner on by default (Nov 2026).
+        assert kw["runner_keep_frac"] == 0.25
+
+    def test_runner_trail_runs_each_tick(
+        self, bot: tuple[Bot, dict[str, MagicMock]], mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        _xautism(b)
+        b.mt5.get_current_price.return_value = {
+            "bid": 1900.4, "ask": 1900.5, "time": NOW, "time_msc": 0,
+        }
+        run = mocker.patch.object(b.runner_trail, "check_live", return_value=[])
+        b.run_iteration(NOW)
+        run.assert_called_once()
+        assert run.call_args.args[:2] == (1900.4, 1900.5)
 
     def test_m5_close_exit_pass_once_per_bar(
         self, bot: tuple[Bot, dict[str, MagicMock]], mocker: MockerFixture,

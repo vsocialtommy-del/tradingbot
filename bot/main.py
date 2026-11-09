@@ -96,6 +96,7 @@ from bot.execution.layer2_stop import (
     cancel_layer2_at_broker,
 )
 from bot.exits.m5_close_exit import run_m5_close_exit
+from bot.exits.runner_trail import RunnerTrailManager
 from bot.exits.trailing_stop_manager import TrailingStopManager
 from bot.exits.zone_exit_manager import ZoneExitManager
 from bot.signals.next_signal_writer import NextSignalWriter
@@ -384,6 +385,10 @@ class Bot:
         )
         self.layer2_stop_manager = Layer2StopManager(
             mt5, supabase, self.position_tracker,
+            self.config.xautism_entries, symbol=self.config.symbol,
+        )
+        self.runner_trail = RunnerTrailManager(
+            mt5, self.position_tracker,
             self.config.xautism_entries, symbol=self.config.symbol,
         )
         self.daily_risk = DailyRiskTracker(mt5, symbol=self.config.symbol)
@@ -706,6 +711,17 @@ class Bot:
                         self.daily_risk.register(ev.ticket, ev.setup_id)
             except Exception:
                 logger.exception("main loop: layer2_stop.check_live failed")
+
+        # 3a-ii. 75/25 runner: at TP1 close 75%, trail the rest
+        # (bot.exits.runner_trail). Runs even while paused / news-blocked.
+        if (
+            self.config.xautism_entries.enabled
+            and self.config.xautism_entries.runner_enabled
+        ):
+            try:
+                self.runner_trail.check_live(bid, ask, self.config.xautism_entries)
+            except Exception:
+                logger.exception("main loop: runner_trail.check_live failed")
 
         # 3b. M5 close exit (runs even while news / halt block new setups).
         if (
@@ -2079,6 +2095,7 @@ class Bot:
                 zone, zone_id,
                 total_lots=total_lots,
                 layer2_lots=layer2_lots,
+                runner_keep_frac=xc.runner_keep_frac if xc.runner_enabled else None,
                 sl_price=sl_price,
                 tp1_price=tp1_price,
                 first_touch_lots=xc.first_touch_lots,
