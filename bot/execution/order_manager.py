@@ -312,12 +312,21 @@ def place_xautism_orders(
     lot_step: float = 0.01,
     stacked: StackedPlan | None = None,
     layer2_lots: float | None = None,
+    runner_keep_frac: float | None = None,
     mt5: MT5Connector,
     supabase: SupabaseLogger,
     tracker: PositionTracker,
     config: OrderManagerConfig | None = None,
 ) -> OrderPlacementResult:
     """XAUTISM entry model (Nov 2026, step 6).
+
+    ``runner_keep_frac`` (75/25 runner, e.g. 0.25): that share of the
+    whole position keeps running past TP1 with a trailing stop
+    (:mod:`bot.exits.runner_trail`). Layer 1 then has **no broker TP**
+    (the bot closes it at TP1, or trails it if layer 2 never filled) and
+    layer 2 is split into the main part (broker TP) and a runner part
+    stored as layer 3 (same stop price, no TP). If the runner share rounds
+    down to 0 lots, layer 2 stays in one piece with its TP.
 
     * Layer 1: ``first_touch_lots`` (0.01) as a market order the moment
       price touches the zone edge. SL **and TP1 sit at the broker**.
@@ -354,6 +363,14 @@ def place_xautism_orders(
         _floor_lots(layer2_lots, lot_step) if layer2_lots is not None
         else _floor_lots(total_lots - l1_lots, lot_step)
     )
+    runner = runner_keep_frac is not None and runner_keep_frac > 0
+    runner_lots = 0.0
+    if runner and l2_lots > 0:
+        runner_lots = _floor_lots((l1_lots + l2_lots) * float(runner_keep_frac), lot_step)
+        if runner_lots >= l2_lots:
+            runner_lots = 0.0  # too small to split; keep layer 2 whole
+    l2_main_lots = round(l2_lots - runner_lots, 2)
+    l1_broker_tp = None if runner else tp1_price
 
     try:
         setup_row = supabase.log_setup(SetupInput(
@@ -381,7 +398,9 @@ def place_xautism_orders(
             direction=zone.direction,
             lot_size=l1_lots,
             sl=sl_price,
-            tp=tp1_price,  # broker-held TP (XAUTISM)
+            # Broker-held TP, except in runner mode where the bot closes
+            # layer 1 at TP1 (or trails it when it's the only layer in).
+            tp=l1_broker_tp,
             comment=f"bot:L1:s={setup_id_short}",
         )
     except Exception as e:
@@ -456,7 +475,8 @@ def place_xautism_orders(
         )
 
     layer_2_trade_id: UUID | None = None
-    if l2_lots > 0:
+    layer_3_trade_id: UUID | None = None
+    if l2_main_lots > 0:
         try:
             row = supabase.log_trade(TradeInput(
                 setup_id=setup_id,
@@ -465,7 +485,7 @@ def place_xautism_orders(
                 order_type=layer2_type,  # type: ignore[arg-type]
                 mt5_ticket=None,
                 entry_price=None,
-                lot_size=Decimal(str(l2_lots)),
+                lot_size=Decimal(str(l2_main_lots)),
                 sl_price=Decimal(str(sl_price)),
                 tp_price=Decimal(str(tp1_price)),
                 status="WAITING",
@@ -474,6 +494,25 @@ def place_xautism_orders(
         except Exception as e:
             errors.append(f"Layer 2 {layer2_type} trade row failed: {e}")
             logger.exception("order_manager: Layer 2 row write failed")
+    if runner_lots > 0:
+        # 75/25 runner part of layer 2: same stop price, no broker TP.
+        try:
+            row = supabase.log_trade(TradeInput(
+                setup_id=setup_id,
+                layer_number=3,
+                direction=zone.direction,
+                order_type=layer2_type,  # type: ignore[arg-type]
+                mt5_ticket=None,
+                entry_price=None,
+                lot_size=Decimal(str(runner_lots)),
+                sl_price=Decimal(str(sl_price)),
+                tp_price=None,
+                status="WAITING",
+            ))
+            layer_3_trade_id = UUID(str(row["id"]))
+        except Exception as e:
+            errors.append(f"Runner {layer2_type} trade row failed: {e}")
+            logger.exception("order_manager: runner row write failed")
 
     try:
         tracker.update_setup_status(setup_id, "ACTIVE")
@@ -488,15 +527,17 @@ def place_xautism_orders(
 
     logger.info(
         f"XAUTISM setup {setup_id_short}: L1 {l1_lots} lots @ market "
-        f"(edge {edge}), L2 {l2_lots} lots {layer2_type} @ {layer2_price} "
-        f"pending{' (stacked)' if stacked else ''}, "
+        f"(edge {edge}), L2 {l2_main_lots} lots {layer2_type} @ {layer2_price} "
+        + (f"+ runner {runner_lots} lots " if runner_lots > 0 else "")
+        + f"pending{' (stacked)' if stacked else ''}, "
         f"sl={sl_price} tp={tp1_price}"
+        + (" (runner mode: 75% at TP1, rest trails)" if runner else "")
     )
     return OrderPlacementResult(
         setup_id=setup_id,
         layer_1_ticket=layer_1_ticket,
         layer_2_trade_id=layer_2_trade_id,
-        layer_3_trade_id=None,
+        layer_3_trade_id=layer_3_trade_id,
         layer_1_filled_price=layer_1_filled_price,
         sl_price=sl_price,
         tp1_price=tp1_price,

@@ -15,7 +15,9 @@ so it can only be placed once price is inside the zone by at least the
 minimum distance. If price just tags the edge and leaves, layer 2 is
 never placed and only the 0.01 runs.
 
-Layer 2 carries the same SL and TP as layer 1, both at the broker.
+Layer 2 carries the same SL and TP as layer 1, both at the broker. With
+the 75/25 runner on, the runner part of layer 2 is a second stop order
+(stored as layer 3) at the same price with no TP; both are handled here.
 
 Per-tick state machine for a WAITING ``order_type='STOP'`` layer 2:
 
@@ -66,6 +68,25 @@ class XautismEntryConfig:
     closes beyond the far edge of the zone. Extra exit on top of the
     broker SL."""
 
+    runner_enabled: bool = True
+    """75/25 runner (Nov 2026). At TP1, 75% of the position closes and
+    25% keeps running with a trailing stop. Layer 2 is split into two
+    broker stops at the same price: the main part with the broker TP and
+    the runner part (stored as layer 3) with no TP. Layer 1 has no broker
+    TP: the bot closes it at TP1, or, if layer 2 never filled, lets the
+    0.01 run as the runner. See :mod:`bot.exits.runner_trail`."""
+
+    runner_keep_frac: float = 0.25
+    """Share of the whole position (layer 1 + layer 2) that keeps running."""
+
+    runner_trail_points: float = 4.0
+    """Trailing distance in price ($4 = 400 MT5 points on gold). Starts
+    only once TP1 is reached; never worse than the runner's entry."""
+
+    runner_trail_step: float = 0.10
+    """Only move the broker SL when the trail has improved by at least
+    this much (avoids a modify request every tick)."""
+
 
 @dataclass(frozen=True)
 class Layer2Event:
@@ -112,13 +133,12 @@ class Layer2StopManager:
             except Exception:
                 logger.exception(f"layer2: get_trades failed for {setup.id}")
                 continue
-            l2 = next(
-                (t for t in trades
-                 if t.layer_number == 2 and t.order_type in ("STOP", "LIMIT")
-                 and t.status == "WAITING"),
-                None,
-            )
-            if l2 is None:
+            waiting = [
+                t for t in trades
+                if t.layer_number in (2, 3) and t.order_type in ("STOP", "LIMIT")
+                and t.status == "WAITING"
+            ]
+            if not waiting:
                 continue
             l1 = next((t for t in trades if t.layer_number == 1), None)
 
@@ -138,10 +158,11 @@ class Layer2StopManager:
                 and l1.mt5_ticket in pos_by_ticket
             )
 
-            ev = self._handle(setup, l1_open, l2, pos_by_ticket,
-                              pending_tickets, bid, ask)
-            if ev is not None:
-                events.append(ev)
+            for l2 in waiting:
+                ev = self._handle(setup, l1_open, l2, pos_by_ticket,
+                                  pending_tickets, bid, ask)
+                if ev is not None:
+                    events.append(ev)
         return events
 
     # ------------------------------------------------------------------ #
@@ -227,7 +248,10 @@ class Layer2StopManager:
                 price=stop_price,
                 sl=float(l2.sl_price),
                 tp=float(l2.tp_price) if l2.tp_price is not None else None,
-                comment=f"bot:L2{'lim' if is_limit else 'stop'}:s={str(setup.id)[:8]}",
+                comment=(
+                    f"bot:L{l2.layer_number}{'lim' if is_limit else 'stop'}"
+                    f":s={str(setup.id)[:8]}"
+                ),
             )
         except Exception:
             logger.exception(
