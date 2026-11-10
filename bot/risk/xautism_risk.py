@@ -49,6 +49,28 @@ class RiskConfig:
     max_lot: float = 2.0
     """Safety cap on any single layer."""
     lot_step: float = 0.01
+    risk_pct: float | None = None
+    """If set (e.g. 0.10), risk this share of the current balance per
+    trade instead of the fixed ``risk_per_trade`` (compounding). Used by
+    the M1 bot profile."""
+    max_daily_loss_pct: float | None = None
+    """If set (e.g. 0.30), the daily loss limit is this share of the
+    current balance instead of the fixed ``max_daily_loss``."""
+
+
+def effective_risk(config: "RiskConfig", balance: float | None) -> "RiskConfig":
+    """Resolve % of balance settings into £ amounts for this moment.
+    Fixed-£ configs (the M5 bot) come back unchanged."""
+    if balance is None or (config.risk_pct is None and config.max_daily_loss_pct is None):
+        return config
+    from dataclasses import replace
+    b = max(float(balance), 0.0)
+    return replace(
+        config,
+        risk_per_trade=(b * config.risk_pct) if config.risk_pct is not None else config.risk_per_trade,
+        max_daily_loss=(b * config.max_daily_loss_pct)
+        if config.max_daily_loss_pct is not None else config.max_daily_loss,
+    )
 
 
 @dataclass(frozen=True)

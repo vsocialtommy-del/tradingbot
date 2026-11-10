@@ -23,9 +23,11 @@ ENV/
 
 # Environment variables (real values — keep .env.example tracked)
 .env
+.env.m1
 .env.local
 .env.*.local
 !.env.example
+!.env.m1.example
 
 # Secrets / credentials
 *.pem

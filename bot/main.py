@@ -129,7 +129,12 @@ from bot.strategy.strong_point import (
 from bot.strategy.direction_gate import DirectionGateConfig, check_direction
 from bot.strategy.levels import LevelsConfig, TradeLevels, compute_levels
 from bot.strategy.stacked import StackedConfig, StackedPlan, stacked_plan
-from bot.risk.xautism_risk import DailyRiskTracker, RiskConfig, split_lots
+from bot.risk.xautism_risk import (
+    DailyRiskTracker,
+    RiskConfig,
+    effective_risk,
+    split_lots,
+)
 from bot.strategy.pipeline import (
     StrategyPipelineConfig,
     run_strategy_pipeline,
@@ -294,7 +299,12 @@ class BotLoopConfig:
     enable_balance_pct_halt: bool = False
     """Old % of balance daily halt. XAUTISM uses the -£300 / 2 losses
     rule in ``risk`` instead."""
-    ohlc_timeframe: Literal["M5"] = "M5"
+    ohlc_timeframe: Literal["M1", "M5"] = "M5"
+    """Entry timeframe: zones, the close exit and the layer logic all run
+    on these bars. ``M5`` for the M5 bot, ``M1`` for the M1 bot
+    (:mod:`bot.profiles`)."""
+    bot_name: str = "M5"
+    """Shown in the startup log so you can tell the two bots apart."""
     error_backoff_seconds: float = 5.0
 
 
@@ -451,10 +461,24 @@ class Bot:
         """Connect to MT5, capture starting balance, reconcile."""
         # ~3.5 days of M5 history at the default. Logged so the
         # operator can confirm at restart without grepping config.
+        bar_minutes = 1 if self.config.ohlc_timeframe == "M1" else 5
         logger.info(
+            f"=== {self.config.bot_name} bot === "
             f"OHLC fetch window: {self.config.ohlc_count} "
             f"{self.config.ohlc_timeframe} bars per pipeline run "
-            f"(~{self.config.ohlc_count * 5 / 60 / 24:.1f} days history)"
+            f"(~{self.config.ohlc_count * bar_minutes / 60 / 24:.1f} days history)"
+        )
+        rc, xc = self.config.risk, self.config.xautism_entries
+        risk_txt = (
+            f"{rc.risk_pct * 100:.0f}% of balance per trade"
+            if rc.risk_pct is not None else f"£{rc.risk_per_trade:.0f} per trade"
+        )
+        logger.info(
+            f"{self.config.bot_name} bot settings: {risk_txt}, max "
+            f"{rc.max_losses_per_day} losses a day, runner "
+            + (f"{(1 - xc.runner_keep_frac) * 100:.0f}% at TP1 / "
+               f"{xc.runner_keep_frac * 100:.0f}% trails {xc.runner_trail_points:g} pts"
+               if xc.runner_enabled else "off")
         )
         self.mt5.connect()
         try:
@@ -799,7 +823,7 @@ class Bot:
             # XAUTISM risk gates: daily £ loss + two losses and done.
             # Zone detection keeps running; only new trades are blocked.
             if self._xautism_risk_on():
-                verdict = self.daily_risk.check(now, self.config.risk)
+                verdict = self.daily_risk.check(now, self._risk_now())
                 if verdict.blocked:
                     placement_blocked = True
                     logger.debug(f"new trades blocked: {verdict.reason}")
@@ -2043,6 +2067,19 @@ class Bot:
             logger.exception("sizing: calc_loss_per_lot failed; using USD fallback")
         return abs(entry - sl) * 100.0
 
+    def _risk_now(self) -> RiskConfig:
+        """The risk settings in £ right now. Fixed-£ (M5 bot) is returned
+        as is; % of balance (M1 bot) is worked out from the live balance."""
+        cfg = self.config.risk
+        if cfg.risk_pct is None and cfg.max_daily_loss_pct is None:
+            return cfg
+        try:
+            balance = self.mt5.get_balance()
+        except Exception:
+            logger.exception("risk: get_balance failed; using fixed £ settings")
+            return cfg
+        return effective_risk(cfg, balance)
+
     def _place_xautism(
         self, zone: ValidatedZone, zone_id: UUID, *,
         entry_price: float, sl_price: float, tp1_price: float,
@@ -2055,8 +2092,9 @@ class Bot:
         layer2_entry = stack.outer_entry if stack is not None else entry_price
         layer2_lots: float | None = None
         if self.config.risk.enabled:
+            risk_cfg = self._risk_now()
             lots = split_lots(
-                risk=self.config.risk.risk_per_trade,
+                risk=risk_cfg.risk_per_trade,
                 layer1_entry=entry_price,
                 layer2_entry=layer2_entry,
                 sl=sl_price,
@@ -2068,7 +2106,7 @@ class Bot:
             layer2_lots = lots.layer2
             total_lots = round(lots.layer1 + lots.layer2, 2)
             logger.info(
-                f"sizing: risk {self.config.risk.risk_per_trade:.0f} → "
+                f"sizing: risk {risk_cfg.risk_per_trade:.0f} → "
                 f"L1 {lots.layer1} + L2 {lots.layer2} lots "
                 f"(actual risk {lots.risk:.2f})"
             )
@@ -2554,10 +2592,36 @@ def main() -> None:
     default), which is the right behaviour for CI / Docker / VPS
     where vars come from the orchestration layer.
     """
-    load_dotenv()
+    import argparse
+    from pathlib import Path
+
+    from bot.profiles import ENV_FILES, build_profile
+
+    parser = argparse.ArgumentParser(prog="python -m bot.main")
+    parser.add_argument(
+        "--bot", choices=sorted(ENV_FILES), default="m5",
+        help="which bot to run: m5 (default, uses .env) or m1 (uses .env.m1)",
+    )
+    args = parser.parse_args()
+
+    env_file = ENV_FILES[args.bot]
+    if args.bot == "m5":
+        load_dotenv()
+    else:
+        path = Path(env_file)
+        if not path.exists():
+            raise SystemExit(
+                f"{env_file} not found in {Path.cwd()}. Copy {env_file}.example "
+                f"to {env_file} and fill in the {args.bot.upper()} bot's MT5 and "
+                "Supabase details."
+            )
+        load_dotenv(path, override=True)
+    loop_config, pipeline_config = build_profile(args.bot)
     bot = Bot(
         mt5=MT5Connector.from_env(),
         supabase=SupabaseLogger.from_env(),
+        config=loop_config,
+        strategy_pipeline_config=pipeline_config,
     )
 
     def _handle_signal(signum: int, frame: object) -> None:
