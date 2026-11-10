@@ -4,11 +4,14 @@
   fresh H1 exception, M5 close exit, £100 a trade, 2 losses a day,
   75/25 runner with a 4 point trail. Reads ``.env``.
 * ``m1``: M1 zones (1 point minimum), M5 direction with the fresh M15
-  exception, M1 close exit, 2 losses a day, 50/50 runner with a 2 point
-  trail. Risk is switchable (``RISK=`` in ``.env.m1`` or ``--risk``):
-  10% of balance (default, daily cap 30%), 5% (cap 15%) or £100 fixed
-  (cap £300). Reads ``.env.m1``, so it runs on its own MT5 account and
-  its own Supabase project.
+  exception, **no candle close exit** (only the 30% SL, TP1 and the
+  trail close a trade, Nov 2026), 50/50 runner with a 2 point trail.
+  Risk is switchable (``RISK=`` in ``.env.m1`` or ``--risk``): 10% of
+  balance (default), 5% or £100 fixed. Losses a day are switchable too
+  (``MAX_LOSSES=`` or ``--max-losses``, default 2). The daily cap is one
+  trade more than the losses allowed: 2 losses at 10% = 30%. Reads
+  ``.env.m1``, so it runs on its own MT5 account and its own Supabase
+  project.
 
 Run them with ``python -m bot.main`` (or ``--bot m5``) and
 ``python -m bot.main --bot m1``, each in its own window.
@@ -27,26 +30,43 @@ from bot.strategy.pipeline import StrategyPipelineConfig
 ENV_FILES = {"m5": ".env", "m1": ".env.m1"}
 
 M1_DEFAULT_RISK = "10%"
+M1_DEFAULT_MAX_LOSSES = 2
 
 
-def parse_risk(text: str):
+def parse_max_losses(text) -> int:
+    """M1 losses-a-day switch: a whole number from 1 to 50."""
+    t = str(text).strip()
+    try:
+        n = int(t)
+        if not 1 <= n <= 50:
+            raise ValueError
+        return n
+    except ValueError:
+        raise ValueError(
+            f"MAX_LOSSES={text!r} isn't valid. Use a whole number from 1 to 50."
+        ) from None
+
+
+def parse_risk(text: str, max_losses: int = M1_DEFAULT_MAX_LOSSES):
     """M1 risk switch: ``"10%"`` / ``"5%"`` (share of balance per trade) or
-    ``"100"`` / ``"£100"`` (fixed). Always 2 losses a day. The daily cap is
-    3 trades' worth: 30% / 15% of balance, or £300 for £100.
+    ``"100"`` / ``"£100"`` (fixed). The daily cap is one trade more than
+    the losses allowed: with 2 losses that's 30% / 15% of balance, or
+    £300 for £100.
 
     Returns ``(risk_pct, risk_per_trade, max_daily_loss, max_daily_loss_pct)``.
     """
     t = str(text).strip().replace("£", "").replace(" ", "").lower()
+    trades = max_losses + 1
     try:
         if t.endswith("%"):
             pct = float(t[:-1]) / 100.0
             if not 0 < pct <= 0.20:
                 raise ValueError
-            return pct, None, None, round(pct * 3, 4)
+            return pct, None, None, round(pct * trades, 4)
         amount = float(t)
         if not 0 < amount <= 10000:
             raise ValueError
-        return None, amount, amount * 3, None
+        return None, amount, amount * trades, None
     except ValueError:
         raise ValueError(
             f"RISK={text!r} isn't valid. Use a percent like 10% or 5%, "
@@ -54,10 +74,11 @@ def parse_risk(text: str):
         ) from None
 
 
-def build_profile(name: str, risk: str | None = None):
+def build_profile(name: str, risk: str | None = None, max_losses=None):
     """Return ``(BotLoopConfig, StrategyPipelineConfig)`` for a bot.
 
-    ``risk`` (M1 only): see :func:`parse_risk`; default 10%."""
+    ``risk`` (M1 only): see :func:`parse_risk`; default 10%.
+    ``max_losses`` (M1 only): losing trades a day before it stops; default 2."""
     from bot.main import BotLoopConfig  # local import: main imports this module
 
     base = BotLoopConfig()
@@ -65,9 +86,15 @@ def build_profile(name: str, risk: str | None = None):
     if name == "m5":
         if risk is not None:
             raise ValueError("the risk switch is for the M1 bot only; the M5 bot stays at £100")
+        if max_losses is not None:
+            raise ValueError("the losses switch is for the M1 bot only; the M5 bot stays at 2 losses a day")
         return replace(base, bot_name="M5"), pipeline
     if name == "m1":
-        pct, amount, daily, daily_pct = parse_risk(risk or M1_DEFAULT_RISK)
+        losses = (
+            parse_max_losses(max_losses) if max_losses not in (None, "")
+            else M1_DEFAULT_MAX_LOSSES
+        )
+        pct, amount, daily, daily_pct = parse_risk(risk or M1_DEFAULT_RISK, losses)
         cfg = replace(
             base,
             bot_name="M1",
@@ -77,6 +104,9 @@ def build_profile(name: str, risk: str | None = None):
             ),
             xautism_entries=replace(
                 base.xautism_entries, runner_keep_frac=0.5, runner_trail_points=2.0,
+                # Nov 2026: no candle close exit on the M1 bot. Only the
+                # 30% SL, TP1 and the runner trail close a trade.
+                m5_close_exit=False,
             ),
             risk=replace(
                 base.risk,
@@ -84,7 +114,7 @@ def build_profile(name: str, risk: str | None = None):
                 max_daily_loss_pct=daily_pct,
                 risk_per_trade=amount if amount is not None else base.risk.risk_per_trade,
                 max_daily_loss=daily if daily is not None else base.risk.max_daily_loss,
-                max_losses_per_day=2,
+                max_losses_per_day=losses,
             ),
         )
         return cfg, replace(pipeline, zone_min_size_points=1.0)

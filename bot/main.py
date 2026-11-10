@@ -479,6 +479,7 @@ class Bot:
             + (f"{(1 - xc.runner_keep_frac) * 100:.0f}% at TP1 / "
                f"{xc.runner_keep_frac * 100:.0f}% trails {xc.runner_trail_points:g} pts"
                if xc.runner_enabled else "off")
+            + f", candle close exit {'on' if xc.m5_close_exit else 'off (30% SL only)'}"
         )
         self.mt5.connect()
         try:
@@ -2606,6 +2607,10 @@ def main() -> None:
         "--risk", default=None,
         help="M1 bot only: 10%%, 5%% or 100 (overrides RISK= in .env.m1)",
     )
+    parser.add_argument(
+        "--max-losses", default=None,
+        help="M1 bot only: losing trades a day before it stops (overrides MAX_LOSSES= in .env.m1)",
+    )
     args = parser.parse_args()
 
     env_file = ENV_FILES[args.bot]
@@ -2623,11 +2628,15 @@ def main() -> None:
     if args.bot == "m5":
         if args.risk is not None:
             raise SystemExit("--risk is for the M1 bot only; the M5 bot stays at £100 a trade.")
+        if args.max_losses is not None:
+            raise SystemExit("--max-losses is for the M1 bot only; the M5 bot stays at 2 losses a day.")
         risk = None
+        max_losses = None
     else:
         risk = args.risk or os.environ.get("RISK") or None
+        max_losses = args.max_losses or os.environ.get("MAX_LOSSES") or None
     try:
-        loop_config, pipeline_config = build_profile(args.bot, risk)
+        loop_config, pipeline_config = build_profile(args.bot, risk, max_losses)
     except ValueError as e:
         raise SystemExit(str(e)) from None
     bot = Bot(
