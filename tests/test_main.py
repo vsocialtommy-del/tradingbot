@@ -3532,6 +3532,22 @@ class TestXautismMode:
         tr.assert_not_called()
         zd.assert_not_called()
 
+    @pytest.mark.parametrize("name,expected", [("m5", True), ("m1", False)])
+    def test_close_exit_runs_on_m5_only(
+        self, bot: tuple[Bot, dict[str, MagicMock]], mocker: MockerFixture,
+        name: str, expected: bool,
+    ) -> None:
+        from dataclasses import replace
+        from bot.profiles import build_profile
+        b, mgrs = bot
+        _xautism(b)
+        prof, _ = build_profile(name)
+        b.config = replace(b.config, xautism_entries=prof.xautism_entries)
+        mgrs["position_tracker"].get_active_setups.return_value = [make_setup()]
+        run = mocker.patch.object(b, "_run_m5_close_exit_pass")
+        b.run_iteration(NOW)
+        assert run.called is expected
+
     def test_placement_uses_first_touch_plus_stop(
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mock_mt5: MagicMock, mocker: MockerFixture,

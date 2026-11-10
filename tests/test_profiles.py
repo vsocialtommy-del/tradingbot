@@ -24,6 +24,7 @@ class TestProfiles:
         assert cfg.risk == base.risk                       # £100, 2 losses, -£300
         assert cfg.direction_gate == base.direction_gate   # M15 + fresh H1
         assert cfg.xautism_entries == base.xautism_entries  # 75/25, 4 pt trail
+        assert cfg.xautism_entries.m5_close_exit is True    # M5 keeps its close exit
         assert pipe == StrategyPipelineConfig()
 
     def test_m1_settings(self) -> None:
@@ -38,6 +39,7 @@ class TestProfiles:
         assert cfg.risk.risk_pct == 0.10
         assert cfg.risk.max_daily_loss_pct == 0.30
         assert cfg.risk.max_losses_per_day == 2
+        assert cfg.xautism_entries.m5_close_exit is False   # 30% SL only
         # everything else is the same as the M5 bot
         base = BotLoopConfig()
         assert cfg.levels == base.levels
@@ -196,3 +198,82 @@ class TestRiskFromEnvAndCommand:
         mocker.patch.object(main_mod, "load_dotenv")
         with pytest.raises(SystemExit, match="M1 bot only"):
             main_mod.main()
+
+
+class TestM1MaxLosses:
+    def test_default_two(self) -> None:
+        cfg, _ = build_profile("m1", "1%")
+        assert cfg.risk.max_losses_per_day == 2
+        assert cfg.risk.max_daily_loss_pct == pytest.approx(0.03)
+
+    @pytest.mark.parametrize("text,n", [("10", 10), (" 5 ", 5), (3, 3), ("1", 1)])
+    def test_switch(self, text, n) -> None:
+        cfg, _ = build_profile("m1", "1%", text)
+        assert cfg.risk.max_losses_per_day == n
+        # daily cap is one trade more than the losses allowed
+        assert cfg.risk.max_daily_loss_pct == pytest.approx(0.01 * (n + 1))
+
+    def test_fixed_amount_cap_scales(self) -> None:
+        cfg, _ = build_profile("m1", "100", "10")
+        assert cfg.risk.max_losses_per_day == 10
+        assert cfg.risk.max_daily_loss == pytest.approx(1100.0)
+
+    def test_empty_means_default(self) -> None:
+        assert build_profile("m1", "1%", "")[0].risk.max_losses_per_day == 2
+
+    @pytest.mark.parametrize("text", ["0", "51", "two", "2.5", "-1"])
+    def test_bad_values(self, text) -> None:
+        with pytest.raises(ValueError, match="MAX_LOSSES"):
+            build_profile("m1", "1%", text)
+
+    def test_m5_refuses(self) -> None:
+        with pytest.raises(ValueError, match="M1 bot only"):
+            build_profile("m5", None, "10")
+
+    def test_from_env_file(self, mocker, tmp_path, monkeypatch) -> None:
+        for k in ("RISK", "MAX_LOSSES"):
+            monkeypatch.delenv(k, raising=False)
+        r = TestRiskFromEnvAndCommand()._run(
+            mocker, ["--bot", "m1"], tmp_path, monkeypatch, "RISK=1%\nMAX_LOSSES=10\n",
+        )
+        assert r.max_losses_per_day == 10
+        for k in ("RISK", "MAX_LOSSES"):
+            monkeypatch.delenv(k, raising=False)
+
+    def test_command_overrides_env(self, mocker, tmp_path, monkeypatch) -> None:
+        for k in ("RISK", "MAX_LOSSES"):
+            monkeypatch.delenv(k, raising=False)
+        r = TestRiskFromEnvAndCommand()._run(
+            mocker, ["--bot", "m1", "--max-losses", "4"], tmp_path, monkeypatch,
+            "MAX_LOSSES=10\n",
+        )
+        assert r.max_losses_per_day == 4
+        for k in ("RISK", "MAX_LOSSES"):
+            monkeypatch.delenv(k, raising=False)
+
+    def test_bad_env_stops_with_message(self, mocker, tmp_path, monkeypatch) -> None:
+        for k in ("RISK", "MAX_LOSSES"):
+            monkeypatch.delenv(k, raising=False)
+        with pytest.raises(SystemExit, match="MAX_LOSSES"):
+            TestRiskFromEnvAndCommand()._run(
+                mocker, ["--bot", "m1"], tmp_path, monkeypatch, "MAX_LOSSES=lots\n",
+            )
+        monkeypatch.delenv("MAX_LOSSES", raising=False)
+
+    def test_m5_command_refused(self, mocker) -> None:
+        mocker.patch.object(sys, "argv", ["bot.main", "--max-losses", "10"])
+        mocker.patch.object(main_mod, "load_dotenv")
+        with pytest.raises(SystemExit, match="M1 bot only"):
+            main_mod.main()
+
+    def test_m5_ignores_max_losses_env(self, mocker, monkeypatch) -> None:
+        monkeypatch.setenv("MAX_LOSSES", "10")
+        mocker.patch.object(sys, "argv", ["bot.main"])
+        mocker.patch.object(main_mod, "load_dotenv")
+        mocker.patch.object(main_mod.MT5Connector, "from_env", return_value=MagicMock())
+        mocker.patch.object(main_mod.SupabaseLogger, "from_env", return_value=MagicMock())
+        mocker.patch.object(main_mod.signal, "signal")
+        bot_cls = mocker.patch.object(main_mod, "Bot")
+        main_mod.main()
+        assert bot_cls.call_args.kwargs["config"].risk.max_losses_per_day == 2
+
