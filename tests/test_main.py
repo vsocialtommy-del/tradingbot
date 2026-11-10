@@ -887,6 +887,11 @@ class TestMainEntryPoint:
          path).
     """
 
+    @pytest.fixture(autouse=True)
+    def _plain_argv(self, mocker: MockerFixture) -> None:
+        # main() now reads --bot; run it as plain ``python -m bot.main``.
+        mocker.patch("sys.argv", ["bot.main"])
+
     def test_main_calls_load_dotenv_before_from_env(
         self, mocker: MockerFixture,
     ) -> None:

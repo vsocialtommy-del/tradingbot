@@ -43,3 +43,37 @@ First days, watch for: lots of `spread` skips (raise `risk.max_spread`).
 ```
 python scripts/backtest_xautism.py M5_part1.csv,M5_part2.csv M1.csv --start 2026-07-08 --out trades.csv
 ```
+
+## M1 bot (second bot, same code)
+
+Two bots share this code. Each runs in its own window, on its own MT5
+account and its own Supabase project, so they never see each other's trades.
+
+| | M5 bot | M1 bot |
+|---|---|---|
+| Start | `python -m bot.main` (or `--bot m5`), or double-click `start_m5_bot.bat` | `python -m bot.main --bot m1`, or double-click `start_m1_bot.bat` |
+| Settings file | `.env` | `.env.m1` (copy `.env.m1.example`) |
+| Zones | M5, 3 pt minimum | M1, 1 pt minimum |
+| Direction | M15 trend, fresh H1 zone exception | M5 trend, fresh M15 zone exception |
+| Close exit | M5 candle close beyond the zone | M1 candle close beyond the zone |
+| Risk | £100 a trade, 2 losses a day, -£300 cap | 10% of balance a trade, 2 losses a day, 30% cap |
+| After TP1 | 75% closes, 25% trails 4 pts | 50% closes, 50% trails 2 pts |
+| Supabase | M5 bot project | M1 bot project (`nvkwnpesedzwnxewuczn`) |
+
+Everything else (30% SL, TP at the BOS foot, 0.01 + layer 2 stop, one
+trade at a time, news filter, spread filter) is the same.
+
+**First-time M1 setup**
+
+1. Open a new MetaQuotes demo account for the M1 bot (start it at £1,000
+   to match the backtest).
+2. Install MetaTrader 5 a second time into its own folder (for example
+   `C:\Program Files\MetaTrader 5 M1`) and log that copy into the M1 demo.
+   Tick Algo Trading in it.
+3. Supabase, "M1 bot" project, SQL Editor: run `m1_bot_supabase_setup.sql`
+   (all migrations 001-015 in one file).
+4. Copy `.env.m1.example` to `.env.m1` and fill in the M1 account login,
+   password, server, the second MT5's `terminal64.exe` path and the M1
+   project's service_role key.
+5. Start it in a new Command Prompt: `python -m bot.main --bot m1`. The
+   first log lines say `=== M1 bot ===` and list the settings.
