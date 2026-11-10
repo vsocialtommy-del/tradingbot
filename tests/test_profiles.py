@@ -24,7 +24,7 @@ class TestProfiles:
         assert cfg.risk == base.risk                       # £100, 2 losses, -£300
         assert cfg.direction_gate == base.direction_gate   # M15 + fresh H1
         assert cfg.xautism_entries == base.xautism_entries  # 75/25, 4 pt trail
-        assert cfg.xautism_entries.m5_close_exit is True    # M5 keeps its close exit
+        assert cfg.xautism_entries.m5_close_exit is False   # 30% SL only (10 Nov 2026)
         assert pipe == StrategyPipelineConfig()
 
     def test_m1_settings(self) -> None:

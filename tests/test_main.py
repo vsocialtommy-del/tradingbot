@@ -3509,7 +3509,7 @@ class TestXautismMode:
         c = BotLoopConfig()
         assert c.xautism_entries.enabled is True
         assert c.xautism_entries.first_touch_lots == 0.01
-        assert c.xautism_entries.m5_close_exit is True
+        assert c.xautism_entries.m5_close_exit is False   # 30% SL only (10 Nov 2026)
         assert c.enable_bot_managed_tp is False
         assert c.enable_zone_exit_be is False
         assert c.enable_trailing_stop is False
@@ -3532,17 +3532,23 @@ class TestXautismMode:
         tr.assert_not_called()
         zd.assert_not_called()
 
-    @pytest.mark.parametrize("name,expected", [("m5", True), ("m1", False)])
-    def test_close_exit_runs_on_m5_only(
+    @pytest.mark.parametrize("name,switch,expected", [
+        ("m5", None, False), ("m1", None, False),   # off on both bots
+        ("m5", True, True),                         # code kept: switch works
+    ])
+    def test_close_exit_off_on_both_bots(
         self, bot: tuple[Bot, dict[str, MagicMock]], mocker: MockerFixture,
-        name: str, expected: bool,
+        name: str, switch, expected: bool,
     ) -> None:
         from dataclasses import replace
         from bot.profiles import build_profile
         b, mgrs = bot
         _xautism(b)
         prof, _ = build_profile(name)
-        b.config = replace(b.config, xautism_entries=prof.xautism_entries)
+        xe = prof.xautism_entries
+        if switch is not None:
+            xe = replace(xe, m5_close_exit=switch)
+        b.config = replace(b.config, xautism_entries=xe)
         mgrs["position_tracker"].get_active_setups.return_value = [make_setup()]
         run = mocker.patch.object(b, "_run_m5_close_exit_pass")
         b.run_iteration(NOW)

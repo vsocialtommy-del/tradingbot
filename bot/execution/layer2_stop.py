@@ -63,10 +63,14 @@ class XautismEntryConfig:
     side of the stop) before layer 2 is sent. The broker's own
     ``trade_stops_level`` is added on top when it's larger."""
 
-    m5_close_exit: bool = True
+    m5_close_exit: bool = False
     """Close every layer (and cancel a pending layer 2) when an M5 candle
     closes beyond the far edge of the zone. Extra exit on top of the
-    broker SL."""
+    broker SL. Off on both bots since 10 Nov 2026 (30% SL only); code
+    kept. Before switching it back on: Tommy's rule is the full body
+    (open AND close) beyond the zone, the M1 bot should use the M5 close,
+    and the "closed after we were in" check needs fixing (it assumes 5 min
+    bars and compares MT5 server-time bars with UTC activated_at)."""
 
     runner_enabled: bool = True
     """75/25 runner (Nov 2026). At TP1, 75% of the position closes and

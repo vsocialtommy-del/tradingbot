@@ -1,8 +1,9 @@
 """The two bots that share this code (Nov 2026).
 
 * ``m5`` (default): the live M5 bot. M5 zones, M15 direction with the
-  fresh H1 exception, M5 close exit, £100 a trade, 2 losses a day,
-  75/25 runner with a 4 point trail. Reads ``.env``.
+  fresh H1 exception, **no candle close exit** (30% SL only, 10 Nov
+  2026), £100 a trade, 2 losses a day, 75/25 runner with a 4 point
+  trail. Reads ``.env``.
 * ``m1``: M1 zones (1 point minimum), M5 direction with the fresh M15
   exception, **no candle close exit** (only the 30% SL, TP1 and the
   trail close a trade, Nov 2026), 50/50 runner with a 2 point trail.
