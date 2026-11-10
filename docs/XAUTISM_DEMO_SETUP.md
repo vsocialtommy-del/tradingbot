@@ -10,7 +10,7 @@
 | Direction | M15 trend, or against it only when the M5 zone sits in a fresh H1 zone. |
 | Entry | 0.01 at the zone edge on first touch. Layer 2 (the rest) is a broker stop at the same edge, placed once price is 0.10 inside the zone, filling on the way back out. Same SL on both (TP: see the 75/25 runner row). Layer 2 is cancelled if TP or SL hits first. |
 | TP1 exit (75/25 runner) | At TP1, 75 % of the whole position closes (layer 1 by the bot, the layer 2 main part at its broker TP) and 25 % (the runner part of layer 2, a second stop at the same price with no TP) keeps going. Its SL moves to breakeven, then trails 4.00 ($4 = 400 MT5 points) behind the best price, never back. If layer 2 never filled, the 0.01 becomes the runner instead of closing for a tiny win. Nothing changes before TP1. 12-month backtest: +£7,446 vs +£4,976 all-out at TP1, max drawdown -£568 vs -£651, no losing month. Off switch: `runner_enabled`. |
-| SL | 30 % of the zone past the far edge (below for buys, above for sells), pushed beyond a swing just past it. Extra exit: an M5 candle closing beyond the far edge closes everything. |
+| SL | 30 % of the zone past the far edge (below for buys, above for sells), pushed beyond a swing just past it. The candle close exit is **off** on both bots (10 Nov 2026): only the 30% SL, TP1 and the runner trail close a trade. Code kept (switch: `m5_close_exit`). |
 | Risk | £100 per trade (both layers together), -£300 a day, stop after 2 losing trades, one trade at a time, no entry above a 0.50 spread. |
 | News | USD red folder events (Forex Factory calendar, downloaded by the bot every hour): no new trades from 15 min before to 15 min after; any open trade is closed and a pending layer 2 cancelled 15 min before. Zones keep being found. Not in the backtest. |
 | Never twice | A zone is traded once. Nothing else blocks a fresh zone (same as the backtest). |
@@ -55,7 +55,7 @@ account and its own Supabase project, so they never see each other's trades.
 | Settings file | `.env` | `.env.m1` (copy `.env.m1.example`) |
 | Zones | M5, 3 pt minimum | M1, 1 pt minimum |
 | Direction | M15 trend, fresh H1 zone exception | M5 trend, fresh M15 zone exception |
-| Close exit | M5 candle close beyond the zone | **None.** Only the 30% SL, TP1 and the runner trail close a trade |
+| Close exit | **None.** Only the 30% SL, TP1 and the runner trail close a trade | **None.** Only the 30% SL, TP1 and the runner trail close a trade |
 | Risk | £100 a trade, 2 losses a day, -£300 cap | Switchable: `RISK=10%` (default), `RISK=5%`, `RISK=1%` or `RISK=100` (£100 a trade). Losses a day: `MAX_LOSSES=2` (default), raise it for testing. The daily cap is one trade more than the losses allowed (2 losses at 10% = 30%, 2 at £100 = £300). Set both in `.env.m1`, or override for one run with `python -m bot.main --bot m1 --risk 5% --max-losses 10`. The startup log shows what's on. |
 | After TP1 | 75% closes, 25% trails 4 pts | 50% closes, 50% trails 2 pts |
 | Supabase | M5 bot project | M1 bot project (`nvkwnpesedzwnxewuczn`) |
