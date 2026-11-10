@@ -125,3 +125,74 @@ class TestMainEntry:
         mocker.patch.object(sys, "argv", ["bot.main", "--bot", "m1"])
         with pytest.raises(SystemExit, match=r"\.env\.m1 not found"):
             main_mod.main()
+
+
+class TestM1RiskSwitch:
+    @pytest.mark.parametrize("text,pct,daily_pct", [("10%", 0.10, 0.30), ("5%", 0.05, 0.15), (" 5 % ", 0.05, 0.15)])
+    def test_percent(self, text, pct, daily_pct) -> None:
+        cfg, _ = build_profile("m1", text)
+        assert cfg.risk.risk_pct == pytest.approx(pct)
+        assert cfg.risk.max_daily_loss_pct == pytest.approx(daily_pct)
+        assert cfg.risk.max_losses_per_day == 2
+
+    @pytest.mark.parametrize("text", ["100", "£100"])
+    def test_fixed_100_like_m5(self, text) -> None:
+        cfg, _ = build_profile("m1", text)
+        m5, _ = build_profile("m5")
+        assert cfg.risk.risk_pct is None and cfg.risk.max_daily_loss_pct is None
+        assert cfg.risk.risk_per_trade == 100.0
+        assert cfg.risk.max_daily_loss == 300.0 == m5.risk.max_daily_loss
+        assert cfg.risk.max_losses_per_day == 2
+        # still the M1 bot otherwise
+        assert cfg.ohlc_timeframe == "M1" and cfg.xautism_entries.runner_keep_frac == 0.5
+
+    def test_default_is_10_percent(self) -> None:
+        assert build_profile("m1")[0].risk.risk_pct == pytest.approx(0.10)
+
+    @pytest.mark.parametrize("text", ["ten", "0%", "50%", "-5", ""])
+    def test_bad_values(self, text) -> None:
+        if text == "":
+            assert build_profile("m1", text)[0].risk.risk_pct == pytest.approx(0.10)
+            return
+        with pytest.raises(ValueError, match="isn't valid"):
+            build_profile("m1", text)
+
+    def test_m5_refuses_the_switch(self) -> None:
+        with pytest.raises(ValueError, match="M1 bot only"):
+            build_profile("m5", "5%")
+
+
+class TestRiskFromEnvAndCommand:
+    def _run(self, mocker, argv, tmp_path, monkeypatch, env_text="MT5_LOGIN=1\n"):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env.m1").write_text(env_text)
+        mocker.patch.object(sys, "argv", ["bot.main", *argv])
+        mocker.patch.object(main_mod.MT5Connector, "from_env", return_value=MagicMock())
+        mocker.patch.object(main_mod.SupabaseLogger, "from_env", return_value=MagicMock())
+        mocker.patch.object(main_mod.signal, "signal")
+        bot_cls = mocker.patch.object(main_mod, "Bot")
+        main_mod.main()
+        return bot_cls.call_args.kwargs["config"].risk
+
+    def test_risk_from_env_file(self, mocker, tmp_path, monkeypatch) -> None:
+        monkeypatch.delenv("RISK", raising=False)
+        r = self._run(mocker, ["--bot", "m1"], tmp_path, monkeypatch, "RISK=5%\n")
+        assert r.risk_pct == pytest.approx(0.05)
+        monkeypatch.delenv("RISK", raising=False)
+
+    def test_command_overrides_env_file(self, mocker, tmp_path, monkeypatch) -> None:
+        monkeypatch.delenv("RISK", raising=False)
+        r = self._run(mocker, ["--bot", "m1", "--risk", "100"], tmp_path, monkeypatch, "RISK=5%\n")
+        assert r.risk_pct is None and r.risk_per_trade == 100.0
+        monkeypatch.delenv("RISK", raising=False)
+
+    def test_bad_value_stops_with_message(self, mocker, tmp_path, monkeypatch) -> None:
+        monkeypatch.delenv("RISK", raising=False)
+        with pytest.raises(SystemExit, match="isn't valid"):
+            self._run(mocker, ["--bot", "m1", "--risk", "lots"], tmp_path, monkeypatch)
+
+    def test_m5_with_risk_refused(self, mocker) -> None:
+        mocker.patch.object(sys, "argv", ["bot.main", "--risk", "5%"])
+        mocker.patch.object(main_mod, "load_dotenv")
+        with pytest.raises(SystemExit, match="M1 bot only"):
+            main_mod.main()
