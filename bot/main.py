@@ -2602,6 +2602,10 @@ def main() -> None:
         "--bot", choices=sorted(ENV_FILES), default="m5",
         help="which bot to run: m5 (default, uses .env) or m1 (uses .env.m1)",
     )
+    parser.add_argument(
+        "--risk", default=None,
+        help="M1 bot only: 10%%, 5%% or 100 (overrides RISK= in .env.m1)",
+    )
     args = parser.parse_args()
 
     env_file = ENV_FILES[args.bot]
@@ -2616,7 +2620,16 @@ def main() -> None:
                 "Supabase details."
             )
         load_dotenv(path, override=True)
-    loop_config, pipeline_config = build_profile(args.bot)
+    if args.bot == "m5":
+        if args.risk is not None:
+            raise SystemExit("--risk is for the M1 bot only; the M5 bot stays at £100 a trade.")
+        risk = None
+    else:
+        risk = args.risk or os.environ.get("RISK") or None
+    try:
+        loop_config, pipeline_config = build_profile(args.bot, risk)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
     bot = Bot(
         mt5=MT5Connector.from_env(),
         supabase=SupabaseLogger.from_env(),

@@ -56,7 +56,7 @@ account and its own Supabase project, so they never see each other's trades.
 | Zones | M5, 3 pt minimum | M1, 1 pt minimum |
 | Direction | M15 trend, fresh H1 zone exception | M5 trend, fresh M15 zone exception |
 | Close exit | M5 candle close beyond the zone | M1 candle close beyond the zone |
-| Risk | £100 a trade, 2 losses a day, -£300 cap | 10% of balance a trade, 2 losses a day, 30% cap |
+| Risk | £100 a trade, 2 losses a day, -£300 cap | Switchable, always 2 losses a day: `RISK=10%` (default, 30% daily cap), `RISK=5%` (15% cap) or `RISK=100` (£100 a trade, -£300 cap). Set it in `.env.m1`, or override for one run with `python -m bot.main --bot m1 --risk 5%`. The startup log shows which one is on. |
 | After TP1 | 75% closes, 25% trails 4 pts | 50% closes, 50% trails 2 pts |
 | Supabase | M5 bot project | M1 bot project (`nvkwnpesedzwnxewuczn`) |
 
