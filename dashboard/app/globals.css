@@ -152,16 +152,17 @@ h3 { font-size: 10px; letter-spacing: 2px; color: var(--gold); margin: 14px 0 7p
 .ov.top { z-index: 20; }
 .toast { position: fixed; left: 50%; bottom: max(20px, env(safe-area-inset-bottom)); transform: translateX(-50%); background: #1a1712; border: 1px solid var(--gold); color: var(--gold2); padding: 9px 14px; border-radius: 12px; font-size: 12px; z-index: 30; max-width: 90vw; }
 
-/* login */
+/* login (sized from the screen, so it's big even in Chrome's "Desktop site" mode) */
 .login { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; }
-.login-logo { width: 84px; height: 84px; border-radius: 50%; box-shadow: 0 0 0 1px #3a3020; margin-bottom: 14px; }
-.login-sub { color: var(--muted); font-size: 12px; letter-spacing: 1.5px; margin: 8px 0 18px; text-transform: uppercase; }
-.pin-dots { display: flex; gap: 16px; margin-bottom: 10px; }
-.pin-dots span { width: 14px; height: 14px; border-radius: 50%; border: 1px solid var(--gold); }
+.login-logo { width: min(34vw, 16vh); height: min(34vw, 16vh); border-radius: 50%; box-shadow: 0 0 0 1px #3a3020; margin-bottom: 18px; }
+.login .brand { font-size: min(7.5vw, 3.4vh); letter-spacing: 3px; }
+.login-sub { color: var(--muted); font-size: min(4vw, 1.7vh); letter-spacing: 2px; margin: 1vh 0 2.4vh; text-transform: uppercase; }
+.pin-dots { display: flex; gap: min(6vw, 2.8vh); margin-bottom: 1.2vh; }
+.pin-dots span { width: min(5vw, 2.3vh); height: min(5vw, 2.3vh); border-radius: 50%; border: 2px solid var(--gold); }
 .pin-dots span.on { background: var(--gold2); }
-.login-msg { min-height: 18px; font-size: 12px; color: #ff9a9a; text-align: center; margin: 4px 0 14px; max-width: 280px; }
-.pad { display: grid; grid-template-columns: repeat(3, 72px); gap: 14px; }
-.pad button { width: 72px; height: 72px; border-radius: 50%; border: 1px solid #3a3020; background: linear-gradient(180deg, #161514, #0b0b0b); font-size: 24px; font-weight: 500; }
+.login-msg { min-height: 2.4vh; font-size: min(3.8vw, 1.6vh); color: #ff9a9a; text-align: center; margin: .6vh 0 2vh; max-width: 80vw; line-height: 1.4; }
+.pad { display: grid; grid-template-columns: repeat(3, min(24vw, 11vh)); gap: min(5vw, 2.4vh); }
+.pad button { width: min(24vw, 11vh); height: min(24vw, 11vh); border-radius: 50%; border: 1px solid #3a3020; background: linear-gradient(180deg, #161514, #0b0b0b); font-size: min(9vw, 4.2vh); font-weight: 500; }
 .pad button:active { background: #2a2416; }
 
 @media (min-width: 700px) {
