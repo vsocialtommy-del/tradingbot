@@ -123,6 +123,7 @@ def mock_supabase(mocker: MockerFixture) -> MagicMock:
         "kill_switch": False, "pause_until": None,
     }.get(key, None)
     m.get_news_events_in_window.return_value = []
+    m.get_config_values.return_value = {}  # no dashboard risk settings
     m.log_zone.return_value = {"id": str(uuid4())}
     m.log_setup.return_value = {"id": str(uuid4())}
     # Empty by default: no zones to dedup against, no zones to scan
@@ -482,32 +483,45 @@ class TestRunIterationActiveSetups:
 
 
 class TestPauseGating:
-    def test_kill_switch_blocks_strategy_pipeline(
+    def test_kill_switch_keeps_finding_zones_but_blocks_placement(
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mock_supabase: MagicMock, mocker: MockerFixture,
     ) -> None:
+        # Nov 2026 dashboard: "Off" = no new trades. Zones keep updating
+        # (so the dashboard shows the right next zones and it can switch
+        # straight back on); only placement stops.
         b, mgrs = bot
         b.state.kill_switch = True
-        # Strategy pipeline shouldn't run; OHLC fetch shouldn't either.
-        # Force config refresh skip.
         b.state.last_config_refresh = NOW
-
-        # Force has_new_m5_close branch to be reachable (would be if it ran).
-        run_pipeline = mocker.patch("bot.main.run_strategy_pipeline")
+        run_pipeline = mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        pending = mocker.patch.object(b, "_try_place_pending")
         b.run_iteration(NOW)
-        run_pipeline.assert_not_called()
+        run_pipeline.assert_called_once()
+        pending.assert_not_called()
 
-    def test_pause_until_in_future_blocks_strategy_pipeline(
+    def test_pause_until_in_future_blocks_placement(
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mocker: MockerFixture,
     ) -> None:
         b, _ = bot
         b.state.pause_until = NOW + timedelta(minutes=5)
         b.state.last_config_refresh = NOW
-
-        run_pipeline = mocker.patch("bot.main.run_strategy_pipeline")
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        pending = mocker.patch.object(b, "_try_place_pending")
         b.run_iteration(NOW)
-        run_pipeline.assert_not_called()
+        pending.assert_not_called()
+
+    def test_kill_switch_still_cancels_dead_zone_layers(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        b, _ = bot
+        b.state.kill_switch = True
+        b.state.last_config_refresh = NOW
+        death = mocker.patch.object(b, "_run_zone_death_pass")
+        b.run_iteration(NOW)
+        if b.config.enable_zone_death_cancel:
+            death.assert_called_once()
 
     def test_pause_until_in_past_does_not_block(
         self, bot: tuple[Bot, dict[str, MagicMock]],
@@ -4065,3 +4079,66 @@ class TestBadTicks:
         mgrs["entry_trigger"].check_live.assert_not_called()
         l2.assert_not_called()
         pending.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Dashboard (Nov 2026): status row, live risk settings
+# --------------------------------------------------------------------------- #
+
+
+class TestDashboard:
+    def test_status_has_account_today_and_settings(self, bot) -> None:
+        from bot.risk.xautism_risk import DailyRisk, RiskVerdict
+        b, _ = bot
+        b.mt5.get_account_info.return_value = {
+            "login": 123, "currency": "GBP", "balance": 10421.64, "equity": 10400.0,
+        }
+        b.daily_risk.last = RiskVerdict(
+            False, None, DailyRisk("2026-11-10", -98.43, 0.0, 2, 1, 1),
+        )
+        data = b._dashboard_status(NOW, bid=4020.5, ask=4020.6)
+        assert data["account"]["balance"] == 10421.64
+        assert data["today"]["wins"] == 1 and data["today"]["losses"] == 1
+        assert data["today"]["realised"] == -98.43
+        assert data["settings"]["max_losses"] == b.config.risk.max_losses_per_day
+        assert data["settings"]["from_dashboard"] is False
+        assert data["spread"] == 0.1
+        assert data["next_buy"] is None and data["next_sell"] is None
+
+    def test_status_survives_mt5_errors(self, bot) -> None:
+        b, _ = bot
+        b.mt5.get_account_info.side_effect = RuntimeError("IPC send failed")
+        b.mt5.get_open_positions.side_effect = RuntimeError("IPC send failed")
+        data = b._dashboard_status(NOW, bid=4020.5, ask=4020.6)
+        assert data["account"] is None and data["open_positions"] == []
+
+    def test_dashboard_pass_writes_status_and_never_raises(self, bot, mock_supabase) -> None:
+        b, _ = bot
+        b.mt5.get_account_info.return_value = {"balance": 1.0, "equity": 1.0}
+        b.mt5.get_deals.return_value = []
+        b._run_dashboard_pass(NOW, bid=1900.0, ask=1900.1)
+        tables = [c.args[0] for c in mock_supabase.upsert_rows.call_args_list]
+        assert "bot_status" in tables
+        # A broken Supabase write must not stop the loop.
+        mock_supabase.upsert_rows.side_effect = RuntimeError("boom")
+        b.state.last_dashboard_status = None
+        b._run_dashboard_pass(NOW + timedelta(minutes=1), bid=1900.0, ask=1900.1)
+
+    def test_live_risk_from_dashboard_then_back_to_default(self, bot, mock_supabase) -> None:
+        b, _ = bot
+        base = b.config.risk
+        mock_supabase.get_config_values.return_value = {"risk": "0.5%", "max_losses": 4}
+        b._refresh_live_risk()
+        assert b.config.risk.max_losses_per_day == 4
+        assert b.config.risk.risk_pct == pytest.approx(0.005)
+        assert b.config.risk.max_daily_loss_pct == pytest.approx(0.025)  # (4+1) x 0.5%
+        mock_supabase.get_config_values.return_value = {"risk": None, "max_losses": None}
+        b._refresh_live_risk()
+        assert b.config.risk == base
+
+    def test_bad_dashboard_risk_is_ignored(self, bot, mock_supabase) -> None:
+        b, _ = bot
+        base = b.config.risk
+        mock_supabase.get_config_values.return_value = {"risk": "lots", "max_losses": 2}
+        b._refresh_live_risk()
+        assert b.config.risk == base

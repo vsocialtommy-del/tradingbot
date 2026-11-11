@@ -101,6 +101,16 @@ class TestSummariseDay:
         d = summarise_day(deals, [], magic=MAGIC, day_start=DAY_START, trading_day="x")
         assert d.realised == 0.0 and d.losing_trades == 0
 
+    def test_wins_counted_breakeven_is_neither(self) -> None:
+        deals = [
+            deal(1, DEAL_ENTRY_IN, comment="s=aaaaaaaa"), deal(1, DEAL_ENTRY_OUT, profit=40.0),
+            deal(2, DEAL_ENTRY_IN, comment="s=bbbbbbbb"), deal(2, DEAL_ENTRY_OUT, profit=0.0),
+            deal(3, DEAL_ENTRY_IN, comment="s=cccccccc"), deal(3, DEAL_ENTRY_OUT, profit=-90.0),
+            deal(4, DEAL_ENTRY_IN, comment="s=dddddddd"), deal(4, DEAL_ENTRY_OUT, profit=12.0),
+        ]
+        d = summarise_day(deals, [], magic=MAGIC, day_start=DAY_START, trading_day="x")
+        assert (d.closed_trades, d.winning_trades, d.losing_trades) == (4, 2, 1)
+
 
 class TestCheckRisk:
     cfg = RiskConfig()

@@ -119,6 +119,7 @@ class DailyRisk:
     floating: float
     closed_trades: int
     losing_trades: int
+    winning_trades: int = 0  # net above zero; breakevens count as neither
 
     @property
     def total(self) -> float:
@@ -204,6 +205,7 @@ def summarise_day(
         floating=round(floating, 2),
         closed_trades=len(closed),
         losing_trades=sum(1 for v in closed.values() if v < 0),
+        winning_trades=sum(1 for v in closed.values() if v > 0),
     )
 
 
@@ -231,6 +233,8 @@ class DailyRiskTracker:
         self._cache_seconds = cache_seconds
         self._lookback = timedelta(days=lookback_days)
         self._cached: tuple[float, RiskVerdict] | None = None
+        self.last: RiskVerdict | None = None
+        """Latest verdict (for the dashboard status)."""
         self._known: dict[int, str] = {}
         self._offset = timedelta(0)
         """Broker server clock minus real UTC. MT5 stamps deals in server
@@ -272,8 +276,18 @@ class DailyRiskTracker:
         )
         verdict = check_risk(daily, config)
         self._cached = (mono, verdict)
+        self.last = verdict
         return verdict
 
+
+    @property
+    def known(self) -> dict[int, str]:
+        return dict(self._known)
+
+    @property
+    def offset(self) -> timedelta:
+        """Broker server clock minus UTC (last good reading)."""
+        return self._offset
 
     def _update_offset(self, now: datetime) -> None:
         """Server clock offset from the latest tick, to the nearest hour.
