@@ -77,3 +77,31 @@ trade at a time, news filter, spread filter) is the same.
    project's service_role key.
 5. Start it in a new Command Prompt: `python -m bot.main --bot m1`. The
    first log lines say `=== M1 bot ===` and list the settings.
+
+## Running both bots with the dashboard supervisor (Nov 2026)
+
+Double-click **`start_bots.bat`**. It does a `git pull`, then starts the
+supervisor, which runs the M5 and M1 bots for you and carries out the
+phone dashboard's buttons.
+
+- The bots have no windows of their own. To watch one, double-click
+  `watch_m5.bat` or `watch_m1.bat` (shows `logs/m5.log` / `logs/m1.log`
+  live). Anything a bot prints when it crashes is in
+  `logs/m5.console.log` / `logs/m1.console.log`.
+- **Close the supervisor window (or Ctrl+C in it) and both bots stop.**
+  Open trades and pending orders stay in MT5 as they are, same as Ctrl+C
+  in a bot window.
+- A bot that crashes is started again after 10 s, then 20 s, 40 s... up
+  to 5 minutes between tries.
+- Dashboard buttons: **Update** = git pull (and pip install if
+  `requirements.txt` changed) then restart both bots. **Restart** /
+  **Stop** / **Start** = just that bot. A bot stopped from the dashboard
+  stays stopped until you press Start (or double-click `start_bots.bat`
+  again). Buttons pressed while the laptop was off are ignored after 10
+  minutes.
+- Each bot only runs once: if it's already running in an old window, the
+  new copy refuses to start and the supervisor waits until you close the
+  old window, then takes over within a minute. So close the old
+  `start_m5_bot.bat` / `start_m1_bot.bat` windows first. Those two still
+  work on their own if you ever want a bot in its own window.
+- MT5 still needs to be open and logged in for each bot, as before.
