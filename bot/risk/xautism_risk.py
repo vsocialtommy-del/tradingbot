@@ -305,6 +305,14 @@ class DailyRiskTracker:
             if new != self._offset:
                 logger.info(f"risk: broker server clock is UTC{hours:+d}h")
             self._offset = new
+            self._offset_known = True
+
+    def refresh_offset(self, now: datetime) -> bool:
+        """Read the broker clock offset now. True once a good reading has
+        been taken (it can't be read from a stale tick, e.g. at the
+        weekend)."""
+        self._update_offset(now)
+        return getattr(self, "_offset_known", False)
 
 
 def _floor(value: float, step: float) -> float:

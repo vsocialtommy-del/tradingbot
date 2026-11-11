@@ -27,12 +27,14 @@ export async function GET(req: NextRequest) {
     .range(0, 9999);
   if (error) return fail(error.message, 500);
 
+  // One trade = one setup, counted on the day its last position closed
+  // (a runner that closes after the 22:00 reset doesn't split it in two).
   const setups = new Map<string, { day: string; net: number }>();
   for (const r of (data ?? []) as Row[]) {
-    const k = `${r.trading_day}|${r.setup_key}`;
-    const s = setups.get(k) ?? { day: r.trading_day, net: 0 };
+    const s = setups.get(r.setup_key) ?? { day: r.trading_day, net: 0 };
     s.net += Number(r.profit);
-    setups.set(k, s);
+    if (r.trading_day > s.day) s.day = r.trading_day;
+    setups.set(r.setup_key, s);
   }
   const days: Record<string, { pnl: number; trades: number; wins: number; losses: number }> = {};
   for (const s of setups.values()) {

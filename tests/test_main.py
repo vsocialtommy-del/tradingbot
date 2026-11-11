@@ -4142,3 +4142,29 @@ class TestDashboard:
         mock_supabase.get_config_values.return_value = {"risk": "lots", "max_losses": 2}
         b._refresh_live_risk()
         assert b.config.risk == base
+
+
+class TestCalendarSyncClock:
+    """Deal times are broker time: never sync before the offset is known."""
+
+    def test_waits_for_broker_clock_then_backfills(self, bot, mock_supabase) -> None:
+        b, _ = bot
+        b.mt5.get_deals.return_value = []
+        # Stale tick (weekend): offset can't be read -> nothing synced.
+        b.mt5.get_current_price.return_value = {
+            "bid": 1.0, "ask": 1.1, "time": NOW - timedelta(days=2, minutes=7), "time_msc": 0,
+        }
+        b._sync_closed_trades(NOW)
+        b.mt5.get_deals.assert_not_called()
+        # Live tick 2 h ahead of UTC: offset known -> first sync is the 60 day backfill.
+        b.mt5.get_current_price.return_value = {
+            "bid": 1.0, "ask": 1.1, "time": NOW + timedelta(hours=2), "time_msc": 0,
+        }
+        b._sync_closed_trades(NOW)
+        since, _until = b.mt5.get_deals.call_args.args
+        assert b.daily_risk.offset == timedelta(hours=2)
+        assert since == NOW - timedelta(days=b.config.dashboard_backfill_days) + timedelta(hours=2)
+        # Later passes only look back 2 days.
+        b._sync_closed_trades(NOW)
+        since, _until = b.mt5.get_deals.call_args.args
+        assert since == NOW - timedelta(days=2) + timedelta(hours=2)
