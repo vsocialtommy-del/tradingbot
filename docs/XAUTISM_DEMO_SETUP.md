@@ -80,9 +80,10 @@ trade at a time, news filter, spread filter) is the same.
 
 ## Running both bots with the dashboard supervisor (Nov 2026)
 
-Double-click **`start_bots.bat`**. It does a `git pull`, then starts the
-supervisor, which runs the M5 and M1 bots for you and carries out the
-phone dashboard's buttons.
+Double-click **`start_bots.bat`**. It does a `git pull`, then opens the
+supervisor with **both bots stopped**. Press **Start** on each bot in the
+phone dashboard to run it. Keep the supervisor window open: it's what
+carries out the dashboard's buttons (and runs the bots).
 
 - The bots have no windows of their own. To watch one, double-click
   `watch_m5.bat` or `watch_m1.bat` (shows `logs/m5.log` / `logs/m1.log`

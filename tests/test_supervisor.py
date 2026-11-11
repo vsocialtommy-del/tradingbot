@@ -337,6 +337,15 @@ class TestStateFile:
         assert sv.load_wanted(resume=True) == {"m5": False, "m1": True}
         assert sv.load_wanted(resume=False) == {"m5": True, "m1": True}
 
+    def test_stopped_start_waits_for_the_dashboard(self) -> None:
+        assert sv.load_wanted(resume=False, stopped=True) == {"m5": False, "m1": False}
+        b = _bot(wanted=False)
+        b.check()
+        assert b.proc is None                    # nothing starts by itself
+        sup = Supervisor(bots={"m5": b}, channels={"m5": None})
+        ok, out = sup.handle("m5", {"command": "start"})
+        assert ok and b.running and "started" in out
+
 
 class TestSingleInstanceLock:
     def test_second_copy_refused(self, tmp_path) -> None:

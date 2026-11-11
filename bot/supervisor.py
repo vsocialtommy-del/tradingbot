@@ -472,8 +472,11 @@ class Supervisor:
         return RELAUNCH_EXIT if self.relaunch else 0
 
 
-def load_wanted(resume: bool) -> dict[str, bool]:
-    wanted = {k: True for k in BOTS}
+def load_wanted(resume: bool, stopped: bool = False) -> dict[str, bool]:
+    """Which bots to run at startup. ``stopped``: none (wait for Start on
+    the dashboard). ``resume``: as they were before the supervisor
+    restarted itself after an update."""
+    wanted = {k: not stopped for k in BOTS}
     if resume:
         try:
             saved = json.loads(STATE_FILE.read_text())
@@ -487,6 +490,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="python -m bot.supervisor")
     parser.add_argument("--resume", action="store_true",
                         help="keep bots stopped that were stopped from the dashboard")
+    parser.add_argument("--stopped", action="store_true",
+                        help="start with both bots stopped; start them from the dashboard")
     parser.add_argument("--only", choices=sorted(BOTS), action="append",
                         help="run only this bot (can repeat)")
     args = parser.parse_args()
@@ -494,7 +499,7 @@ def main() -> None:
     os.chdir(ROOT)
     logger.add("logs/supervisor.log", level="INFO", rotation="5 MB", retention=3,
                encoding="utf-8")
-    wanted = load_wanted(args.resume)
+    wanted = load_wanted(args.resume, stopped=args.stopped)
     keys = args.only or list(BOTS)
     bots = {k: BotProcess(k, BOTS[k][0], wanted=wanted[k]) for k in keys}
     channels = {}
@@ -508,7 +513,8 @@ def main() -> None:
     sup.save_state()
     logger.info(
         "supervisor running: " + ", ".join(
-            f"{b.label} {'on' if b.wanted else 'kept stopped'}" for b in bots.values()
+            f"{b.label} {'on' if b.wanted else 'stopped (press Start on the dashboard)'}"
+            for b in bots.values()
         ) + ". Ctrl+C here stops both bots. Logs are in the logs folder."
     )
     sys.exit(sup.run())
