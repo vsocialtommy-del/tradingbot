@@ -35,6 +35,10 @@ type BotRow = {
 };
 type DayCell = { pnl: number; trades: number; wins: number; losses: number };
 type Month = { days: Record<string, DayCell>; total: number; trades: number; wins: number; losses: number };
+type CalEvent = { time: string; title: string; impact: "High" | "Medium" | "Low" | "Holiday"; forecast: string | null; previous: string | null };
+type Headline = { id: string; title: string; summary: string | null; time: string; link: string | null };
+type News = { calendar: CalEvent[]; calendarError: string | null; headlines: Headline[]; headlinesError: string | null };
+
 type DayTrade = {
   direction: string; open: string; close: string; profit: number;
   layers: { volume: number; open: number | null; close: number | null; profit: number }[];
@@ -96,6 +100,7 @@ export default function Dashboard() {
   const [calOpen, setCalOpen] = useState<"M5" | "M1" | null>(null);
   const [months, setMonths] = useState<Record<string, Month>>({});
   const [toast, setToast] = useState<string | null>(null);
+  const [news, setNews] = useState<News | null>(null);
   const [confirm, setConfirm] = useState<{ text: string; ok: string; danger?: boolean; run: () => Promise<void> } | null>(null);
   const [pendingToggle, setPendingToggle] = useState<Record<string, boolean>>({});
 
@@ -168,6 +173,13 @@ export default function Dashboard() {
     const t = setInterval(go, 60_000);
     return () => clearInterval(t);
   }, [thisMonth, loadMonth]);
+
+  useEffect(() => {
+    const go = () => { api("/api/news").then(setNews).catch(() => { /* keep last */ }); };
+    go();
+    const t = setInterval(go, 60_000);
+    return () => clearInterval(t);
+  }, [api]);
 
   const serverNow = now + skew;
 
@@ -246,6 +258,8 @@ export default function Dashboard() {
             onOpen={() => setCalOpen(b.bot)} />
         ))}
       </div>
+
+      <UsdNews news={news} now={serverNow} />
 
       {openBot && (
         <BotPopup b={openBot} now={serverNow} trading={pendingToggle[openBot.bot] ?? !openBot.killSwitch}
@@ -626,6 +640,86 @@ function BigCal({ bot, start, months, load, api, currency, today, onClose }: {
             )}
           </>
         )}
+      </div>
+    </>
+  );
+}
+
+// ------------------------------------------------------------------ USD news
+
+function Folder({ impact }: { impact: CalEvent["impact"] }) {
+  return <span className={`folder ${impact.toLowerCase()}`} title={`${impact} impact`} />;
+}
+
+const ago = (iso: string, now: number) => {
+  const m = Math.max(0, Math.round((now - Date.parse(iso)) / 60_000));
+  return m < 1 ? "just now" : m < 60 ? `${m} min ago` : `${Math.floor(m / 60)} hr ago`;
+};
+const until = (iso: string, now: number) => {
+  const m = Math.max(0, Math.round((Date.parse(iso) - now) / 60_000));
+  return m < 60 ? `in ${m} min` : `in ${Math.floor(m / 60)}h ${m % 60}m`;
+};
+
+function UsdNews({ news, now }: { news: News | null; now: number }) {
+  const today = londonDate();
+  const events = (news?.calendar ?? []).filter(
+    (e) => new Date(e.time).toLocaleDateString("en-CA", { timeZone: TZ }) >= today,
+  );
+  const days = new Map<string, CalEvent[]>();
+  for (const e of events) {
+    const d = new Date(e.time).toLocaleDateString("en-CA", { timeZone: TZ });
+    days.set(d, [...(days.get(d) ?? []), e]);
+  }
+  const next = events.find((e) => Date.parse(e.time) > now && e.impact !== "Holiday");
+  const fresh = (h: Headline) => now - Date.parse(h.time) < 15 * 60_000;
+
+  return (
+    <>
+      <h2 className="sec">USD NEWS · THIS WEEK</h2>
+      <div className="card news">
+        {!news ? <div className="meta">Loading…</div> : events.length === 0 ? (
+          <div className="meta">{news.calendarError ? `Can't load the calendar right now (${news.calendarError})` : "No more USD events this week"}</div>
+        ) : [...days.entries()].map(([d, list]) => (
+          <div key={d}>
+            <div className={`news-day ${d === today ? "today" : ""}`}>
+              {new Date(`${d}T12:00:00Z`).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" }).toUpperCase()}
+              {d === today ? " · TODAY" : ""}
+            </div>
+            {list.map((e, i) => {
+              const past = Date.parse(e.time) <= now;
+              const isNext = next === e;
+              return (
+                <div key={i} className={`news-row ${past ? "past" : ""} ${isNext ? "next" : ""}`}>
+                  <span className="news-time">{hhmm(e.time)}</span>
+                  <Folder impact={e.impact} />
+                  <span className="news-title">
+                    {e.title}
+                    {isNext && <em> · {until(e.time, now)}</em>}
+                  </span>
+                  {(e.forecast || e.previous) && (
+                    <span className="news-fp">
+                      {e.forecast ? <>F {e.forecast}</> : null}{e.forecast && e.previous ? <br /> : null}{e.previous ? <>P {e.previous}</> : null}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        ))}
+        <p className="note" style={{ marginTop: 8 }}>Forex Factory, USD only, UK times. Red = high, orange = medium, yellow = low impact.</p>
+      </div>
+
+      <h2 className="sec">USD HEADLINES</h2>
+      <div className="news-heads">
+        {!news ? <div className="box">Loading…</div> : news.headlines.length === 0 ? (
+          <div className="box">{news.headlinesError ? `Can't load headlines right now (${news.headlinesError})` : "No USD headlines in the last 12 hours"}</div>
+        ) : news.headlines.map((h) => (
+          <a key={h.id} className={`head ${fresh(h) ? "fresh" : ""}`} href={h.link ?? undefined} target="_blank" rel="noreferrer">
+            <div className="head-title">{fresh(h) && <span className="badge">NEW</span>}{h.title}</div>
+            <div className="meta">FinancialJuice · {ago(h.time, now)} · {hhmm(h.time)} UK</div>
+            {h.summary && <div className="head-sum">{h.summary}</div>}
+          </a>
+        ))}
       </div>
     </>
   );
