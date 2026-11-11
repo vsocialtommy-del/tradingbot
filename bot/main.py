@@ -68,7 +68,7 @@ from __future__ import annotations
 import os
 import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal
@@ -100,6 +100,14 @@ from bot.exits.runner_trail import RunnerTrailManager
 from bot.exits.trailing_stop_manager import TrailingStopManager
 from bot.exits.zone_exit_manager import ZoneExitManager
 from bot.signals.next_signal_writer import NextSignalWriter
+from bot.profiles import live_risk, risk_label
+from bot.dashboard.bridge import (
+    DashboardBridge,
+    ZoneView,
+    build_closed_trades,
+    calendar_day,
+    pick_closest_zones,
+)
 from bot.filters.forex_factory import ForexFactoryCalendar
 from bot.filters.news_filter import NewsFilter, NewsFilterConfig
 from bot.logging.supabase_logger import (
@@ -231,6 +239,12 @@ class BotLoopConfig:
     detect_closed_seconds: int = 30
     reconcile_seconds: int = 300
     heartbeat_seconds: int = 300
+    dashboard_status_seconds: float = 10.0
+    """How often the bot writes its status row for the phone dashboard."""
+    dashboard_trades_seconds: float = 60.0
+    """How often closed positions are copied for the dashboard calendar."""
+    dashboard_backfill_days: int = 60
+    """How far back the calendar is filled on startup."""
 
     max_simultaneous_setups: int = 1
     """Nov 2026 (XAUTISM): one trade at a time (was 3)."""
@@ -317,6 +331,8 @@ class BotState:
     last_detect_closed: datetime | None = None
     last_reconcile: datetime | None = None
     last_heartbeat: datetime | None = None
+    last_dashboard_status: datetime | None = None
+    last_dashboard_trades: datetime | None = None
     last_m5_bar_time: pd.Timestamp | None = None
     kill_switch: bool = False
     pause_until: datetime | None = None
@@ -402,6 +418,13 @@ class Bot:
             self.config.xautism_entries, symbol=self.config.symbol,
         )
         self.daily_risk = DailyRiskTracker(mt5, symbol=self.config.symbol)
+        # Phone dashboard (Nov 2026): status / calendar / live settings.
+        self.dashboard = DashboardBridge(supabase, self.config.bot_name)
+        self._base_risk = self.config.risk
+        self._live_risk_raw: tuple[Any, Any] = (None, None)
+        self._deferred_seen: dict[tuple[str, float, float], float] = {}
+        self._started_at = datetime.now(timezone.utc)
+        self._version = _git_version()
         if self.config.news_source == "forexfactory":
             self.news_source = ForexFactoryCalendar()
             self.news_filter = NewsFilter(
@@ -549,6 +572,7 @@ class Bot:
         now = datetime.now(timezone.utc)
         self.state.last_reconcile = now
         self._refresh_runtime_config(now)
+        self._sync_closed_trades(now, days=self.config.dashboard_backfill_days)
 
     def _hydrate_persisted_zone_cache(self) -> None:
         """Load every existing zone row → key cache.
@@ -811,9 +835,8 @@ class Bot:
                 self._news_closed.clear()
 
         placement_blocked = False
-        if self._is_paused(now):
-            placement_blocked = True  # skip new setups; existing managed above
-        else:
+        paused = self._is_paused(now)
+        if True:  # zones keep updating while switched off; only placement stops
             daily_halt_result = (
                 self._check_daily_halt(now)
                 if self.config.enable_balance_pct_halt else _NotHalted()
@@ -821,6 +844,8 @@ class Bot:
             placement_blocked = daily_halt_result.is_halted or bool(
                 news_check is not None and news_check.is_blocked
             )
+            if paused:
+                placement_blocked = True  # switched off: no new trades
             # XAUTISM risk gates: daily £ loss + two losses and done.
             # Zone detection keeps running; only new trades are blocked.
             if self._xautism_risk_on():
@@ -864,7 +889,7 @@ class Bot:
         # underlying body-cross count only changes on M5 close (the
         # df we use is the post-M5-close snapshot), so per-tick is
         # cheap repeated work that catches state changes promptly.
-        if self.config.enable_zone_death_cancel and not self._is_paused(now):
+        if self.config.enable_zone_death_cancel:
             try:
                 self._run_zone_death_pass()
             except Exception:
@@ -894,6 +919,9 @@ class Bot:
         if self._should_heartbeat(now):
             self._emit_heartbeat(now)
             self.state.last_heartbeat = now
+
+        # 8. Phone dashboard (never affects trading).
+        self._run_dashboard_pass(now, bid=bid, ask=ask)
 
     # ------------------------------------------------------------------ #
     # Cadence helpers
@@ -942,7 +970,36 @@ class Bot:
                 "config refresh: pause_until read failed (using last value)"
             )
 
+        self._refresh_live_risk()
         self.state.last_config_refresh = now
+
+    def _refresh_live_risk(self) -> None:
+        """Risk / max losses set on the dashboard (bot_config ``risk`` and
+        ``max_losses``; null = the bot's own setting). A bad value is
+        logged and ignored, the last good settings stay."""
+        try:
+            vals = self.supabase.get_config_values(["risk", "max_losses"])
+        except Exception:
+            logger.debug("config refresh: dashboard risk settings not readable")
+            return
+        raw = (vals.get("risk"), vals.get("max_losses"))
+        if raw == getattr(self, "_live_risk_raw", (None, None)):
+            return
+        try:
+            new = live_risk(self._base_risk, *raw)
+        except ValueError as exc:
+            logger.warning(f"dashboard risk setting ignored: {exc}")
+            self._live_risk_raw = raw
+            return
+        self._live_risk_raw = raw
+        if new != self.config.risk:
+            self.config = replace(self.config, risk=new)
+            self.daily_risk.invalidate()
+            logger.info(
+                f"risk settings now: {risk_label(new)} per trade, "
+                f"max {new.max_losses_per_day} losses a day"
+                + (" (from the dashboard)" if raw != (None, None) else " (bot default)")
+            )
 
     def _is_paused(self, now: datetime) -> bool:
         """True iff kill_switch is on or ``now`` is before pause_until."""
@@ -1849,6 +1906,7 @@ class Bot:
         # ``_detect_gap_through`` check in order_manager; this gate
         # only covers the "not yet at zone" case.
         if zone.direction == "BUY" and bid > zone.top:
+            self._note_waiting_zone(zone)
             logger.info(
                 f"new setup deferred: BUY zone {zone.bottom:.2f}-"
                 f"{zone.top:.2f}, current bid {bid:.2f} above zone.top; "
@@ -1856,6 +1914,7 @@ class Bot:
             )
             return False
         if zone.direction == "SELL" and ask < zone.bottom:
+            self._note_waiting_zone(zone)
             logger.info(
                 f"new setup deferred: SELL zone {zone.bottom:.2f}-"
                 f"{zone.top:.2f}, current ask {ask:.2f} below zone.bottom; "
@@ -2242,6 +2301,139 @@ class Bot:
     # Heartbeat / observability
     # ------------------------------------------------------------------ #
 
+    # ------------------------------------------------------------------ #
+    # Phone dashboard (Nov 2026)
+    # ------------------------------------------------------------------ #
+
+    def _note_waiting_zone(self, zone: ValidatedZone) -> None:
+        """A zone that passed every check and is waiting for price."""
+        seen = getattr(self, "_deferred_seen", None)
+        if seen is not None:
+            seen[(zone.direction, round(float(zone.top), 2),
+                  round(float(zone.bottom), 2))] = time.monotonic()
+
+    def _waiting_zone_views(self, bid: float, ask: float) -> list[ZoneView]:
+        """Zones on the queue that were 'waiting for price' in the last
+        15 s (obscured / skipped ones never get marked)."""
+        df: pd.DataFrame | None = getattr(self, "_latest_ohlc", None)
+        seen = getattr(self, "_deferred_seen", {})
+        cutoff = time.monotonic() - 15.0
+        views: list[ZoneView] = []
+        for zone, _zid in list(self._pending_pipeline_zones):
+            key = (zone.direction, round(float(zone.top), 2), round(float(zone.bottom), 2))
+            if seen.get(key, 0.0) < cutoff:
+                continue
+            buy = zone.direction == "BUY"
+            entry = float(zone.top) if buy else float(zone.bottom)
+            sl = tp1 = None
+            if df is not None and len(df):
+                try:
+                    lv = compute_levels(zone, df, self.config.levels)
+                    entry, sl, tp1 = lv.entry, lv.sl, lv.tp1
+                except Exception:
+                    pass
+            dist = (bid - entry) if buy else (entry - ask)
+            views.append(ZoneView(zone.direction, float(zone.top), float(zone.bottom),
+                                  entry, sl, tp1, max(dist, 0.0)))
+        return views
+
+    def _dashboard_status(self, now: datetime, bid: float, ask: float) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "bot": self.config.bot_name,
+            "timeframe": self.config.ohlc_timeframe,
+            "version": getattr(self, "_version", None),
+            "started_at": getattr(self, "_started_at", now).isoformat(),
+            "pid": os.getpid(),
+            "trading_enabled": not self.state.kill_switch,
+            "paused_until": None if self.state.pause_until is None
+            else self.state.pause_until.isoformat(),
+            "bid": round(bid, 2),
+            "ask": round(ask, 2),
+            "spread": round(ask - bid, 2),
+        }
+        risk = self.config.risk
+        data["settings"] = {
+            "risk": risk_label(risk),
+            "risk_is_pct": risk.risk_pct is not None,
+            "max_losses": risk.max_losses_per_day,
+            "from_dashboard": getattr(self, "_live_risk_raw", (None, None)) != (None, None),
+            "runner": f"{int(round((1 - self.config.xautism_entries.runner_keep_frac) * 100))}/"
+                      f"{int(round(self.config.xautism_entries.runner_keep_frac * 100))}, "
+                      f"{self.config.xautism_entries.runner_trail_points:g} pt trail",
+        }
+        try:
+            acct = self.mt5.get_account_info()
+            data["account"] = {
+                "login": acct.get("login"),
+                "currency": acct.get("currency"),
+                "balance": round(float(acct.get("balance", 0.0)), 2),
+                "equity": round(float(acct.get("equity", 0.0)), 2),
+            }
+        except Exception:
+            data["account"] = None
+        verdict = getattr(self.daily_risk, "last", None)
+        daily = verdict.daily if verdict is not None else None
+        data["today"] = None if daily is None else {
+            "trading_day": calendar_day(now).isoformat(),
+            "realised": daily.realised,
+            "floating": daily.floating,
+            "trades": daily.closed_trades,
+            "wins": daily.winning_trades,
+            "losses": daily.losing_trades,
+            "blocked": bool(verdict.blocked),
+            "blocked_reason": verdict.reason,
+        }
+        try:
+            positions = self.mt5.get_open_positions(symbol=self.config.symbol)
+        except Exception:
+            positions = []
+        data["open_positions"] = [
+            {
+                "ticket": p.get("ticket"),
+                "direction": "BUY" if p.get("type") == 0 else "SELL",
+                "volume": p.get("volume"),
+                "entry": round(float(p.get("price_open", 0.0)), 2),
+                "sl": round(float(p.get("sl", 0.0) or 0.0), 2) or None,
+                "tp": round(float(p.get("tp", 0.0) or 0.0), 2) or None,
+                "profit": round(float(p.get("profit", 0.0)), 2),
+            }
+            for p in positions
+        ]
+        buy, sell = pick_closest_zones(self._waiting_zone_views(bid, ask))
+        data["next_buy"] = None if buy is None else buy.as_dict()
+        data["next_sell"] = None if sell is None else sell.as_dict()
+        return data
+
+    def _sync_closed_trades(self, now: datetime, *, days: float = 2.0) -> None:
+        """Copy closed positions from MT5 history for the calendar."""
+        if not hasattr(self, "dashboard"):
+            return
+        try:
+            offset = self.daily_risk.offset
+            since = now - timedelta(days=days) + offset
+            deals = self.mt5.get_deals(since, now + timedelta(days=1))
+            rows = build_closed_trades(
+                deals, bot=self.config.bot_name, magic=self.mt5.magic,
+                server_offset=offset, known=self.daily_risk.known,
+            )
+        except Exception:
+            logger.exception("dashboard: reading MT5 history failed (trading not affected)")
+            return
+        self.dashboard.sync_trades(rows)
+
+    def _run_dashboard_pass(self, now: datetime, *, bid: float, ask: float) -> None:
+        if not hasattr(self, "dashboard"):
+            return
+        try:
+            if _elapsed(self.state.last_dashboard_status, now) >= self.config.dashboard_status_seconds:
+                self.state.last_dashboard_status = now
+                self.dashboard.write_status(self._dashboard_status(now, bid, ask), now)
+            if _elapsed(self.state.last_dashboard_trades, now) >= self.config.dashboard_trades_seconds:
+                self.state.last_dashboard_trades = now
+                self._sync_closed_trades(now)
+        except Exception:
+            logger.exception("dashboard pass failed (trading not affected)")
+
     def _emit_heartbeat(self, now: datetime) -> None:
         try:
             balance = self.mt5.get_balance()
@@ -2394,6 +2586,20 @@ class Bot:
 # --------------------------------------------------------------------------- #
 # Module-level helpers
 # --------------------------------------------------------------------------- #
+
+
+def _git_version() -> str | None:
+    """Short git commit the bot is running (shown on the dashboard)."""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        return out.stdout.strip() or None
+    except Exception:
+        return None
 
 
 def _elapsed(last: datetime | None, now: datetime) -> float:
@@ -2639,6 +2845,14 @@ def main() -> None:
         loop_config, pipeline_config = build_profile(args.bot, risk, max_losses)
     except ValueError as e:
         raise SystemExit(str(e)) from None
+    # Log file (INFO and up) next to the code, one per bot, kept small.
+    try:
+        logger.add(
+            f"logs/{args.bot}.log", level="INFO", rotation="20 MB", retention=5,
+            enqueue=True, encoding="utf-8",
+        )
+    except Exception:
+        logger.warning("could not open the log file; logging to the window only")
     bot = Bot(
         mt5=MT5Connector.from_env(),
         supabase=SupabaseLogger.from_env(),
@@ -2652,6 +2866,8 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+    if hasattr(signal, "SIGBREAK"):  # Windows: how the supervisor stops a bot
+        signal.signal(signal.SIGBREAK, _handle_signal)
 
     bot.run()
 

@@ -75,6 +75,37 @@ def parse_risk(text: str, max_losses: int = M1_DEFAULT_MAX_LOSSES):
         ) from None
 
 
+def risk_label(cfg) -> str:
+    """How a RiskConfig reads on the dashboard: "1%" or "100"."""
+    if cfg.risk_pct is not None:
+        return f"{cfg.risk_pct * 100:g}%"
+    return f"{cfg.risk_per_trade:g}"
+
+
+def live_risk(base, risk=None, max_losses=None):
+    """Risk settings from the dashboard (``bot_config`` keys ``risk`` and
+    ``max_losses``) applied over the bot's own settings ``base``. Either
+    may be None (= keep the bot's own). Works for both bots. The daily cap
+    stays one trade more than the losses allowed. Raises ValueError on a
+    bad value."""
+    if (risk is None or str(risk).strip() == "") and max_losses in (None, ""):
+        return base
+    losses = (
+        parse_max_losses(max_losses) if max_losses not in (None, "")
+        else base.max_losses_per_day
+    )
+    text = risk if (risk is not None and str(risk).strip() != "") else risk_label(base)
+    pct, amount, daily, daily_pct = parse_risk(text, losses)
+    return replace(
+        base,
+        risk_pct=pct,
+        risk_per_trade=amount if amount is not None else base.risk_per_trade,
+        max_daily_loss=daily if daily is not None else base.max_daily_loss,
+        max_daily_loss_pct=daily_pct,
+        max_losses_per_day=losses,
+    )
+
+
 def build_profile(name: str, risk: str | None = None, max_losses=None):
     """Return ``(BotLoopConfig, StrategyPipelineConfig)`` for a bot.
 

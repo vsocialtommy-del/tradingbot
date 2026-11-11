@@ -529,6 +529,23 @@ class SupabaseLogger:
         )
         return result.data["value"]
 
+    def get_config_values(self, keys: list[str]) -> dict[str, Any]:
+        """``{key: value}`` for the keys that exist (missing keys left out)."""
+        result = (
+            self._client.table("bot_config")
+            .select("key,value")
+            .in_("key", keys)
+            .execute()
+        )
+        return {row["key"]: row["value"] for row in (result.data or [])}
+
+    def upsert_rows(
+        self, table: str, rows: list[dict[str, Any]], *, on_conflict: str,
+    ) -> None:
+        """Generic upsert (dashboard tables)."""
+        if rows:
+            self._client.table(table).upsert(rows, on_conflict=on_conflict).execute()
+
     # ---- bot_logs ----
     def log_event(
         self,
