@@ -2405,10 +2405,19 @@ class Bot:
         return data
 
     def _sync_closed_trades(self, now: datetime, *, days: float = 2.0) -> None:
-        """Copy closed positions from MT5 history for the calendar."""
+        """Copy closed positions from MT5 history for the calendar.
+
+        Deal times are broker server time, so nothing is sent until the
+        server clock offset is known (a 2 hour error put evening trades
+        on the next day). The first successful sync is the backfill."""
         if not hasattr(self, "dashboard"):
             return
         try:
+            if not self.daily_risk.refresh_offset(now):
+                logger.debug("dashboard: broker clock not known yet; calendar sync waits")
+                return
+            if not getattr(self, "_calendar_backfilled", False):
+                days = max(days, float(self.config.dashboard_backfill_days))
             offset = self.daily_risk.offset
             since = now - timedelta(days=days) + offset
             deals = self.mt5.get_deals(since, now + timedelta(days=1))
@@ -2420,6 +2429,8 @@ class Bot:
             logger.exception("dashboard: reading MT5 history failed (trading not affected)")
             return
         self.dashboard.sync_trades(rows)
+        if self.dashboard.available:
+            self._calendar_backfilled = True
 
     def _run_dashboard_pass(self, now: datetime, *, bid: float, ask: float) -> None:
         if not hasattr(self, "dashboard"):
