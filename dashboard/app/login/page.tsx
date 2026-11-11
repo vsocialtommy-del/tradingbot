@@ -57,7 +57,7 @@ export default function Login() {
 
   return (
     <main className="login">
-      <img src="/icons/icon-192.png" alt="" className="login-logo" />
+      <img src="/icons/logo-192.png" alt="" className="login-logo" />
       <h1 className="brand">XAU/TISM BOT</h1>
       <p className="login-sub">{locked ? "Locked" : "Enter your PIN"}</p>
       <div className="pin-dots">
