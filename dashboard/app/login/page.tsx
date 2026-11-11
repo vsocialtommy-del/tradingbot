@@ -27,6 +27,7 @@ export default function Login() {
       });
       const j = await res.json().catch(() => ({}));
       if (res.ok) {
+        try { sessionStorage.setItem("xb_open", "1"); } catch { /* storage blocked */ }
         window.location.replace("/");
         return;
       }

@@ -3,10 +3,11 @@
 //
 // Cookie = "<expiry ms>.<HMAC-SHA256(SESSION_SECRET, v1|expiry|PIN)>".
 // Putting the PIN in the signed text means changing DASHBOARD_PIN in
-// Vercel logs every phone out.
+// Vercel logs every phone out. The cookie only lives while the app is
+// open (no expiry date) and is never valid for more than 12 hours.
 
 export const COOKIE = "xb_session";
-export const SESSION_DAYS = 30;
+export const SESSION_HOURS = 12;
 
 const enc = new TextEncoder();
 
@@ -39,7 +40,7 @@ async function sign(exp: number): Promise<string> {
 }
 
 export async function makeToken(now = Date.now()): Promise<{ token: string; exp: number }> {
-  const exp = now + SESSION_DAYS * 24 * 3600 * 1000;
+  const exp = now + SESSION_HOURS * 3600 * 1000;
   return { token: `${exp}.${await sign(exp)}`, exp };
 }
 

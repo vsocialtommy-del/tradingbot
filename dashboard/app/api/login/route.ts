@@ -2,7 +2,7 @@ import { timingSafeEqual } from "crypto";
 import { NextResponse, type NextRequest } from "next/server";
 
 import { db } from "@/lib/db";
-import { COOKIE, SESSION_DAYS, authConfigured, makeToken } from "@/lib/session";
+import { COOKIE, authConfigured, makeToken } from "@/lib/session";
 
 export const dynamic = "force-dynamic";
 
@@ -54,15 +54,14 @@ export async function POST(req: NextRequest) {
 
   if (/^\d{4}$/.test(pin) && samePin(pin, process.env.DASHBOARD_PIN!)) {
     await sb.from("dashboard_auth").upsert({ id: 1, failed_attempts: 0, locked_until: null });
-    const { token, exp } = await makeToken(now);
+    const { token } = await makeToken(now);
     const res = NextResponse.json({ ok: true });
     res.cookies.set(COOKIE, token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
       sameSite: "lax",
       path: "/",
-      maxAge: SESSION_DAYS * 24 * 3600,
-      expires: new Date(exp),
+      // No maxAge / expires: a session cookie, gone when the app closes.
     });
     return res;
   }
