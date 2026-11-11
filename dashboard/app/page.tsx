@@ -139,6 +139,14 @@ export default function Dashboard() {
   }, [bots]);
 
   useEffect(() => {
+    // Locks when the app is closed: the PIN screen sets a flag in
+    // sessionStorage, which the phone wipes when the app is closed.
+    let open = true;
+    try { open = sessionStorage.getItem("xb_open") === "1"; } catch { /* storage blocked: rely on the cookie */ }
+    if (!open) {
+      void fetch("/api/logout", { method: "POST" }).finally(() => window.location.replace("/login"));
+      return;
+    }
     setNow(Date.now());
     void loadStatus();
     let st = setInterval(loadStatus, 5000);
@@ -201,7 +209,12 @@ export default function Dashboard() {
         <h1 className="brand">XAU/TISM BOT</h1>
         <p>2 BOTS · {netErr ? "NO CONNECTION" : "LIVE"} · {now ? new Date(now).toLocaleTimeString("en-GB", { timeZone: TZ, hour: "2-digit", minute: "2-digit" }) : "--:--"} UK</p>
       </div>
-      <button className="lock-btn" onClick={async () => { await fetch("/api/logout", { method: "POST" }); window.location.replace("/login"); }}>LOCK</button>
+      <button className="top-btn" disabled={!bots?.some((b) => b.configured)}
+        onClick={() => setConfirm({
+          text: "Pull the latest code from GitHub and restart BOTH bots on it? Open trades stay in MT5.",
+          ok: "Update",
+          run: sendCommand(bots?.find((b) => b.configured)?.bot ?? "M5", "update"),
+        })}>UPDATE</button>
     </header>
   );
 
@@ -399,9 +412,7 @@ function BotPopup({ b, now, trading, onClose, onToggle, onCommand, api, say, rel
           </button>
         </div>
 
-        <div className="btns">
-          <button className="btn primary" disabled={!b.configured}
-            onClick={() => onCommand("update", "Pull the latest code from GitHub and restart BOTH bots on it?")}>Update</button>
+        <div className="btns" style={{ gridTemplateColumns: "1fr 1fr" }}>
           <button className="btn" disabled={!b.configured}
             onClick={() => onCommand("restart", `Restart the ${b.bot} bot? Open trades stay in MT5.`)}>Restart</button>
           {st.running
