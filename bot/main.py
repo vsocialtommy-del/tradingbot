@@ -2588,6 +2588,36 @@ class Bot:
 # --------------------------------------------------------------------------- #
 
 
+ALREADY_RUNNING_EXIT = 75  # the supervisor knows this one: "close the old window"
+
+
+def _single_instance_lock(bot: str, folder: str = "logs"):
+    """Hold ``logs/<bot>.lock`` for the life of the process.
+
+    Returns the open file (keep a reference) or None if another process
+    has it. The OS drops the lock when the process ends, even on a crash,
+    so a stale file never blocks a restart."""
+    from pathlib import Path
+
+    try:
+        Path(folder).mkdir(exist_ok=True)
+        fh = open(Path(folder) / f"{bot}.lock", "a+")
+    except OSError:
+        return object()  # can't make the file: don't block trading over it
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
 def _git_version() -> str | None:
     """Short git commit the bot is running (shown on the dashboard)."""
     try:
@@ -2845,6 +2875,14 @@ def main() -> None:
         loop_config, pipeline_config = build_profile(args.bot, risk, max_losses)
     except ValueError as e:
         raise SystemExit(str(e)) from None
+    # One copy of each bot at a time: two would double every trade.
+    lock = _single_instance_lock(args.bot)
+    if lock is None:
+        logger.error(
+            f"The {args.bot.upper()} bot is already running (another window or "
+            "start_bots.bat). Close that one first; not starting a second copy."
+        )
+        raise SystemExit(ALREADY_RUNNING_EXIT)
     # Log file (INFO and up) next to the code, one per bot, kept small.
     try:
         logger.add(

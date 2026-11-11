@@ -26,6 +26,9 @@ CREATE TABLE IF NOT EXISTS bot_status (
   supervisor_seen_at TIMESTAMPTZ,
   process_running BOOLEAN
 );
+-- What the laptop supervisor last had to say ("already running in
+-- another window", "stopped by itself, restarting in 20s").
+ALTER TABLE bot_status ADD COLUMN IF NOT EXISTS supervisor_note TEXT;
 
 CREATE TABLE IF NOT EXISTS bot_commands (
   id BIGSERIAL PRIMARY KEY,
