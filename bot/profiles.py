@@ -183,6 +183,9 @@ def build_profile(name: str, risk: str | None = None, max_losses=None):
                 risk_per_trade=amount if amount is not None else base.risk.risk_per_trade,
                 max_daily_loss=daily if daily is not None else base.risk.max_daily_loss,
                 max_losses_per_day=losses,
+                # 12 Nov 2026: stop for the day after 4 losses in a row
+                # (3-month test: +£11,106 vs +£11,085, drawdown -£1,491 vs -£1,547).
+                max_loss_streak=4,
             ),
         )
         # 12 Nov 2026: BOS must close beyond the swing's wick (M1 only;

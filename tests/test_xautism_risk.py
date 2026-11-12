@@ -223,3 +223,43 @@ class TestServerClock:
         mt5.get_current_price.return_value = {"bid": 1, "ask": 1, "time": now - timedelta(days=2)}
         t.check(now, RiskConfig())
         assert t._offset == timedelta(hours=2)
+
+
+class TestLossStreak:
+    """M1 bot (12 Nov 2026): stop after 4 losing trades in a row."""
+
+    def _daily(self, results: list[float]):
+        from bot.risk.xautism_risk import DailyRisk
+        s = 0
+        for v in results:
+            s = s + 1 if v < 0 else (0 if v > 0 else s)
+        return DailyRisk(trading_day="2026-11-12", realised=sum(results), floating=0.0,
+                         closed_trades=len(results), losing_trades=sum(v < 0 for v in results),
+                         winning_trades=sum(v > 0 for v in results), loss_streak=s)
+
+    def test_blocks_at_four_in_a_row(self) -> None:
+        from bot.risk.xautism_risk import RiskConfig, check_risk
+        cfg = RiskConfig(max_losses_per_day=50, max_daily_loss=1e9, max_loss_streak=4)
+        assert not check_risk(self._daily([-1, -1, -1, 5, -1, -1, -1]), cfg).blocked
+        v = check_risk(self._daily([5, -1, -1, 0, -1, -1]), cfg)    # breakeven doesn't reset
+        assert v.blocked and "4 losing trades in a row" in v.reason
+
+    def test_off_by_default(self) -> None:
+        from bot.risk.xautism_risk import RiskConfig, check_risk
+        cfg = RiskConfig(max_losses_per_day=50, max_daily_loss=1e9)
+        assert not check_risk(self._daily([-1] * 6), cfg).blocked
+
+    def test_streak_counted_in_close_order(self) -> None:
+        from datetime import datetime, timezone
+        from bot.risk.xautism_risk import DEAL_ENTRY_IN, DEAL_ENTRY_OUT, summarise_day
+        start = datetime(2026, 11, 12, tzinfo=timezone.utc)
+        deals = []
+        # trades a..e: loss, win, loss, loss, loss -> streak 3 at the end
+        for n, (tag, pnl) in enumerate([("aaaaaaaa", -1), ("bbbbbbbb", 2), ("cccccccc", -1),
+                                        ("dddddddd", -1), ("eeeeeeee", -1)]):
+            deals.append({"entry": DEAL_ENTRY_IN, "magic": 7, "position_id": n, "comment": f"s={tag}",
+                          "time": start.timestamp() + n * 60})
+            deals.append({"entry": DEAL_ENTRY_OUT, "magic": 7, "position_id": n, "profit": pnl,
+                          "time": start.timestamp() + n * 60 + 30})
+        d = summarise_day(deals, [], magic=7, day_start=start, trading_day="2026-11-12")
+        assert d.losing_trades == 4 and d.loss_streak == 3

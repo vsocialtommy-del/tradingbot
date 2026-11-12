@@ -2416,6 +2416,7 @@ class Bot:
             "risk": risk_label(risk),
             "risk_is_pct": risk.risk_pct is not None,
             "max_losses": risk.max_losses_per_day,
+            "max_loss_streak": risk.max_loss_streak,
             "from_dashboard": getattr(self, "_live_risk_raw", (None, None)) != (None, None),
             "runner": f"{int(round((1 - self.config.xautism_entries.runner_keep_frac) * 100))}/"
                       f"{int(round(self.config.xautism_entries.runner_keep_frac * 100))}, "
@@ -2441,6 +2442,7 @@ class Bot:
             "trades": daily.closed_trades,
             "wins": daily.winning_trades,
             "losses": daily.losing_trades,
+            "loss_streak": daily.loss_streak,
             "blocked": bool(verdict.blocked),
             "blocked_reason": verdict.reason,
         }
