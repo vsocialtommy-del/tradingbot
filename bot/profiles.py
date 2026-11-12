@@ -185,5 +185,7 @@ def build_profile(name: str, risk: str | None = None, max_losses=None):
                 max_losses_per_day=losses,
             ),
         )
-        return cfg, replace(pipeline, zone_min_size_points=1.0)
+        # 12 Nov 2026: BOS must close beyond the swing's wick (M1 only;
+        # 3-month backtest: +£11,085 vs +£10,118, drawdown -£1,547 vs -£2,053).
+        return cfg, replace(pipeline, zone_min_size_points=1.0, bos_close_beyond_wick=True)
     raise ValueError(f"unknown bot {name!r} (expected one of {sorted(ENV_FILES)})")

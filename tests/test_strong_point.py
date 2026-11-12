@@ -405,3 +405,30 @@ class TestXautismZoneRules:
         v = validate_strong_point(refined, df)
         assert v.is_strong_point is True
         assert v.broken_swing is not None and v.broken_swing.price == 90
+
+
+class TestWickCloseBos:
+    """M1 bot (12 Nov 2026): the BOS must close beyond the swing's wick."""
+
+    # Same as _DBR_ROWS but bar 9 only closes at 110.3: above the swing's
+    # close (110) yet below its wick (110.5). Bar 10 closes 112.5.
+    ROWS = _DBR_ROWS[:9] + [(108.5, 110.4, 108, 110.3)] + _DBR_ROWS[10:]
+
+    def test_standard_bos_breaks_on_the_close(self) -> None:
+        df = _ohlc(self.ROWS)
+        refined = _dbr_refined(df, base_start=5, base_end=6, top=102.0, bottom=100.0)
+        v = validate_strong_point(refined, df)
+        assert v.is_strong_point and v.broken_at == df.index[9]
+
+    def test_wick_bos_waits_for_a_close_beyond_the_wick(self) -> None:
+        df = _ohlc(self.ROWS)
+        refined = _dbr_refined(df, base_start=5, base_end=6, top=102.0, bottom=100.0)
+        v = validate_strong_point(refined, df, StrongPointConfig(bos_close_beyond_wick=True))
+        assert v.is_strong_point and v.broken_at == df.index[10]
+        assert v.broken_swing is not None and v.broken_swing.price == 110   # TP1 unchanged
+
+    def test_wick_bos_not_broken_yet(self) -> None:
+        df = _ohlc(self.ROWS[:10])
+        refined = _dbr_refined(df, base_start=5, base_end=6, top=102.0, bottom=100.0)
+        v = validate_strong_point(refined, df, StrongPointConfig(bos_close_beyond_wick=True))
+        assert v.validation_failures == ["NO_BOS"]
