@@ -87,6 +87,11 @@ function botState(b: BotRow, now: number): State {
   return { label: "Running", cls: "ok", running: true };
 }
 
+// The bot's highest allowed value (50) is shown as "No limit".
+const NO_LIMIT = "50";
+const lossesText = (v: string | number | null | undefined) =>
+  v === null || v === undefined || v === "" ? "–" : Number(v) >= 50 ? "No limit" : String(v);
+
 const riskText = (r?: string) => (!r ? "" : r.endsWith("%") ? r : `£${r}`);
 
 // ------------------------------------------------------------------ page
@@ -421,7 +426,7 @@ function BotPopup({ b, now, trading, onClose, onToggle, onCommand, api, say, rel
           </button>
           <button className="field" onClick={() => setEditing(true)} disabled={!b.configured || !!b.error}>
             <label>Max losses / day</label>
-            <div>{d.settings?.max_losses ?? b.maxLosses ?? "–"} {today ? <small>· {today.losses} used today</small> : null}</div>
+            <div>{lossesText(d.settings?.max_losses ?? b.maxLosses)} {today ? <small>· {today.losses} used today</small> : null}</div>
             <div className="edit">{b.maxLosses ? "SET HERE · TAP TO CHANGE" : "BOT DEFAULT · TAP TO CHANGE"}</div>
           </button>
         </div>
@@ -466,7 +471,7 @@ function SettingsEditor({ b, onClose, api, say, reload }: {
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const RISKS = ["0.5%", "1%", "2%", "50", "100", "150"];
-  const LOSSES = ["1", "2", "3", "4", "5"];
+  const LOSSES = ["1", "2", "3", "4", "5", "6", "8", "10", NO_LIMIT];
 
   const save = async () => {
     setBusy(true); setErr(null);
@@ -499,12 +504,12 @@ function SettingsEditor({ b, onClose, api, say, reload }: {
         <div className="chips">
           <button className={`chip ${losses === "" ? "on" : ""}`} onClick={() => setLosses("")}>Bot default</button>
           {LOSSES.map((l) => (
-            <button key={l} className={`chip ${losses === l ? "on" : ""}`} onClick={() => setLosses(l)}>{l}</button>
+            <button key={l} className={`chip ${losses === l ? "on" : ""}`} onClick={() => setLosses(l)}>{lossesText(l)}</button>
           ))}
         </div>
         <p className="note">
           % = share of balance per trade, a number = fixed £ per trade. The bot also stops for the day once it&apos;s down
-          (max losses + 1) trades&apos; worth. Bot default = what&apos;s in its .env file. Changes apply within 30 seconds, from the next trade.
+          (max losses + 1) trades&apos; worth. No limit = it keeps trading all day. Bot default = what&apos;s in its .env file. Changes apply within 30 seconds, from the next trade.
         </p>
         {err && <div className="err">{err}</div>}
         <div className="btns" style={{ gridTemplateColumns: "1fr 1fr" }}>
