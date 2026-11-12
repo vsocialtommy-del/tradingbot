@@ -94,6 +94,11 @@ class StrongPointConfig:
     breaking bar's time is ``broken_at`` (the zone's birth)."""
 
     bos_swing_strength: int = 2
+    bos_close_beyond_wick: bool = False
+    """Tommy's stricter BOS (M1 bot since 12 Nov 2026): the move out must
+    CLOSE beyond the wick of the swing before the base (the highest high
+    around a swing HIGH, lowest low around a swing LOW), not just beyond
+    its close. TP1 stays at the same swing."""
     """Swing pivot strength on closes (the line-chart W / M points)."""
 
     require_fresh_since_bos: bool = True
@@ -184,6 +189,7 @@ def validate_strong_point(
     if cfg.require_bos:
         bos = find_bos(
             refined, df, swing_strength=cfg.bos_swing_strength, swings=swings,
+            beyond_wick=cfg.bos_close_beyond_wick,
         )
         if bos is None:
             failures.append("NO_BOS")
@@ -221,6 +227,7 @@ def find_bos(
     *,
     swing_strength: int = 2,
     swings: list[Swing] | None = None,
+    beyond_wick: bool = False,
 ) -> tuple[Swing, int] | None:
     """Find the first break of structure out of the base.
 
@@ -253,12 +260,22 @@ def find_bos(
     if not before:
         return None
     ref = before[-1]
+    level = ref.price
+    if beyond_wick:
+        # The wick of that swing: highest high / lowest low of the bars
+        # around it, never reaching into the base.
+        lo = max(0, ref.index - swing_strength)
+        hi = min(base_start - 1, ref.index + swing_strength)
+        if hi < lo:
+            lo = hi = ref.index
+        level = (float(df["high"].iloc[lo:hi + 1].max()) if refined.direction == "BUY"
+                 else float(df["low"].iloc[lo:hi + 1].min()))
     closes = df["close"].to_numpy()
     for i in range(base_end + 1, len(df)):
         c = float(closes[i])
-        if refined.direction == "BUY" and c > ref.price:
+        if refined.direction == "BUY" and c > level:
             return ref, i
-        if refined.direction == "SELL" and c < ref.price:
+        if refined.direction == "SELL" and c < level:
             return ref, i
     return None
 

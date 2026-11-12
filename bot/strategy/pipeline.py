@@ -133,6 +133,8 @@ class StrategyPipelineConfig:
     +£1,148 with the first-dip foot). 0 = old first-dip foot."""
     require_bos: bool = True
     bos_swing_strength: int = 2
+    bos_close_beyond_wick: bool = False
+    """BOS must close beyond the swing's wick (M1 bot, 12 Nov 2026)."""
     require_fresh_since_bos: bool = True
 
     # TP1 target — read by ``main`` when computing TP1 for each zone.
@@ -227,6 +229,7 @@ def run_strategy_pipeline(
         allowed_pattern_types=cfg.allowed_pattern_types,
         require_bos=cfg.require_bos,
         bos_swing_strength=cfg.bos_swing_strength,
+        bos_close_beyond_wick=cfg.bos_close_beyond_wick,
         require_fresh_since_bos=cfg.require_fresh_since_bos,
     )
 
