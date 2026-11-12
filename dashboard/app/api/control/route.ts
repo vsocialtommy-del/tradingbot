@@ -23,8 +23,10 @@ export async function POST(req: NextRequest) {
     if (risk instanceof Error) return fail(risk.message);
     const losses = checkMaxLosses(body.maxLosses);
     if (losses instanceof Error) return fail(losses.message);
-    rows.push({ key: "risk", value: risk, updated_by: "dashboard" });
-    rows.push({ key: "max_losses", value: losses, updated_by: "dashboard" });
+    // "Bot default" is saved as "" (not null): bot_config.value can't be
+    // empty, and the bot treats "" the same as no setting.
+    rows.push({ key: "risk", value: risk ?? "", updated_by: "dashboard" });
+    rows.push({ key: "max_losses", value: losses ?? "", updated_by: "dashboard" });
   }
   if (!rows.length) return fail("Nothing to change");
   const { error } = await sb.from("bot_config").upsert(rows, { onConflict: "key" });
