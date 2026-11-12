@@ -46,6 +46,7 @@ class TestProfiles:
         assert cfg.risk.risk_pct == 0.10
         assert cfg.risk.max_daily_loss_pct == 0.30
         assert cfg.risk.max_losses_per_day == 2
+        assert cfg.risk.max_loss_streak == 4                 # 4 in a row (12 Nov 2026)
         assert cfg.xautism_entries.m5_close_exit is False   # 30% SL only
         # everything else is the same as the M5 bot
         base = BotLoopConfig()

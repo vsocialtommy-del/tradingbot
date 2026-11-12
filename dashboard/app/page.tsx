@@ -15,11 +15,11 @@ type Position = {
 type StatusData = {
   bot?: string; timeframe?: string; version?: string | null; started_at?: string;
   trading_enabled?: boolean; bid?: number; ask?: number; spread?: number;
-  settings?: { risk: string; risk_is_pct: boolean; max_losses: number; from_dashboard: boolean; runner: string };
+  settings?: { risk: string; risk_is_pct: boolean; max_losses: number; max_loss_streak?: number | null; from_dashboard: boolean; runner: string };
   account?: { login?: number; server?: string; currency?: string; balance: number; equity: number } | null;
   today?: {
     trading_day: string; realised: number; floating: number; trades: number;
-    wins?: number; losses: number; blocked: boolean; blocked_reason: string | null;
+    wins?: number; losses: number; loss_streak?: number; blocked: boolean; blocked_reason: string | null;
   } | null;
   open_positions?: Position[];
   next_buy?: Zone | null; next_sell?: Zone | null;
@@ -470,6 +470,7 @@ function BotPopup({ b, now, trading, onClose, onToggle, onCommand, api, say, rel
           <button className="field" onClick={() => setEditing(true)} disabled={!b.configured || !!b.error}>
             <label>Max losses / day</label>
             <div>{lossesText(d.settings?.max_losses ?? b.maxLosses)} {today ? <small>· {today.losses} used today</small> : null}</div>
+            {d.settings?.max_loss_streak ? <small>Stops after {d.settings.max_loss_streak} in a row{today ? ` · ${today.loss_streak ?? 0} now` : ""}</small> : null}
             <div className="edit">{b.maxLosses ? "SET HERE · TAP TO CHANGE" : "BOT DEFAULT · TAP TO CHANGE"}</div>
           </button>
           <button className="field wide" onClick={() => setEditing(true)} disabled={!b.configured || !!b.error}>

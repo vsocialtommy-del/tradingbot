@@ -44,6 +44,9 @@ class RiskConfig:
     max_daily_loss: float = 300.0
     """Realised today + floating. At or past this, no new trades today."""
     max_losses_per_day: int = 2
+    max_loss_streak: int | None = None
+    """Stop for the day after this many losing trades IN A ROW (a win
+    resets it, a breakeven doesn't). None = off. M1 bot: 4 (12 Nov 2026)."""
     max_spread: float = 0.50
     """Max ask - bid (price units, $0.50) to open a new trade."""
     max_lot: float = 2.0
@@ -120,6 +123,7 @@ class DailyRisk:
     closed_trades: int
     losing_trades: int
     winning_trades: int = 0  # net above zero; breakevens count as neither
+    loss_streak: int = 0     # losing trades in a row at the end of today
 
     @property
     def total(self) -> float:
@@ -178,6 +182,7 @@ def summarise_day(
 
     realised = 0.0
     net: dict[str, float] = {}
+    last_close: dict[str, float] = {}
     for d in deals:
         if d.get("entry") not in (DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT, DEAL_ENTRY_OUT_BY):
             continue
@@ -193,12 +198,19 @@ def summarise_day(
         realised += pnl
         key = trade_of_pos[pos]
         net[key] = net.get(key, 0.0) + pnl
+        last_close[key] = max(last_close.get(key, 0.0), float(d.get("time", 0)))
 
     closed = {k: v for k, v in net.items() if k not in open_trades}
     floating = sum(
         float(p.get("profit", 0.0)) + float(p.get("swap", 0.0))
         for p in open_positions if p["ticket"] in trade_of_pos
     )
+    streak = 0
+    for key in sorted(closed, key=lambda k: last_close.get(k, 0.0)):
+        if closed[key] < 0:
+            streak += 1
+        elif closed[key] > 0:
+            streak = 0
     return DailyRisk(
         trading_day=trading_day,
         realised=round(realised, 2),
@@ -206,6 +218,7 @@ def summarise_day(
         closed_trades=len(closed),
         losing_trades=sum(1 for v in closed.values() if v < 0),
         winning_trades=sum(1 for v in closed.values() if v > 0),
+        loss_streak=streak,
     )
 
 
@@ -218,6 +231,10 @@ def check_risk(daily: DailyRisk, config: RiskConfig) -> RiskVerdict:
         return RiskVerdict(True, (
             f"{daily.losing_trades} losing trades today "
             f"(max {config.max_losses_per_day})"
+        ), daily)
+    if config.max_loss_streak and daily.loss_streak >= config.max_loss_streak:
+        return RiskVerdict(True, (
+            f"{daily.loss_streak} losing trades in a row (max {config.max_loss_streak})"
         ), daily)
     return RiskVerdict(False, None, daily)
 
