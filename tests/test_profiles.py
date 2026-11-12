@@ -24,6 +24,7 @@ class TestProfiles:
         assert cfg.risk == base.risk                       # £100, 2 losses, -£300
         # 12 Nov 2026: trend read on M5 (its own chart), fresh H1 exception
         assert cfg.direction_gate.trend_timeframe == "5min"
+        assert cfg.direction_gate.enabled is False           # filter off by default
         assert cfg.direction_gate.htf_timeframe == "1h"
         assert cfg.direction_gate.trend_rule == "bos"
         assert cfg.xautism_entries == base.xautism_entries  # 75/25, 4 pt trail
@@ -35,6 +36,7 @@ class TestProfiles:
         assert cfg.bot_name == "M1" and cfg.ohlc_timeframe == "M1"
         assert pipe.zone_min_size_points == 1.0
         assert cfg.direction_gate.trend_timeframe == "1min"   # its own chart (12 Nov 2026)
+        assert cfg.direction_gate.enabled is False           # filter off by default
         assert cfg.direction_gate.htf_timeframe == "15min"
         assert cfg.xautism_entries.runner_enabled
         assert cfg.xautism_entries.runner_keep_frac == 0.5
@@ -280,3 +282,27 @@ class TestM1MaxLosses:
         main_mod.main()
         assert bot_cls.call_args.kwargs["config"].risk.max_losses_per_day == 2
 
+
+
+class TestTrendFilterSwitch:
+    def test_parse(self) -> None:
+        from bot.profiles import parse_trend_filter
+        assert parse_trend_filter(None) == "off"
+        assert parse_trend_filter("") == "off"
+        assert parse_trend_filter(" Own ") == "own"
+        assert parse_trend_filter("higher") == "higher"
+        with pytest.raises(ValueError):
+            parse_trend_filter("sideways")
+
+    def test_timeframes_per_bot(self) -> None:
+        from bot.profiles import trend_gate
+        from bot.strategy.direction_gate import DirectionGateConfig
+        g = DirectionGateConfig()
+        assert (trend_gate(g, "M5", "own").trend_timeframe, trend_gate(g, "M5", "own").enabled) == ("5min", True)
+        assert trend_gate(g, "M5", "higher").trend_timeframe == "15min"
+        assert trend_gate(g, "M1", "own").trend_timeframe == "1min"
+        assert trend_gate(g, "M1", "higher").trend_timeframe == "5min"
+        off = trend_gate(g, "M1", "off")
+        assert off.enabled is False and off.trend_timeframe == "1min"
+        # the higher-timeframe zone exception is left alone
+        assert trend_gate(g, "M5", "higher").htf_timeframe == g.htf_timeframe

@@ -1,11 +1,11 @@
 """The two bots that share this code (Nov 2026).
 
-* ``m5`` (default): the live M5 bot. M5 zones, M15 direction with the
-  fresh H1 exception, **no candle close exit** (30% SL only, 10 Nov
+* ``m5`` (default): the live M5 bot. M5 zones, trend filter off by
+  default (dashboard switch: off / M5 / M15, with the fresh H1 exception), **no candle close exit** (30% SL only, 10 Nov
   2026), £100 a trade, 2 losses a day, 75/25 runner with a 4 point
   trail. Reads ``.env``.
-* ``m1``: M1 zones (1 point minimum), M5 direction with the fresh M15
-  exception, **no candle close exit** (only the 30% SL, TP1 and the
+* ``m1``: M1 zones (1 point minimum), trend filter off by default
+  (dashboard switch: off / M1 / M5, with the fresh M15 exception), **no candle close exit** (only the 30% SL, TP1 and the
   trail close a trade, Nov 2026), 50/50 runner with a 2 point trail.
   Risk is switchable (``RISK=`` in ``.env.m1`` or ``--risk``): 10% of
   balance (default), 5% or £100 fixed. Losses a day are switchable too
@@ -29,6 +29,36 @@ from dataclasses import replace
 from bot.strategy.pipeline import StrategyPipelineConfig
 
 ENV_FILES = {"m5": ".env", "m1": ".env.m1"}
+
+# Trend filter (12 Nov 2026): OFF by default on both bots, switchable per
+# bot from the dashboard (bot_config "trend_filter"):
+#   "off"    no trend filter; the trend is still worked out for the badge
+#   "own"    trend read on the bot's own chart (M5 bot: M5, M1 bot: M1)
+#   "higher" trend read one step up (M5 bot: M15, M1 bot: M5)
+# When on, fresh H1 (M5 bot) / M15 (M1 bot) zones still allow a
+# counter-trend trade.
+TREND_FILTER_MODES = ("off", "own", "higher")
+TREND_TIMEFRAMES = {"M5": ("5min", "15min"), "M1": ("1min", "5min")}
+
+
+def parse_trend_filter(text) -> str:
+    """"" / None (bot default) = "off"; otherwise one of TREND_FILTER_MODES."""
+    if text is None or str(text).strip() == "":
+        return "off"
+    mode = str(text).strip().lower()
+    if mode not in TREND_FILTER_MODES:
+        raise ValueError(f"unknown trend filter {text!r}; use off, own or higher")
+    return mode
+
+
+def trend_gate(gate, bot_name: str, mode: str):
+    """The direction gate config for a trend filter mode."""
+    own, higher = TREND_TIMEFRAMES[bot_name]
+    return replace(
+        gate,
+        enabled=mode != "off",
+        trend_timeframe=higher if mode == "higher" else own,
+    )
 
 M1_DEFAULT_RISK = "10%"
 M1_DEFAULT_MAX_LOSSES = 2
@@ -120,11 +150,11 @@ def build_profile(name: str, risk: str | None = None, max_losses=None):
             raise ValueError("the risk switch is for the M1 bot only; the M5 bot stays at £100")
         if max_losses is not None:
             raise ValueError("the losses switch is for the M1 bot only; the M5 bot stays at 2 losses a day")
-        # 12 Nov 2026: the trend is read on the bot's own chart (M5), with
-        # Tommy's BOS rule. Fresh H1 zones still allow a counter-trend trade.
+        # 12 Nov 2026: trend filter off by default (switch it on from the
+        # dashboard); the trend shown is read on M5 with Tommy's BOS rule.
         return replace(
             base, bot_name="M5",
-            direction_gate=replace(base.direction_gate, trend_timeframe="5min"),
+            direction_gate=trend_gate(base.direction_gate, "M5", "off"),
         ), pipeline
     if name == "m1":
         losses = (
@@ -136,9 +166,9 @@ def build_profile(name: str, risk: str | None = None, max_losses=None):
             base,
             bot_name="M1",
             ohlc_timeframe="M1",
-            direction_gate=replace(
-                # 12 Nov 2026: trend read on the M1 chart itself.
-                base.direction_gate, trend_timeframe="1min", htf_timeframe="15min",
+            # 12 Nov 2026: trend filter off by default (dashboard switch).
+            direction_gate=trend_gate(
+                replace(base.direction_gate, htf_timeframe="15min"), "M1", "off",
             ),
             xautism_entries=replace(
                 base.xautism_entries, runner_keep_frac=0.5, runner_trail_points=2.0,

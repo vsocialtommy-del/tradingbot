@@ -100,7 +100,7 @@ from bot.exits.runner_trail import RunnerTrailManager
 from bot.exits.trailing_stop_manager import TrailingStopManager
 from bot.exits.zone_exit_manager import ZoneExitManager
 from bot.signals.next_signal_writer import NextSignalWriter
-from bot.profiles import live_risk, risk_label
+from bot.profiles import live_risk, parse_trend_filter, risk_label, trend_gate
 from bot.dashboard.bridge import (
     DashboardBridge,
     ZoneView,
@@ -134,7 +134,7 @@ from bot.strategy.strong_point import (
     ValidatedZone,
     compute_sl_price,
 )
-from bot.strategy.direction_gate import DirectionGateConfig, check_direction, trend_summary
+from bot.strategy.direction_gate import DirectionGateConfig, check_direction, tf_label, trend_summary
 from bot.strategy.levels import LevelsConfig, TradeLevels, compute_levels
 from bot.strategy.stacked import StackedConfig, StackedPlan, stacked_plan
 from bot.risk.xautism_risk import (
@@ -422,6 +422,8 @@ class Bot:
         self.dashboard = DashboardBridge(supabase, self.config.bot_name)
         self._base_risk = self.config.risk
         self._live_risk_raw: tuple[Any, Any] = (None, None)
+        self._trend_filter = "on" if self.config.direction_gate.enabled else "off"
+        self._trend_filter_raw: Any = None
         self._deferred_seen: dict[tuple[str, float, float], float] = {}
         self._started_at = datetime.now(timezone.utc)
         self._version = _git_version()
@@ -978,10 +980,11 @@ class Bot:
         ``max_losses``; null = the bot's own setting). A bad value is
         logged and ignored, the last good settings stay."""
         try:
-            vals = self.supabase.get_config_values(["risk", "max_losses"])
+            vals = self.supabase.get_config_values(["risk", "max_losses", "trend_filter"])
         except Exception:
             logger.debug("config refresh: dashboard risk settings not readable")
             return
+        self._apply_trend_filter(vals.get("trend_filter"))
         raw = (vals.get("risk"), vals.get("max_losses"))
         if raw == getattr(self, "_live_risk_raw", (None, None)):
             return
@@ -1000,6 +1003,33 @@ class Bot:
                 f"max {new.max_losses_per_day} losses a day"
                 + (" (from the dashboard)" if raw != (None, None) else " (bot default)")
             )
+
+    def _apply_trend_filter(self, raw: Any) -> None:
+        """Dashboard trend filter (bot_config ``trend_filter``): "off"
+        (default), "own" (the bot's own chart) or "higher" (one step up)."""
+        if raw == self._trend_filter_raw or self.config.bot_name not in ("M5", "M1"):
+            return
+        self._trend_filter_raw = raw
+        try:
+            mode = parse_trend_filter(raw)
+        except ValueError as exc:
+            logger.warning(f"dashboard trend filter ignored: {exc}")
+            return
+        if mode == self._trend_filter:
+            return
+        self._trend_filter = mode
+        self.config = replace(
+            self.config,
+            direction_gate=trend_gate(self.config.direction_gate, self.config.bot_name, mode),
+        )
+        gate = self.config.direction_gate
+        logger.info(
+            "trend filter now: "
+            + ("off (trend shown on the dashboard only)" if mode == "off"
+               else f"on, {tf_label(gate.trend_timeframe)} trend with fresh "
+                    f"{tf_label(gate.htf_timeframe)} zones allowed")
+            + ("" if raw not in (None, "") else " (bot default)")
+        )
 
     def _is_paused(self, now: datetime) -> bool:
         """True iff kill_switch is on or ``now`` is before pause_until."""
@@ -2344,18 +2374,26 @@ class Bot:
         """The direction gate's current reading, recomputed once per new
         candle (it only changes when a bar closes)."""
         df = getattr(self, "_latest_ohlc", None)
-        if df is None or len(df) == 0 or not self.config.direction_gate.enabled:
+        if df is None or len(df) == 0:
             return None
-        key = df.index[-1]
+        # Worked out even with the filter off, so the badge still shows
+        # what the bot reads (info only).
+        gate = replace(self.config.direction_gate, enabled=True)
+        key = (df.index[-1], gate.trend_timeframe, getattr(self, "_trend_filter", "on"))
         cached = getattr(self, "_trend_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
         try:
             # Closed candles only (the last row is still forming).
-            summary = trend_summary(df.iloc[:-1] if len(df) > 1 else df, self.config.direction_gate)
+            summary = trend_summary(df.iloc[:-1] if len(df) > 1 else df, gate)
         except Exception:  # noqa: BLE001
             logger.debug("dashboard: trend summary failed")
             return None
+        # Candle times are broker time; the dashboard wants real (UTC) time.
+        offset = getattr(getattr(self, "daily_risk", None), "offset", None)
+        if summary.get("since") and isinstance(offset, timedelta):
+            summary["since"] = (pd.Timestamp(summary["since"]) - offset).isoformat()
+        summary["filter"] = getattr(self, "_trend_filter", "on")
         self._trend_cache = (key, summary)
         return summary
 

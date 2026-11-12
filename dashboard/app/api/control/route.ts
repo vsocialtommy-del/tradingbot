@@ -1,11 +1,12 @@
 import { NextResponse, type NextRequest } from "next/server";
 
-import { checkMaxLosses, checkRisk, db, fail, isBot, needLogin } from "@/lib/db";
+import { checkMaxLosses, checkRisk, checkTrendFilter, db, fail, isBot, needLogin } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
 // { bot, trading: true|false }                 the on/off switch
 // { bot, risk: "1%"|"100"|null, maxLosses: 2|null }  settings (null = bot default)
+// { bot, trendFilter: "off"|"own"|"higher" }        trend filter (12 Nov 2026)
 export async function POST(req: NextRequest) {
   const denied = await needLogin();
   if (denied) return denied;
@@ -27,6 +28,11 @@ export async function POST(req: NextRequest) {
     // empty, and the bot treats "" the same as no setting.
     rows.push({ key: "risk", value: risk ?? "", updated_by: "dashboard" });
     rows.push({ key: "max_losses", value: losses ?? "", updated_by: "dashboard" });
+  }
+  if ("trendFilter" in body) {
+    const trend = checkTrendFilter(body.trendFilter);
+    if (trend instanceof Error) return fail(trend.message);
+    rows.push({ key: "trend_filter", value: trend, updated_by: "dashboard" });
   }
   if (!rows.length) return fail("Nothing to change");
   const { error } = await sb.from("bot_config").upsert(rows, { onConflict: "key" });

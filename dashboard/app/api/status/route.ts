@@ -9,7 +9,7 @@ async function one(bot: Bot) {
   if (!sb) return { bot, configured: false };
   const [status, config, commands] = await Promise.all([
     sb.from("bot_status").select("*").eq("bot", bot).maybeSingle(),
-    sb.from("bot_config").select("key, value").in("key", ["kill_switch", "risk", "max_losses"]),
+    sb.from("bot_config").select("key, value").in("key", ["kill_switch", "risk", "max_losses", "trend_filter"]),
     sb.from("bot_commands").select("id, command, status, created_at, finished_at, output")
       .eq("bot", bot).order("created_at", { ascending: false }).limit(6),
   ]);
@@ -26,6 +26,7 @@ async function one(bot: Bot) {
     killSwitch: cfg.kill_switch === true,
     risk: (cfg.risk as string | null) || null,       // "" = bot default
     maxLosses: (cfg.max_losses as number | null) || null,
+    trendFilter: (cfg.trend_filter as string | null) || null,   // null = bot default (off)
     commands: commands.data ?? [],
   };
 }
