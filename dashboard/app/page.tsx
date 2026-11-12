@@ -16,7 +16,7 @@ type StatusData = {
   bot?: string; timeframe?: string; version?: string | null; started_at?: string;
   trading_enabled?: boolean; bid?: number; ask?: number; spread?: number;
   settings?: { risk: string; risk_is_pct: boolean; max_losses: number; from_dashboard: boolean; runner: string };
-  account?: { login?: number; currency?: string; balance: number; equity: number } | null;
+  account?: { login?: number; server?: string; currency?: string; balance: number; equity: number } | null;
   today?: {
     trading_day: string; realised: number; floating: number; trades: number;
     wins?: number; losses: number; blocked: boolean; blocked_reason: string | null;
@@ -34,6 +34,7 @@ type BotRow = {
     process_running: boolean | null; supervisor_note?: string | null;
   } | null;
   killSwitch?: boolean; risk?: string | null; maxLosses?: number | null; trendFilter?: string | null;
+  loginKey?: string | null;
   commands?: Command[];
 };
 type DayCell = { pnl: number; trades: number; wins: number; losses: number };
@@ -339,6 +340,10 @@ function BotCard({ b, now, trading, onOpen, onToggle }: {
       </div>
       <div className="st"><span className={`dot ${st.cls}`} />{st.label}</div>
       <TrendBadge t={d.trend} />
+      {d.open_positions?.length ? (() => {
+        const pl = d.open_positions.reduce((a, p) => a + p.profit, 0);
+        return <div className="live">OPEN <b className={tone(pl)}>{signed(pl, cur)}</b></div>;
+      })() : null}
       <div className="kv"><label>Balance</label><b>{d.account ? money(d.account.balance, cur) : "–"}</b></div>
       <div className="kv"><label>Today</label><b className={today ? tone(today.realised) : ""}>{today ? signed(today.realised, cur) : "–"}</b></div>
       <div className="kv"><label>W / L today</label><b>{today ? `${today.wins ?? 0}/${today.losses}` : "–"}</b></div>
@@ -385,6 +390,7 @@ function BotPopup({ b, now, trading, onClose, onToggle, onCommand, api, say, rel
   const cur = d.account?.currency;
   const today = d.today;
   const [editing, setEditing] = useState(false);
+  const [loggingIn, setLoggingIn] = useState(false);
   const [showOut, setShowOut] = useState<number | null>(null);
   const updAgo = b.status ? Math.max(0, Math.round((now - Date.parse(b.status.updated_at)) / 1000)) : null;
 
@@ -495,9 +501,21 @@ function BotPopup({ b, now, trading, onClose, onToggle, onCommand, api, say, rel
             </div>
           )) : "None yet"}
         </div>
+        <h3>ACCOUNT</h3>
+        <div className="box acct">
+          <div className="cmd"><span>Account number</span><b>{d.account?.login ?? "–"}</b></div>
+          <div className="cmd"><span>Broker server</span><b>{d.account?.server ?? "–"}</b></div>
+          <div className="cmd"><span>Password</span><b>Saved on the laptop ✓</b></div>
+          <button className="btn" style={{ width: "100%", marginTop: 8 }}
+            disabled={!b.configured || !b.loginKey || !!d.open_positions?.length}
+            onClick={() => setLoggingIn(true)}>Log in to another account</button>
+          {!b.loginKey && b.configured && <p className="note">Turns on after the next Update (the laptop makes its key).</p>}
+          {!!d.open_positions?.length && <p className="note">Close the open trade first.</p>}
+        </div>
         {d.version && <p className="note">Code {d.version}{d.started_at ? ` · running since ${dayMon(d.started_at)} ${hhmm(d.started_at)}` : ""}</p>}
       </div>
       {editing && <SettingsEditor b={b} onClose={() => setEditing(false)} api={api} say={say} reload={reload} />}
+      {loggingIn && <LoginEditor b={b} onClose={() => setLoggingIn(false)} api={api} say={say} reload={reload} />}
     </>
   );
 }
@@ -569,6 +587,75 @@ function SettingsEditor({ b, onClose, api, say, reload }: {
         <div className="btns" style={{ gridTemplateColumns: "1fr 1fr" }}>
           <button className="btn" onClick={onClose}>Cancel</button>
           <button className="btn primary" onClick={save} disabled={busy}>{busy ? "Saving…" : "Save"}</button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ------------------------------------------------------------------ account login
+
+// Scrambles the login with the laptop's public key (RSA-OAEP, SHA-256), so
+// the password is only readable on the laptop, never in Supabase or Vercel.
+async function sealLogin(keyB64: string, login: string, password: string, server: string): Promise<string> {
+  const der = Uint8Array.from(atob(keyB64), (c) => c.charCodeAt(0));
+  const key = await crypto.subtle.importKey("spki", der, { name: "RSA-OAEP", hash: "SHA-256" }, false, ["encrypt"]);
+  const msg = new TextEncoder().encode(JSON.stringify({ login, password, server }));
+  const out = new Uint8Array(await crypto.subtle.encrypt({ name: "RSA-OAEP" }, key, msg));
+  let bin = "";
+  for (const x of out) bin += String.fromCharCode(x);
+  return btoa(bin);
+}
+
+function LoginEditor({ b, onClose, api, say, reload }: {
+  b: BotRow; onClose: () => void;
+  api: (u: string, i?: RequestInit) => Promise<any>; say: (t: string) => void; reload: () => Promise<void>;
+}) {
+  const [login, setLogin] = useState("");
+  const [password, setPassword] = useState("");
+  const [server, setServer] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const ok = /^\d{4,15}$/.test(login.trim()) && password.length > 0 && password.length <= 64
+    && server.trim().length > 0 && server.trim().length <= 60;
+
+  const send = async () => {
+    if (!b.loginKey) return;
+    setBusy(true); setErr(null);
+    try {
+      const payload = await sealLogin(b.loginKey, login.trim(), password, server.trim());
+      await api("/api/command", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bot: b.bot, command: "login", payload }),
+      });
+      setPassword("");
+      say(`Sent. The laptop logs the ${b.bot} bot into ${login.trim()} and restarts it. Check Last commands.`);
+      await reload();
+      onClose();
+    } catch (e) { setErr((e as Error).message); }
+    setBusy(false);
+  };
+
+  return (
+    <>
+      <div className="ov top" onClick={onClose} />
+      <div className="confirm" style={{ top: "12%" }}>
+        <div className="name" style={{ fontSize: 14 }}>{b.bot} BOT · LOG IN</div>
+        <h3>ACCOUNT NUMBER</h3>
+        <input className="input" inputMode="numeric" autoComplete="off" value={login} onChange={(e) => setLogin(e.target.value.replace(/\D/g, ""))} />
+        <h3>PASSWORD</h3>
+        <input className="input" type="password" autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)} />
+        <h3>BROKER SERVER</h3>
+        <input className="input" autoComplete="off" placeholder="As in MT5, e.g. FTMO-Demo" value={server} onChange={(e) => setServer(e.target.value)} />
+        <p className="note">
+          Scrambled on this phone so only your laptop can read it, then wiped. The bot stops, MT5 logs in, and the bot
+          starts again on the new account. If the login fails it stays on the old account. MT5 must already know the
+          broker (add it once in MT5 on the laptop: File, Open an Account).
+        </p>
+        {err && <div className="err">{err}</div>}
+        <div className="btns" style={{ gridTemplateColumns: "1fr 1fr" }}>
+          <button className="btn" onClick={onClose}>Cancel</button>
+          <button className="btn primary" onClick={send} disabled={busy || !ok}>{busy ? "Sending…" : "Log in"}</button>
         </div>
       </div>
     </>

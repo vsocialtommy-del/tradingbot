@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 
-import { db, fail, isBot, needLogin } from "@/lib/db";
+import { db, fail, isBot, needLogin, tradesQuery } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
@@ -21,10 +21,8 @@ export async function GET(req: NextRequest) {
   const [y, m] = month.split("-").map(Number);
   const first = `${month}-01`;
   const last = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
-  const { data, error } = await sb.from("closed_trades")
-    .select("trading_day, setup_key, profit")
-    .eq("bot", bot).gte("trading_day", first).lte("trading_day", last)
-    .range(0, 9999);
+  const { data, error } = await tradesQuery<Row>(sb, bot, "trading_day, setup_key, profit",
+    (q) => q.gte("trading_day", first).lte("trading_day", last).range(0, 9999));
   if (error) return fail(error.message, 500);
 
   // One trade = one setup, counted on the day its last position closed

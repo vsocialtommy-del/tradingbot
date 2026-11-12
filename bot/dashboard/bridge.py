@@ -179,6 +179,9 @@ class DashboardBridge:
         self._off_until = 0.0
         self._warned = False
         self.synced_positions: set[int] = set()
+        # closed_trades.account (SQL 017): None = not tried yet, False = the
+        # column isn't there, True = working.
+        self._account_col: bool | None = None
 
     @property
     def available(self) -> bool:
@@ -212,13 +215,29 @@ class DashboardBridge:
             self._failed("status write", exc)
             return False
 
-    def sync_trades(self, rows: list[dict[str, Any]]) -> int:
-        """Upsert closed positions not sent yet. Returns how many were sent."""
+    def sync_trades(self, rows: list[dict[str, Any]], account: int | None = None) -> int:
+        """Upsert closed positions not sent yet. Returns how many were sent.
+
+        ``account`` (the MT5 login) tags each row so the calendar follows
+        the account the bot is logged into. The first time, rows saved
+        before the tag existed are given this account (the demo)."""
         if not self.available:
             return 0
+        if account is not None and self._account_col is None:
+            try:
+                self._sb.claim_untagged_trades(self.bot, account)
+                self._account_col = True
+            except Exception as exc:  # noqa: BLE001
+                self._account_col = False
+                logger.warning(
+                    "dashboard: closed_trades has no account column yet (run "
+                    f"migrations/017_account_login.sql); calendar not split by account ({exc})"
+                )
         new = [r for r in rows if r["position_id"] not in self.synced_positions]
         if not new:
             return 0
+        if account is not None and self._account_col:
+            new = [{**r, "account": account} for r in new]
         try:
             for i in range(0, len(new), 200):
                 self._sb.upsert_rows("closed_trades", new[i:i + 200], on_conflict="position_id")

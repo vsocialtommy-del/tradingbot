@@ -4232,3 +4232,26 @@ class TestCalendarSyncClock:
         b._sync_closed_trades(NOW)
         since, _until = b.mt5.get_deals.call_args.args
         assert since == NOW - timedelta(days=2) + timedelta(hours=2)
+
+
+class TestCalendarAccount:
+    def test_rows_tagged_with_the_account_and_old_rows_claimed(self) -> None:
+        from unittest.mock import MagicMock
+
+        from bot.dashboard.bridge import DashboardBridge
+        sb = MagicMock()
+        br = DashboardBridge(sb, "M5")
+        br.sync_trades([{"position_id": 1, "profit": 5.0}], account=5058387501)
+        sb.claim_untagged_trades.assert_called_once_with("M5", 5058387501)
+        rows = sb.upsert_rows.call_args.args[1]
+        assert rows == [{"position_id": 1, "profit": 5.0, "account": 5058387501}]
+
+    def test_without_the_column_it_still_syncs(self) -> None:
+        from unittest.mock import MagicMock
+
+        from bot.dashboard.bridge import DashboardBridge
+        sb = MagicMock()
+        sb.claim_untagged_trades.side_effect = RuntimeError("column closed_trades.account does not exist")
+        br = DashboardBridge(sb, "M5")
+        assert br.sync_trades([{"position_id": 2, "profit": 1.0}], account=5058387501) == 1
+        assert sb.upsert_rows.call_args.args[1] == [{"position_id": 2, "profit": 1.0}]

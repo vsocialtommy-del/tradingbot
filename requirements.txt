@@ -56,3 +56,4 @@ nbformat>=5.10
 
 # Deferred — added in their respective phases:
 #   python-telegram-bot          Phase E (dashboard / alerts)
+cryptography>=42

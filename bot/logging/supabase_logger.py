@@ -539,6 +539,14 @@ class SupabaseLogger:
         )
         return {row["key"]: row["value"] for row in (result.data or [])}
 
+    def claim_untagged_trades(self, bot: str, account: int) -> None:
+        """closed_trades rows saved before the account column (SQL 017)
+        belong to the account the bot is on now."""
+        (
+            self._client.table("closed_trades").update({"account": account})
+            .eq("bot", bot).is_("account", "null").execute()
+        )
+
     def upsert_rows(
         self, table: str, rows: list[dict[str, Any]], *, on_conflict: str,
     ) -> None:

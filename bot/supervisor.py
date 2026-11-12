@@ -56,7 +56,12 @@ ALREADY_RUNNING_EXIT = 75
 RELAUNCH_EXIT = 3
 
 BOTS = {"m5": ("M5", ".env"), "m1": ("M1", ".env.m1")}
-COMMANDS = ("update", "restart", "start", "stop")
+COMMANDS = ("update", "restart", "start", "stop", "login")
+# Account login from the dashboard (12 Nov 2026). Each bot has its own key
+# pair in keys/ (never committed). The public half goes to bot_config
+# "account_pubkey"; the phone scrambles the login with it, so the password
+# is never readable in Supabase or Vercel, only here on the laptop.
+KEY_DIR_NAME = "keys"
 STALE_AFTER = timedelta(minutes=10)
 STOP_TIMEOUT = 45.0
 STATE_FILE = ROOT / "logs" / "supervisor_state.json"
@@ -264,6 +269,24 @@ class Channel:
         except Exception as exc:  # noqa: BLE001
             self._failed("saving a command result", exc)
 
+    def publish_key(self, public_b64: str) -> bool:
+        try:
+            self.client.table("bot_config").upsert({
+                "key": "account_pubkey", "value": public_b64, "updated_by": "supervisor",
+                "description": "Public key for logging into an MT5 account from the dashboard "
+                               "(the private half stays on the laptop).",
+            }, on_conflict="key").execute()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self._failed("publishing the login key", exc)
+            return False
+
+    def wipe_payload(self, cmd_id: int) -> None:
+        try:
+            self.client.table("bot_commands").update({"payload": None}).eq("id", cmd_id).execute()
+        except Exception as exc:  # noqa: BLE001
+            self._failed("clearing a login message", exc)
+
     def heartbeat(self, running: bool, note: str | None) -> None:
         if not self.available:
             return
@@ -345,6 +368,105 @@ def git_update(runner: Callable[[list[str], float], tuple[bool, str]] = run_cmd
 
 
 # --------------------------------------------------------------------------- #
+# Account login (dashboard)
+# --------------------------------------------------------------------------- #
+
+
+def load_or_make_key(key: str):
+    """This bot's RSA key (made the first time). Returns (private key,
+    public key as base64 DER) or (None, None) if cryptography is missing."""
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+    except ImportError:
+        logger.warning("cryptography not installed: logging in from the dashboard is off")
+        return None, None
+    import base64
+
+    key_dir = ROOT / KEY_DIR_NAME
+    path = key_dir / f"{key}_account.pem"
+    if path.exists():
+        priv = serialization.load_pem_private_key(path.read_bytes(), password=None)
+    else:
+        key_dir.mkdir(exist_ok=True)
+        priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        path.write_bytes(priv.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ))
+    der = priv.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return priv, base64.b64encode(der).decode()
+
+
+def decrypt_login(priv, payload: str) -> dict[str, Any]:
+    """Phone's RSA-OAEP (SHA-256) message -> {login, password, server}."""
+    import base64
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    raw = priv.decrypt(
+        base64.b64decode(payload),
+        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                     algorithm=hashes.SHA256(), label=None),
+    )
+    data = json.loads(raw.decode())
+    login = int(str(data.get("login", "")).strip())
+    password = str(data.get("password", ""))
+    server = str(data.get("server", "")).strip()
+    if login <= 0 or not password or not server:
+        raise ValueError("account number, password and broker server are all needed")
+    return {"login": login, "password": password, "server": server}
+
+
+def _env_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def write_login(env_path: Path, login: int, password: str, server: str) -> None:
+    """Swap MT5_LOGIN / MT5_PASSWORD / MT5_SERVER in the bot's env file,
+    leaving every other line as it is."""
+    new = {"MT5_LOGIN": str(login), "MT5_PASSWORD": _env_quote(password), "MT5_SERVER": server}
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    out, seen = [], set()
+    for line in lines:
+        name = line.split("=", 1)[0].strip()
+        if name in new and not line.lstrip().startswith("#"):
+            out.append(f"{name}={new[name]}")
+            seen.add(name)
+        else:
+            out.append(line)
+    out += [f"{k}={v}" for k, v in new.items() if k not in seen]
+    env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def try_mt5_login(env_path: Path, login: int, password: str, server: str) -> tuple[bool, str]:
+    """Log the bot's MT5 terminal into the account (the bot is stopped
+    while this runs). True + a short description if it worked."""
+    try:
+        import MetaTrader5 as mt5
+    except ImportError:
+        return False, "MetaTrader5 package not installed"
+    from dotenv import dotenv_values
+
+    kwargs: dict[str, Any] = {"login": login, "password": password, "server": server}
+    path = dotenv_values(env_path).get("MT5_PATH")
+    if path:
+        kwargs["path"] = path
+    try:
+        if not mt5.initialize(**kwargs):
+            return False, f"MT5 wouldn't log in: {mt5.last_error()}"
+        info = mt5.account_info()
+        if info is None or info.login != login:
+            return False, f"MT5 wouldn't log in: {mt5.last_error()}"
+        return True, f"{info.login} on {info.server}, balance {info.balance:.2f} {info.currency}"
+    finally:
+        mt5.shutdown()
+
+
+# --------------------------------------------------------------------------- #
 # Supervisor
 # --------------------------------------------------------------------------- #
 
@@ -358,6 +480,9 @@ class Supervisor:
     heartbeat_seconds: float = 15.0
     relaunch: bool = False
     _last_beat: float = field(default=0.0, repr=False)
+    keys: dict[str, Any] = field(default_factory=dict, repr=False)
+    login_tester: Callable[[Path, int, str, str], tuple[bool, str]] = try_mt5_login
+    _key_published: set[str] = field(default_factory=set, repr=False)
 
     def save_state(self) -> None:
         try:
@@ -392,6 +517,8 @@ class Supervisor:
             bot.start()
             self.save_state()
             return True, f"{bot.label} bot restarted" + ("" if clean else " (had to force the stop)")
+        if name == "login":
+            return self.switch_account(key, cmd)
         if name == "update":
             ok, out, sup_changed = self.updater()
             if not ok:
@@ -409,6 +536,39 @@ class Supervisor:
             names = " and ".join(restarted) or "no"
             return True, out + f"\nRestarted {names} bot{'s' if len(restarted) != 1 else ''} on the new code."
         return False, f"unknown command {name!r}"
+
+    def switch_account(self, key: str, cmd: dict[str, Any]) -> tuple[bool, str]:
+        bot = self.bots[key]
+        priv = self.keys.get(key)
+        if priv is None:
+            return False, "Logging in from the dashboard isn't set up on the laptop (cryptography missing)"
+        try:
+            acct = decrypt_login(priv, cmd.get("payload") or "")
+        except Exception as exc:  # noqa: BLE001
+            return False, f"Couldn't read the login ({exc}). Nothing changed."
+        env_path = ROOT / BOTS[key][1]
+        was_running = bot.running
+        if was_running:
+            bot.stop()
+        ok, what = self.login_tester(env_path, acct["login"], acct["password"], acct["server"])
+        if ok:
+            write_login(env_path, acct["login"], acct["password"], acct["server"])
+            msg = f"Logged in: {what}. Saved in {BOTS[key][1]}."
+        else:
+            msg = f"{what}. Kept the old account."
+        if bot.wanted:
+            bot.crashes = 0
+            bot.start()
+            msg += f" {bot.label} bot restarted."
+        return ok, msg
+
+    def publish_keys(self) -> None:
+        for key, ch in self.channels.items():
+            if ch is None or key in self._key_published or key not in self.keys:
+                continue
+            pub = self.keys[key + ":pub"]
+            if ch.available and ch.publish_key(pub):
+                self._key_published.add(key)
 
     def poll_commands(self) -> None:
         for key, ch in self.channels.items():
@@ -430,6 +590,8 @@ class Supervisor:
                     logger.exception("command failed")
                     ok, out = False, f"error: {exc}"
                 ch.finish(cid, ok, out)
+                if cmd.get("payload"):
+                    ch.wipe_payload(cid)
                 logger.info(f"dashboard: {cmd.get('command')} {ch.label}: {'done' if ok else 'FAILED'}")
                 if self.relaunch:
                     return
@@ -447,6 +609,7 @@ class Supervisor:
     def tick(self) -> None:
         for bot in self.bots.values():
             bot.check()
+        self.publish_keys()
         self.poll_commands()
         self.heartbeat()
 
@@ -509,7 +672,16 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"{BOTS[k][0]}: Supabase not reachable ({exc}); buttons off for it")
             channels[k] = None
-    sup = Supervisor(bots=bots, channels=channels)
+    login_keys: dict[str, Any] = {}
+    for k in keys:
+        try:
+            priv, pub = load_or_make_key(k)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"{BOTS[k][0]}: login key problem ({exc}); dashboard login off for it")
+            priv = pub = None
+        if priv is not None:
+            login_keys[k], login_keys[k + ":pub"] = priv, pub
+    sup = Supervisor(bots=bots, channels=channels, keys=login_keys)
     sup.save_state()
     logger.info(
         "supervisor running: " + ", ".join(

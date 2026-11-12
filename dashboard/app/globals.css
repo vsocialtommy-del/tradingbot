@@ -203,3 +203,7 @@ h3 { font-size: 10px; letter-spacing: 2px; color: var(--gold); margin: 14px 0 7p
   .zn { font-size: 12px; }
   .c i { font-size: 9px; } .c b { font-size: 10px; } .mw { font-size: 9px; } .cm { font-size: 9px; }
 }
+
+.card .live { font-size: 11px; letter-spacing: 1px; color: var(--muted); margin: 0 0 6px; }
+.card .live b { font-size: 15px; margin-left: 6px; letter-spacing: 0; }
+.acct .cmd b { color: var(--text, #fff); font-weight: 600; }

@@ -72,3 +72,26 @@ export function checkMaxLosses(raw: unknown): number | null | Error {
   }
   return n;
 }
+
+// The MT5 account the bot is logged into now (from its status row), so the
+// calendar only shows that account's trades. null = not known yet.
+export async function currentAccount(sb: NonNullable<ReturnType<typeof db>>, bot: Bot): Promise<number | null> {
+  const { data } = await sb.from("bot_status").select("data").eq("bot", bot).maybeSingle();
+  const login = (data?.data as { account?: { login?: number } } | undefined)?.account?.login;
+  return typeof login === "number" ? login : null;
+}
+
+// closed_trades for this account (rows from before SQL 017 have no account
+// and are shown too). Falls back to all rows if the column isn't there yet.
+export async function tradesQuery<T>(
+  sb: NonNullable<ReturnType<typeof db>>, bot: Bot, cols: string,
+  build: (q: any) => any,
+): Promise<{ data: T[] | null; error: { message: string } | null }> {
+  const login = await currentAccount(sb, bot);
+  const base = () => build(sb.from("closed_trades").select(cols).eq("bot", bot));
+  if (login !== null) {
+    const res = await base().or(`account.eq.${login},account.is.null`);
+    if (!res.error || !/account/i.test(res.error.message)) return res;
+  }
+  return base();
+}
