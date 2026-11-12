@@ -1932,16 +1932,19 @@ class Bot:
                 )
                 return False
 
-        # 0c. Direction gate (Nov 2026): with the M15 trend, or against it
-        # only when the zone sits inside / touches a fresh H1 zone in the
-        # same direction. Runs after the price gate so it's only computed
+        # 0c. Direction gate (Nov 2026): with the trend on the bot's own
+        # chart (M5 bot: M5, M1 bot: M1, since 12 Nov 2026), or against it
+        # only when the zone sits inside / touches a fresh higher-timeframe
+        # zone in the same direction (H1 / M15). Runs after the price gate so it's only computed
         # when price is actually at the zone.
         if self.config.direction_gate.enabled:
             decision = check_direction(
                 direction=zone.direction,
                 zone_bottom=float(zone.bottom),
                 zone_top=float(zone.top),
-                df_m5=ohlc_df,
+                # Closed candles only: the last row is still forming, and
+                # the trend only changes on a candle CLOSE.
+                df_m5=ohlc_df.iloc[:-1] if len(ohlc_df) > 1 else ohlc_df,
                 config=self.config.direction_gate,
                 pipeline_cfg=self.strategy_pipeline_config,
             )
@@ -2348,7 +2351,8 @@ class Bot:
         if cached is not None and cached[0] == key:
             return cached[1]
         try:
-            summary = trend_summary(df, self.config.direction_gate)
+            # Closed candles only (the last row is still forming).
+            summary = trend_summary(df.iloc[:-1] if len(df) > 1 else df, self.config.direction_gate)
         except Exception:  # noqa: BLE001
             logger.debug("dashboard: trend summary failed")
             return None

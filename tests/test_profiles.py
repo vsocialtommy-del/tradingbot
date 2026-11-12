@@ -22,7 +22,10 @@ class TestProfiles:
         assert cfg.bot_name == "M5"
         assert cfg.ohlc_timeframe == "M5"
         assert cfg.risk == base.risk                       # £100, 2 losses, -£300
-        assert cfg.direction_gate == base.direction_gate   # M15 + fresh H1
+        # 12 Nov 2026: trend read on M5 (its own chart), fresh H1 exception
+        assert cfg.direction_gate.trend_timeframe == "5min"
+        assert cfg.direction_gate.htf_timeframe == "1h"
+        assert cfg.direction_gate.trend_rule == "bos"
         assert cfg.xautism_entries == base.xautism_entries  # 75/25, 4 pt trail
         assert cfg.xautism_entries.m5_close_exit is False   # 30% SL only (10 Nov 2026)
         assert pipe == StrategyPipelineConfig()
@@ -31,7 +34,7 @@ class TestProfiles:
         cfg, pipe = build_profile("m1")
         assert cfg.bot_name == "M1" and cfg.ohlc_timeframe == "M1"
         assert pipe.zone_min_size_points == 1.0
-        assert cfg.direction_gate.trend_timeframe == "5min"
+        assert cfg.direction_gate.trend_timeframe == "1min"   # its own chart (12 Nov 2026)
         assert cfg.direction_gate.htf_timeframe == "15min"
         assert cfg.xautism_entries.runner_enabled
         assert cfg.xautism_entries.runner_keep_frac == 0.5
