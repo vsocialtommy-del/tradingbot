@@ -23,6 +23,8 @@ type StatusData = {
   } | null;
   open_positions?: Position[];
   next_buy?: Zone | null; next_sell?: Zone | null;
+  trend?: { state: "UPTREND" | "DOWNTREND" | "RANGE"; timeframe: string; rule: string;
+    since: string | null; up_above: number | null; down_below: number | null } | null;
 };
 type Command = { id: number; command: string; status: string; created_at: string; finished_at: string | null; output: string | null };
 type BotRow = {
@@ -91,6 +93,13 @@ function botState(b: BotRow, now: number): State {
 const NO_LIMIT = "50";
 const lossesText = (v: string | number | null | undefined) =>
   v === null || v === undefined || v === "" ? "–" : Number(v) >= 50 ? "No limit" : String(v);
+
+function TrendBadge({ t }: { t: StatusData["trend"] }) {
+  if (!t) return null;
+  const cls = t.state === "UPTREND" ? "up" : t.state === "DOWNTREND" ? "down" : "range";
+  const txt = t.state === "UPTREND" ? "▲ UP" : t.state === "DOWNTREND" ? "▼ DOWN" : "◆ RANGE";
+  return <span className={`trend ${cls}`}>{txt} · {t.timeframe}</span>;
+}
 
 const riskText = (r?: string) => (!r ? "" : r.endsWith("%") ? r : `£${r}`);
 
@@ -319,6 +328,7 @@ function BotCard({ b, now, trading, onOpen, onToggle }: {
           onClick={(e) => { e.stopPropagation(); onToggle(); }} />
       </div>
       <div className="st"><span className={`dot ${st.cls}`} />{st.label}</div>
+      <TrendBadge t={d.trend} />
       <div className="kv"><label>Balance</label><b>{d.account ? money(d.account.balance, cur) : "–"}</b></div>
       <div className="kv"><label>Today</label><b className={today ? tone(today.realised) : ""}>{today ? signed(today.realised, cur) : "–"}</b></div>
       <div className="kv"><label>W / L today</label><b>{today ? `${today.wins ?? 0}/${today.losses}` : "–"}</b></div>
@@ -399,6 +409,22 @@ function BotPopup({ b, now, trading, onClose, onToggle, onCommand, api, say, rel
           <div className="stat"><label>Balance</label><b>{d.account ? money(d.account.balance, cur) : "–"}</b></div>
           <div className="stat"><label>Today</label><b className={today ? tone(today.realised) : ""}>{today ? signed(today.realised, cur) : "–"}</b></div>
           <div className="stat"><label>W / L today</label><b>{today ? `${today.wins ?? 0}/${today.losses}` : "–"}</b></div>
+        </div>
+
+        <h3>TREND</h3>
+        <div className="box">
+          {d.trend ? (
+            <>
+              <TrendBadge t={d.trend} />{" "}
+              {d.trend.state === "RANGE" ? "No break yet, so buys and sells are both allowed." :
+                d.trend.state === "DOWNTREND" ? "Buys blocked (unless inside a fresh higher-timeframe zone)." :
+                "Sells blocked (unless inside a fresh higher-timeframe zone)."}
+              <br />
+              {d.trend.since && <>Since {dayMon(d.trend.since)} {hhmm(d.trend.since)} UK. </>}
+              {d.trend.up_above !== null && <>Turns <b className="pos">up</b> on an {d.trend.timeframe} close above <b>{d.trend.up_above.toFixed(2)}</b>. </>}
+              {d.trend.down_below !== null && <>Turns <b className="neg">down</b> on an {d.trend.timeframe} close below <b>{d.trend.down_below.toFixed(2)}</b>.</>}
+            </>
+          ) : "Waiting for the bot's first candles"}
         </div>
 
         <h3>OPEN TRADE</h3>

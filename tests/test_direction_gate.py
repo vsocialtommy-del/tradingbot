@@ -139,3 +139,29 @@ class TestBosTrendRule:
 
     def test_labels(self) -> None:
         assert (tf_label("15min"), tf_label("5min"), tf_label("1h")) == ("M15", "M5", "H1")
+
+
+class TestTrendSummary:
+    """What the dashboard shows: state, since when, and the flip level."""
+
+    def test_downtrend_with_flip_level(self) -> None:
+        from bot.strategy.direction_gate import trend_summary
+
+        df = _m5_from_closes(TestBosTrendRule.WATERFALL)
+        s = trend_summary(df, DirectionGateConfig())
+        assert s["state"] == "DOWNTREND" and s["timeframe"] == "M15" and s["rule"] == "bos"
+        assert s["since"] is not None and s["down_below"] is None
+        assert s["up_above"] is not None and s["up_above"] > df["close"].iloc[-1]
+
+    def test_m1_bot_reads_m5(self) -> None:
+        from bot.strategy.direction_gate import trend_summary
+
+        df = _m5_from_closes(TestBosTrendRule.WATERFALL)
+        s = trend_summary(df, DirectionGateConfig(trend_timeframe="5min"))
+        assert s["timeframe"] == "M5" and s["state"] == "DOWNTREND"
+
+    def test_too_little_data_is_range(self) -> None:
+        from bot.strategy.direction_gate import trend_summary
+
+        s = trend_summary(_m5_from_closes([100.0] * 6), DirectionGateConfig())
+        assert s["state"] == "RANGE" and s["since"] is None

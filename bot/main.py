@@ -134,7 +134,7 @@ from bot.strategy.strong_point import (
     ValidatedZone,
     compute_sl_price,
 )
-from bot.strategy.direction_gate import DirectionGateConfig, check_direction
+from bot.strategy.direction_gate import DirectionGateConfig, check_direction, trend_summary
 from bot.strategy.levels import LevelsConfig, TradeLevels, compute_levels
 from bot.strategy.stacked import StackedConfig, StackedPlan, stacked_plan
 from bot.risk.xautism_risk import (
@@ -2337,6 +2337,24 @@ class Bot:
                                   entry, sl, tp1, max(dist, 0.0)))
         return views
 
+    def _dashboard_trend(self) -> dict[str, Any] | None:
+        """The direction gate's current reading, recomputed once per new
+        candle (it only changes when a bar closes)."""
+        df = getattr(self, "_latest_ohlc", None)
+        if df is None or len(df) == 0 or not self.config.direction_gate.enabled:
+            return None
+        key = df.index[-1]
+        cached = getattr(self, "_trend_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            summary = trend_summary(df, self.config.direction_gate)
+        except Exception:  # noqa: BLE001
+            logger.debug("dashboard: trend summary failed")
+            return None
+        self._trend_cache = (key, summary)
+        return summary
+
     def _dashboard_status(self, now: datetime, bid: float, ask: float) -> dict[str, Any]:
         data: dict[str, Any] = {
             "bot": self.config.bot_name,
@@ -2399,6 +2417,7 @@ class Bot:
             }
             for p in positions
         ]
+        data["trend"] = self._dashboard_trend()
         buy, sell = pick_closest_zones(self._waiting_zone_views(bid, ask))
         data["next_buy"] = None if buy is None else buy.as_dict()
         data["next_sell"] = None if sell is None else sell.as_dict()

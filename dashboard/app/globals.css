@@ -60,6 +60,11 @@ header.top .grow { flex: 1; }
 .sw::after { content: ""; position: absolute; left: 2px; top: 2px; width: 16px; height: 16px; border-radius: 50%; background: #777; transition: all .2s; }
 .sw.on { background: linear-gradient(90deg, var(--gold), var(--gold2)); }
 .sw.on::after { left: 18px; background: #0b0b0b; }
+.trend { display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: 1px; border-radius: 6px; padding: 3px 7px; margin: 0 0 6px; border: 1px solid; }
+.trend.down { color: var(--down); border-color: rgba(255, 91, 91, .5); background: rgba(255, 91, 91, .1); }
+.trend.up { color: var(--up); border-color: rgba(60, 207, 122, .5); background: rgba(60, 207, 122, .1); }
+.trend.range { color: var(--muted); border-color: #3a3a3a; background: #141414; }
+.box .trend { margin: 0 4px 0 0; }
 .kv { display: flex; justify-content: space-between; align-items: baseline; padding: 6px 0; border-top: 1px solid var(--line2); gap: 6px; }
 .kv label { font-size: 8.5px; color: var(--muted); letter-spacing: 1px; text-transform: uppercase; white-space: nowrap; }
 .kv b { font-size: 14px; font-weight: 600; white-space: nowrap; }
