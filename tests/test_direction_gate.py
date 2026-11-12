@@ -160,8 +160,50 @@ class TestTrendSummary:
         s = trend_summary(df, DirectionGateConfig(trend_timeframe="5min"))
         assert s["timeframe"] == "M5" and s["state"] == "DOWNTREND"
 
+    def test_m5_bot_reads_its_own_chart(self) -> None:
+        """12 Nov 2026: M5 trend on M5 bars = the bars as they are."""
+        from bot.strategy.direction_gate import trend_summary
+
+        df = _m5_from_closes(TestBosTrendRule.WATERFALL)
+        assert resample_ohlc(df, "5min")["close"].tolist() == df["close"].tolist()
+        s = trend_summary(df, DirectionGateConfig(trend_timeframe="5min"))
+        assert s["timeframe"] == "M5" and s["state"] == "DOWNTREND"
+
+    def test_m1_bot_reads_its_own_chart(self) -> None:
+        from bot.strategy.direction_gate import trend_summary
+
+        df = _m5_from_closes(TestBosTrendRule.WATERFALL)
+        df.index = pd.date_range("2026-01-05T00:00:00Z", periods=len(df), freq="1min", tz="UTC")
+        assert len(resample_ohlc(df, "1min")) == len(df)
+        s = trend_summary(df, DirectionGateConfig(trend_timeframe="1min"))
+        assert s["timeframe"] == "M1" and s["state"] == "DOWNTREND"
+
     def test_too_little_data_is_range(self) -> None:
         from bot.strategy.direction_gate import trend_summary
 
         s = trend_summary(_m5_from_closes([100.0] * 6), DirectionGateConfig())
         assert s["state"] == "RANGE" and s["since"] is None
+
+
+class TestResampleSourceLength:
+    """The forming-bar check uses the real length of the source bars."""
+
+    def _m1(self, n: int) -> pd.DataFrame:
+        idx = pd.date_range("2026-11-12T09:00:00Z", periods=n, freq="1min", tz="UTC")
+        c = np.arange(n, dtype=float) + 4000
+        return pd.DataFrame({"open": c, "high": c, "low": c, "close": c}, index=idx)
+
+    def test_m1_bars_into_m5_drop_the_unfinished_m5(self) -> None:
+        # 09:00..09:06 closed M1 bars: the 09:05 M5 bar only has 2 of its 5.
+        out = resample_ohlc(self._m1(7), "5min")
+        assert list(out.index.strftime("%H:%M")) == ["09:00"]
+        assert out["close"].iloc[-1] == 4004.0
+
+    def test_m1_bars_into_m5_keep_a_finished_m5(self) -> None:
+        out = resample_ohlc(self._m1(10), "5min")   # 09:00..09:09
+        assert list(out.index.strftime("%H:%M")) == ["09:00", "09:05"]
+
+    def test_weekend_gap_does_not_confuse_the_bar_length(self) -> None:
+        a = self._m1(5)
+        b = a.copy(); b.index = b.index + pd.Timedelta(days=2)
+        assert dg.source_step(pd.concat([a, b])) == pd.Timedelta(minutes=1)

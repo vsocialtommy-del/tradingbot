@@ -120,7 +120,12 @@ def build_profile(name: str, risk: str | None = None, max_losses=None):
             raise ValueError("the risk switch is for the M1 bot only; the M5 bot stays at £100")
         if max_losses is not None:
             raise ValueError("the losses switch is for the M1 bot only; the M5 bot stays at 2 losses a day")
-        return replace(base, bot_name="M5"), pipeline
+        # 12 Nov 2026: the trend is read on the bot's own chart (M5), with
+        # Tommy's BOS rule. Fresh H1 zones still allow a counter-trend trade.
+        return replace(
+            base, bot_name="M5",
+            direction_gate=replace(base.direction_gate, trend_timeframe="5min"),
+        ), pipeline
     if name == "m1":
         losses = (
             parse_max_losses(max_losses) if max_losses not in (None, "")
@@ -132,7 +137,8 @@ def build_profile(name: str, risk: str | None = None, max_losses=None):
             bot_name="M1",
             ohlc_timeframe="M1",
             direction_gate=replace(
-                base.direction_gate, trend_timeframe="5min", htf_timeframe="15min",
+                # 12 Nov 2026: trend read on the M1 chart itself.
+                base.direction_gate, trend_timeframe="1min", htf_timeframe="15min",
             ),
             xautism_entries=replace(
                 base.xautism_entries, runner_keep_frac=0.5, runner_trail_points=2.0,

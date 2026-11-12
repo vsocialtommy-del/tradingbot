@@ -49,7 +49,8 @@ Direction = Literal["BUY", "SELL"]
 class DirectionGateConfig:
     enabled: bool = True
     trend_timeframe: str = "15min"
-    """Pandas resample rule for the direction timeframe (M15)."""
+    """Pandas resample rule for the direction timeframe. The live bots set
+    their own (12 Nov 2026): M5 bot reads M5, M1 bot reads M1."""
     trend_swing_strength: int = 3
     trend_min_swings: int = 4
     trend_rule: str = "bos"
@@ -70,8 +71,20 @@ class DirectionDecision:
     """(bottom, top) of the fresh H1 zone that allowed a counter-trend trade."""
 
 
+def source_step(df: pd.DataFrame) -> pd.Timedelta:
+    """Length of one source bar (M1 or M5), from the smallest gap between
+    the last few bars (weekend gaps are bigger, so the smallest is right)."""
+    if len(df) < 2:
+        return pd.Timedelta(minutes=5)
+    gaps = df.index[-12:].to_series().diff().dropna()
+    gaps = gaps[gaps > pd.Timedelta(0)]
+    return gaps.min() if len(gaps) else pd.Timedelta(minutes=5)
+
+
 def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    """Resample M5 OHLC to a higher timeframe (complete bars only)."""
+    """Resample closed M1/M5 bars to the trend timeframe (complete bars
+    only). Same timeframe in and out (M5 trend on M5 bars) = the bars as
+    they are."""
     agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
     if "volume" in df.columns:
         agg["volume"] = "sum"
@@ -82,8 +95,8 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     # the final M5 bar we have).
     if len(out) and len(df):
         step = pd.Timedelta(rule)
-        last_m5_end = df.index[-1] + pd.Timedelta(minutes=5)
-        if out.index[-1] + step > last_m5_end:
+        last_end = df.index[-1] + source_step(df)
+        if out.index[-1] + step > last_end:
             out = out.iloc[:-1]
     return out
 

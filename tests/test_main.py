@@ -4119,6 +4119,22 @@ class TestDashboard:
         t = b._dashboard_status(NOW, bid=3990.0, ask=3990.1)["trend"]
         assert t["state"] == "DOWNTREND" and t["timeframe"] == "M15"
 
+    def test_trend_ignores_the_forming_candle(self, bot) -> None:
+        """The trend only changes on a CLOSE: a forming candle spiking
+        above the swing high must not flip it to UP."""
+        import numpy as np
+        from dataclasses import replace
+        b, _ = bot
+        b.config = replace(b.config, direction_gate=replace(b.config.direction_gate, trend_timeframe="5min"))
+        b.mt5.get_account_info.return_value = {"balance": 1.0, "equity": 1.0}
+        c = np.concatenate([np.linspace(4100, 4060, 40), np.linspace(4060, 4070, 10),
+                            np.linspace(4070, 4040, 30)])
+        c = np.append(c, 4200.0)          # the forming candle, way above every high
+        idx = pd.date_range("2026-11-10", periods=len(c), freq="5min", tz="UTC")
+        b._latest_ohlc = pd.DataFrame({"open": c, "high": c + .3, "low": c - .3, "close": c, "volume": 1}, index=idx)
+        t = b._dashboard_status(NOW, bid=4200.0, ask=4200.1)["trend"]
+        assert t["state"] == "DOWNTREND" and t["timeframe"] == "M5"
+
     def test_status_survives_mt5_errors(self, bot) -> None:
         b, _ = bot
         b.mt5.get_account_info.side_effect = RuntimeError("IPC send failed")
