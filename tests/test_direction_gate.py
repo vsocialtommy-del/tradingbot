@@ -11,6 +11,7 @@ from bot.strategy.direction_gate import (
     DirectionGateConfig,
     check_direction,
     resample_ohlc,
+    tf_label,
     trend_state,
 )
 from bot.strategy.structure import StructureState
@@ -101,3 +102,40 @@ class TestCheckDirection:
                             df_m5=_m5_from_closes(UP),
                             config=DirectionGateConfig(enabled=False))
         assert d.allowed
+
+
+class TestBosTrendRule:
+    """Tommy's rule (12 Nov 2026): a close past the last swing = trend."""
+
+    # Like 11-12 Nov: a higher low in the last swings, then a one-way drop
+    # with no bounce big enough to make new swings.
+    WATERFALL = _zigzag([4100, 4060, 4090, 4015, 4065, 4038, 4050, 3990], bars_per_leg=36)
+
+    def test_old_rule_says_range_new_rule_sees_the_drop(self) -> None:
+        df = _m5_from_closes(self.WATERFALL)
+        old = DirectionGateConfig(trend_rule="swings")
+        assert trend_state(df, old) == StructureState.RANGE
+        assert trend_state(df, DirectionGateConfig()) == StructureState.DOWNTREND
+
+    def test_buy_blocked_in_the_drop(self) -> None:
+        df = _m5_from_closes(self.WATERFALL)
+        cfg = DirectionGateConfig(allow_counter_trend_from_htf_zone=False)
+        d = check_direction(direction="BUY", zone_bottom=3995, zone_top=3998, df_m5=df, config=cfg)
+        assert not d.allowed and d.trend == StructureState.DOWNTREND
+        assert "against M15 trend" in d.reason
+        assert check_direction(direction="SELL", zone_bottom=4000, zone_top=4003, df_m5=df, config=cfg).allowed
+
+    def test_close_above_last_swing_high_flips_to_uptrend(self) -> None:
+        # The drop, then a rally that closes above the last swing high.
+        df = _m5_from_closes(_zigzag([4100, 4060, 4090, 4040, 4070, 4020, 4045, 4030, 4080], bars_per_leg=36))
+        assert trend_state(df, DirectionGateConfig()) == StructureState.UPTREND
+
+    def test_m1_bot_reads_m5_and_says_so(self) -> None:
+        df = _m5_from_closes(self.WATERFALL)
+        cfg = DirectionGateConfig(trend_timeframe="5min", htf_timeframe="15min",
+                                  allow_counter_trend_from_htf_zone=False)
+        d = check_direction(direction="BUY", zone_bottom=3995, zone_top=3998, df_m5=df, config=cfg)
+        assert "M5 trend" in d.reason and "M15 zone" in d.reason
+
+    def test_labels(self) -> None:
+        assert (tf_label("15min"), tf_label("5min"), tf_label("1h")) == ("M15", "M5", "H1")
