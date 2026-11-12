@@ -24,7 +24,7 @@ type StatusData = {
   open_positions?: Position[];
   next_buy?: Zone | null; next_sell?: Zone | null;
   trend?: { state: "UPTREND" | "DOWNTREND" | "RANGE"; timeframe: string; rule: string;
-    since: string | null; up_above: number | null; down_below: number | null } | null;
+    since: string | null; up_above: number | null; down_below: number | null; filter?: string } | null;
 };
 type Command = { id: number; command: string; status: string; created_at: string; finished_at: string | null; output: string | null };
 type BotRow = {
@@ -33,7 +33,8 @@ type BotRow = {
     updated_at: string; data: StatusData; supervisor_seen_at: string | null;
     process_running: boolean | null; supervisor_note?: string | null;
   } | null;
-  killSwitch?: boolean; risk?: string | null; maxLosses?: number | null; commands?: Command[];
+  killSwitch?: boolean; risk?: string | null; maxLosses?: number | null; trendFilter?: string | null;
+  commands?: Command[];
 };
 type DayCell = { pnl: number; trades: number; wins: number; losses: number };
 type Month = { days: Record<string, DayCell>; total: number; trades: number; wins: number; losses: number };
@@ -94,11 +95,20 @@ const NO_LIMIT = "50";
 const lossesText = (v: string | number | null | undefined) =>
   v === null || v === undefined || v === "" ? "–" : Number(v) >= 50 ? "No limit" : String(v);
 
+// Trend filter (12 Nov 2026): off by default; when on it reads the bot's
+// own chart or one step up.
+const TREND_TF: Record<string, [string, string]> = { M5: ["M5", "M15"], M1: ["M1", "M5"] };
+const filterOff = (t: StatusData["trend"]) => !t || t.filter === "off";
+const trendFilterText = (bot: string, v?: string | null) => {
+  const [own, higher] = TREND_TF[bot] ?? ["own chart", "higher"];
+  return v === "own" ? `On · ${own}` : v === "higher" ? `On · ${higher}` : "Off";
+};
+
 function TrendBadge({ t }: { t: StatusData["trend"] }) {
   if (!t) return null;
   const cls = t.state === "UPTREND" ? "up" : t.state === "DOWNTREND" ? "down" : "range";
   const txt = t.state === "UPTREND" ? "▲ UP" : t.state === "DOWNTREND" ? "▼ DOWN" : "◆ RANGE";
-  return <span className={`trend ${cls}`}>{txt} · {t.timeframe}</span>;
+  return <span className={`trend ${cls}${filterOff(t) ? " info" : ""}`}>{txt} · {t.timeframe}{filterOff(t) ? " · info" : ""}</span>;
 }
 
 const riskText = (r?: string) => (!r ? "" : r.endsWith("%") ? r : `£${r}`);
@@ -416,7 +426,8 @@ function BotPopup({ b, now, trading, onClose, onToggle, onCommand, api, say, rel
           {d.trend ? (
             <>
               <TrendBadge t={d.trend} />{" "}
-              {d.trend.state === "RANGE" ? "No break yet, so buys and sells are both allowed." :
+              {filterOff(d.trend) ? "Trend filter is off, so this is info only: buys and sells are both allowed." :
+                d.trend.state === "RANGE" ? "No break yet, so buys and sells are both allowed." :
                 d.trend.state === "DOWNTREND" ? "Buys blocked (unless inside a fresh higher-timeframe zone)." :
                 "Sells blocked (unless inside a fresh higher-timeframe zone)."}
               <br />
@@ -454,6 +465,11 @@ function BotPopup({ b, now, trading, onClose, onToggle, onCommand, api, say, rel
             <label>Max losses / day</label>
             <div>{lossesText(d.settings?.max_losses ?? b.maxLosses)} {today ? <small>· {today.losses} used today</small> : null}</div>
             <div className="edit">{b.maxLosses ? "SET HERE · TAP TO CHANGE" : "BOT DEFAULT · TAP TO CHANGE"}</div>
+          </button>
+          <button className="field wide" onClick={() => setEditing(true)} disabled={!b.configured || !!b.error}>
+            <label>Trend filter</label>
+            <div>{trendFilterText(b.bot, d.trend?.filter ?? b.trendFilter)}</div>
+            <div className="edit">{b.trendFilter ? "SET HERE · TAP TO CHANGE" : "BOT DEFAULT · TAP TO CHANGE"}</div>
           </button>
         </div>
 
@@ -494,6 +510,8 @@ function SettingsEditor({ b, onClose, api, say, reload }: {
 }) {
   const [risk, setRisk] = useState<string>(b.risk ?? "");
   const [losses, setLosses] = useState<string>(b.maxLosses ? String(b.maxLosses) : "");
+  const [trend, setTrend] = useState<string>(b.trendFilter || "off");
+  const [own, higher] = TREND_TF[b.bot] ?? ["own chart", "higher"];
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const RISKS = ["0.5%", "1%", "2%", "50", "100", "150"];
@@ -504,7 +522,7 @@ function SettingsEditor({ b, onClose, api, say, reload }: {
     try {
       await api("/api/control", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ bot: b.bot, risk: risk || null, maxLosses: losses || null }),
+        body: JSON.stringify({ bot: b.bot, risk: risk || null, maxLosses: losses || null, trendFilter: trend }),
       });
       say(`${b.bot} settings saved. The bot picks them up within 30s.`);
       await reload();
@@ -533,6 +551,16 @@ function SettingsEditor({ b, onClose, api, say, reload }: {
             <button key={l} className={`chip ${losses === l ? "on" : ""}`} onClick={() => setLosses(l)}>{lossesText(l)}</button>
           ))}
         </div>
+        <h3>TREND FILTER</h3>
+        <div className="chips">
+          <button className={`chip ${trend === "off" ? "on" : ""}`} onClick={() => setTrend("off")}>Off</button>
+          <button className={`chip ${trend === "own" ? "on" : ""}`} onClick={() => setTrend("own")}>On · {own}</button>
+          <button className={`chip ${trend === "higher" ? "on" : ""}`} onClick={() => setTrend("higher")}>On · {higher}</button>
+        </div>
+        <p className="note">
+          Off = takes every zone, the trend badge is info only. On = no buys in a downtrend or sells in an uptrend on
+          that chart, unless the zone is inside a fresh {b.bot === "M1" ? "M15" : "H1"} zone.
+        </p>
         <p className="note">
           % = share of balance per trade, a number = fixed £ per trade. The bot also stops for the day once it&apos;s down
           (max losses + 1) trades&apos; worth. No limit = it keeps trading all day. Bot default = what&apos;s in its .env file. Changes apply within 30 seconds, from the next trade.

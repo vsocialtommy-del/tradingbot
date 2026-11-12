@@ -57,6 +57,13 @@ export function checkRisk(raw: unknown): string | null | Error {
   return String(amount);
 }
 
+export function checkTrendFilter(raw: unknown): string | Error {
+  if (raw === null || raw === undefined || raw === "") return "off";
+  const v = String(raw).trim().toLowerCase();
+  if (!["off", "own", "higher"].includes(v)) return new Error("Trend filter must be off, own or higher");
+  return v;
+}
+
 export function checkMaxLosses(raw: unknown): number | null | Error {
   if (raw === null || raw === undefined || raw === "") return null;
   const n = Number(raw);

@@ -4135,6 +4135,40 @@ class TestDashboard:
         t = b._dashboard_status(NOW, bid=4200.0, ask=4200.1)["trend"]
         assert t["state"] == "DOWNTREND" and t["timeframe"] == "M5"
 
+    def test_trend_filter_switch_from_the_dashboard(self, bot) -> None:
+        from dataclasses import replace
+        from bot.profiles import trend_gate
+        b, _ = bot
+        b.config = replace(b.config, bot_name="M1",
+                           direction_gate=trend_gate(b.config.direction_gate, "M1", "off"))
+        b._trend_filter = "off"
+        b._apply_trend_filter("higher")
+        assert b.config.direction_gate.enabled and b.config.direction_gate.trend_timeframe == "5min"
+        b._apply_trend_filter("own")
+        assert b.config.direction_gate.enabled and b.config.direction_gate.trend_timeframe == "1min"
+        b._apply_trend_filter("rubbish")          # ignored, last good setting stays
+        assert b.config.direction_gate.trend_timeframe == "1min" and b._trend_filter == "own"
+        b._apply_trend_filter("")                 # bot default = off
+        assert b.config.direction_gate.enabled is False
+
+    def test_badge_shows_with_the_filter_off_in_uk_time(self, bot) -> None:
+        import numpy as np
+        from dataclasses import replace
+        b, _ = bot
+        b.config = replace(b.config, direction_gate=replace(b.config.direction_gate, enabled=False, trend_timeframe="5min"))
+        b._trend_filter = "off"
+        b.daily_risk._offset = timedelta(hours=2)   # broker clock UTC+2
+        b.mt5.get_account_info.return_value = {"balance": 1.0, "equity": 1.0}
+        c = np.concatenate([np.linspace(4100, 4060, 40), np.linspace(4060, 4070, 10),
+                            np.linspace(4070, 4040, 30), [4040.0]])
+        idx = pd.date_range("2026-11-10", periods=len(c), freq="5min", tz="UTC")
+        b._latest_ohlc = pd.DataFrame({"open": c, "high": c + .3, "low": c - .3, "close": c, "volume": 1}, index=idx)
+        t = b._dashboard_status(NOW, bid=4040.0, ask=4040.1)["trend"]
+        assert t["state"] == "DOWNTREND" and t["filter"] == "off"
+        from bot.strategy.direction_gate import trend_summary
+        raw = trend_summary(b._latest_ohlc.iloc[:-1], replace(b.config.direction_gate, enabled=True))
+        assert pd.Timestamp(t["since"]) == pd.Timestamp(raw["since"]) - timedelta(hours=2)
+
     def test_status_survives_mt5_errors(self, bot) -> None:
         b, _ = bot
         b.mt5.get_account_info.side_effect = RuntimeError("IPC send failed")
