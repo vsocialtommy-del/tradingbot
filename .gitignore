@@ -29,6 +29,9 @@ ENV/
 !.env.example
 !.env.m1.example
 
+# Dashboard login keys (private, made on the laptop by the supervisor)
+keys/
+
 # Secrets / credentials
 *.pem
 *.key

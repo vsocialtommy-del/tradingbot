@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 
-import { db, fail, isBot, needLogin } from "@/lib/db";
+import { db, fail, isBot, needLogin, tradesQuery } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
@@ -24,9 +24,9 @@ export async function GET(req: NextRequest) {
   // Trades are shown on the day their last position closed, so also look
   // at the day before for layers that closed before the 22:00 reset.
   const prev = new Date(Date.parse(`${date}T12:00:00Z`) - 86_400_000).toISOString().slice(0, 10);
-  const { data: raw, error } = await sb.from("closed_trades")
-    .select("position_id, setup_key, direction, volume, open_time, close_time, open_price, close_price, profit, trading_day")
-    .eq("bot", bot).gte("trading_day", prev).lte("trading_day", date).order("open_time");
+  const { data: raw, error } = await tradesQuery<Row & { trading_day: string }>(sb, bot,
+    "position_id, setup_key, direction, volume, open_time, close_time, open_price, close_price, profit, trading_day",
+    (q) => q.gte("trading_day", prev).lte("trading_day", date).order("open_time"));
   if (error) return fail(error.message, 500);
   const lastDay = new Map<string, string>();
   for (const r of raw ?? []) {

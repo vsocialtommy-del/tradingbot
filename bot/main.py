@@ -2425,6 +2425,7 @@ class Bot:
             acct = self.mt5.get_account_info()
             data["account"] = {
                 "login": acct.get("login"),
+                "server": acct.get("server"),
                 "currency": acct.get("currency"),
                 "balance": round(float(acct.get("balance", 0.0)), 2),
                 "equity": round(float(acct.get("equity", 0.0)), 2),
@@ -2489,7 +2490,8 @@ class Bot:
         except Exception:
             logger.exception("dashboard: reading MT5 history failed (trading not affected)")
             return
-        self.dashboard.sync_trades(rows)
+        login = getattr(self.mt5, "_login", None)
+        self.dashboard.sync_trades(rows, account=login if isinstance(login, int) else None)
         if self.dashboard.available:
             self._calendar_backfilled = True
 

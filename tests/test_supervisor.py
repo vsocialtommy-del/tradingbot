@@ -362,3 +362,75 @@ class TestSingleInstanceLock:
         assert sp.run([sys.executable, "-c", code], check=False).returncode == 0
         first.close()
         assert sp.run([sys.executable, "-c", code.replace("is None", "is not None")], check=False).returncode == 0
+
+
+# --------------------------------------------------------------------------- #
+# Account login from the dashboard (12 Nov 2026)
+# --------------------------------------------------------------------------- #
+
+
+def _seal(pub_b64: str, data: dict[str, Any]) -> str:
+    """What the phone does (Web Crypto RSA-OAEP SHA-256)."""
+    import base64
+    import json as _json
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    pub = serialization.load_der_public_key(base64.b64decode(pub_b64))
+    ct = pub.encrypt(_json.dumps(data).encode(), padding.OAEP(
+        mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+    return base64.b64encode(ct).decode()
+
+
+class TestAccountLogin:
+    def _setup(self, tmp_path, tester):
+        sup, m5db, m1db = _sup()
+        priv, pub = sv.load_or_make_key("m5")
+        sup.keys = {"m5": priv, "m5:pub": pub}
+        sup.login_tester = tester
+        (tmp_path / ".env").write_text(
+            "SUPABASE_URL=x\nMT5_LOGIN=5058387501\nMT5_PASSWORD=old\nMT5_SERVER=MetaQuotes-Demo\nMT5_PATH=C:\\MT5\n")
+        return sup, m5db, pub
+
+    def test_key_is_made_once_and_kept_private(self, tmp_path) -> None:
+        priv1, pub1 = sv.load_or_make_key("m1")
+        priv2, pub2 = sv.load_or_make_key("m1")
+        assert pub1 == pub2 and (tmp_path / "keys" / "m1_account.pem").exists()
+
+    def test_login_works_saves_env_and_wipes_message(self, tmp_path) -> None:
+        seen = []
+        sup, m5db, pub = self._setup(tmp_path, lambda p, l, pw, s: (seen.append((l, pw, s)) or True, f"{l} on {s}"))
+        old_proc = sup.bots["m5"].proc
+        _cmd(m5db, 1, "M5", "login")
+        m5db.tables["bot_commands"][0]["payload"] = _seal(pub, {"login": "1510000123", "password": 'p#ss "w"\\x', "server": "FTMO-Demo"})
+        sup.poll_commands()
+        row = m5db.tables["bot_commands"][0]
+        assert row["status"] == "done" and "1510000123 on FTMO-Demo" in row["output"]
+        assert row["payload"] is None                       # wiped from Supabase
+        assert "p#ss" not in row["output"]                  # password never echoed
+        assert seen == [(1510000123, 'p#ss "w"\\x', "FTMO-Demo")]
+        from dotenv import dotenv_values
+        env = dotenv_values(tmp_path / ".env")
+        assert env["MT5_LOGIN"] == "1510000123" and env["MT5_SERVER"] == "FTMO-Demo"
+        assert env["MT5_PASSWORD"] == 'p#ss "w"\\x'          # quoting survives
+        assert env["SUPABASE_URL"] == "x" and env["MT5_PATH"] == "C:\\MT5"
+        assert sup.bots["m5"].running and sup.bots["m5"].proc is not old_proc
+
+    def test_failed_login_keeps_old_account(self, tmp_path) -> None:
+        sup, m5db, pub = self._setup(tmp_path, lambda *a: (False, "MT5 wouldn't log in: (-6, 'Authorization failed')"))
+        _cmd(m5db, 1, "M5", "login")
+        m5db.tables["bot_commands"][0]["payload"] = _seal(pub, {"login": "123456", "password": "x", "server": "FTMO-Demo"})
+        sup.poll_commands()
+        row = m5db.tables["bot_commands"][0]
+        assert row["status"] == "failed" and "Kept the old account" in row["output"]
+        assert "MT5_LOGIN=5058387501" in (tmp_path / ".env").read_text()
+        assert sup.bots["m5"].running
+
+    def test_garbage_message_changes_nothing(self, tmp_path) -> None:
+        sup, m5db, _ = self._setup(tmp_path, lambda *a: (True, "should not be called"))
+        _cmd(m5db, 1, "M5", "login")
+        m5db.tables["bot_commands"][0]["payload"] = "bm90IGEgcmVhbCBtZXNzYWdl" * 6
+        sup.poll_commands()
+        assert m5db.tables["bot_commands"][0]["status"] == "failed"
+        assert "MT5_LOGIN=5058387501" in (tmp_path / ".env").read_text()
