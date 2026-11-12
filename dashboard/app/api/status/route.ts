@@ -24,8 +24,8 @@ async function one(bot: Bot) {
       : err.message) : null,
     status: status.data ?? null,
     killSwitch: cfg.kill_switch === true,
-    risk: (cfg.risk as string | null) ?? null,
-    maxLosses: (cfg.max_losses as number | null) ?? null,
+    risk: (cfg.risk as string | null) || null,       // "" = bot default
+    maxLosses: (cfg.max_losses as number | null) || null,
     commands: commands.data ?? [],
   };
 }
