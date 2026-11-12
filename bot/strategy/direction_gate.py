@@ -95,7 +95,18 @@ def tf_label(rule: str) -> str:
     return f"H{mins // 60}" if mins >= 60 and mins % 60 == 0 else f"M{mins}"
 
 
-def bos_trend(htf: pd.DataFrame, strength: int) -> StructureState:
+@dataclass(frozen=True)
+class BosTrend:
+    state: StructureState
+    since: pd.Timestamp | None
+    """Open time of the bar whose close set the current state."""
+    last_high: float | None
+    """Last confirmed swing high: a close above it = uptrend."""
+    last_low: float | None
+    """Last confirmed swing low: a close below it = downtrend."""
+
+
+def bos_trend_detail(htf: pd.DataFrame, strength: int) -> BosTrend:
     """Tommy's rule: walk the bars in order; a close below the last
     confirmed swing low = DOWNTREND, a close above the last confirmed swing
     high = UPTREND. A swing at bar i is only known once bar i+strength has
@@ -104,6 +115,7 @@ def bos_trend(htf: pd.DataFrame, strength: int) -> StructureState:
     swings = {sw.index: sw for sw in detect_swings(htf, strength)}
     last_high = last_low = None
     state = StructureState.RANGE
+    since = None
     for t in range(len(closes)):
         sw = swings.get(t - strength)
         if sw is not None:
@@ -112,11 +124,43 @@ def bos_trend(htf: pd.DataFrame, strength: int) -> StructureState:
             else:
                 last_low = sw.price
         c = closes[t]
+        new = state
         if last_low is not None and c < last_low:
-            state = StructureState.DOWNTREND
+            new = StructureState.DOWNTREND
         elif last_high is not None and c > last_high:
-            state = StructureState.UPTREND
-    return state
+            new = StructureState.UPTREND
+        if new != state:
+            state, since = new, htf.index[t]
+    return BosTrend(state, since, last_high, last_low)
+
+
+def bos_trend(htf: pd.DataFrame, strength: int) -> StructureState:
+    return bos_trend_detail(htf, strength).state
+
+
+def trend_summary(df_m5: pd.DataFrame, cfg: DirectionGateConfig) -> dict:
+    """What the direction gate thinks right now, for the dashboard."""
+    out: dict = {"timeframe": tf_label(cfg.trend_timeframe), "rule": cfg.trend_rule,
+                 "state": StructureState.RANGE.value, "since": None,
+                 "up_above": None, "down_below": None}
+    htf = resample_ohlc(df_m5, cfg.trend_timeframe)
+    if len(htf) < 2 * cfg.trend_swing_strength + 1:
+        return out
+    if cfg.trend_rule == "bos":
+        d = bos_trend_detail(htf, cfg.trend_swing_strength)
+        out.update(
+            state=d.state.value,
+            since=None if d.since is None
+            else (d.since + pd.Timedelta(cfg.trend_timeframe)).isoformat(),  # the close that did it
+            # The level that would flip it the other way.
+            up_above=None if d.state == StructureState.UPTREND or d.last_high is None
+            else round(float(d.last_high), 2),
+            down_below=None if d.state == StructureState.DOWNTREND or d.last_low is None
+            else round(float(d.last_low), 2),
+        )
+    else:
+        out["state"] = trend_state(df_m5, cfg).value
+    return out
 
 
 def trend_state(df_m5: pd.DataFrame, cfg: DirectionGateConfig) -> StructureState:

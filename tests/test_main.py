@@ -4104,6 +4104,20 @@ class TestDashboard:
         assert data["settings"]["from_dashboard"] is False
         assert data["spread"] == 0.1
         assert data["next_buy"] is None and data["next_sell"] is None
+        assert data["trend"] is None  # no candles yet
+
+    def test_status_shows_the_trend(self, bot) -> None:
+        import numpy as np
+        b, _ = bot
+        b.mt5.get_account_info.return_value = {"balance": 1.0, "equity": 1.0}
+        c = np.concatenate([np.linspace(4100, 4060, 40), np.linspace(4060, 4090, 40),
+                            np.linspace(4090, 4015, 60), np.linspace(4015, 4065, 50),
+                            np.linspace(4065, 4038, 30), np.linspace(4038, 4050, 20),
+                            np.linspace(4050, 3990, 80)])
+        idx = pd.date_range("2026-11-10", periods=len(c), freq="5min", tz="UTC")
+        b._latest_ohlc = pd.DataFrame({"open": c, "high": c + .3, "low": c - .3, "close": c, "volume": 1}, index=idx)
+        t = b._dashboard_status(NOW, bid=3990.0, ask=3990.1)["trend"]
+        assert t["state"] == "DOWNTREND" and t["timeframe"] == "M15"
 
     def test_status_survives_mt5_errors(self, bot) -> None:
         b, _ = bot
