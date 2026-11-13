@@ -432,3 +432,31 @@ class TestWickCloseBos:
         refined = _dbr_refined(df, base_start=5, base_end=6, top=102.0, bottom=100.0)
         v = validate_strong_point(refined, df, StrongPointConfig(bos_close_beyond_wick=True))
         assert v.validation_failures == ["NO_BOS"]
+
+
+class TestUsedOnceLeft:
+    """Tommy's freshness rule (13 Nov 2026): price left the zone (a candle
+    opened and closed fully outside), came back into it before the BOS ->
+    the zone is used for good."""
+
+    # Bar 8 opens and closes above the zone (top 102); bar 9 dips back to
+    # 101.8 (into the zone); bar 10 then closes 111.5 past the 110 swing (BOS).
+    ROWS = _DBR_ROWS[:9] + [(108.5, 108.6, 101.8, 107.0), (107.0, 112.0, 106.5, 111.5)] + _DBR_ROWS[10:]
+
+    def test_reentry_before_bos_uses_the_zone(self) -> None:
+        df = _ohlc(self.ROWS)
+        refined = _dbr_refined(df, base_start=5, base_end=6, top=102.0, bottom=100.0)
+        v = validate_strong_point(refined, df)
+        assert v.is_strong_point is False
+        assert v.validation_failures == ["ZONE_REENTERED_BEFORE_BOS"]
+
+    def test_switch_off_gives_the_old_behaviour(self) -> None:
+        df = _ohlc(self.ROWS)
+        refined = _dbr_refined(df, base_start=5, base_end=6, top=102.0, bottom=100.0)
+        v = validate_strong_point(refined, df, StrongPointConfig(used_once_left=False))
+        assert v.is_strong_point is True and v.broken_at == df.index[10]
+
+    def test_untouched_zone_is_still_fresh(self) -> None:
+        df = _ohlc(_DBR_ROWS)
+        refined = _dbr_refined(df, base_start=5, base_end=6, top=102.0, bottom=100.0)
+        assert validate_strong_point(refined, df).is_strong_point is True
