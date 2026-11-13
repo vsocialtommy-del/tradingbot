@@ -136,6 +136,9 @@ class StrategyPipelineConfig:
     bos_close_beyond_wick: bool = False
     """BOS must close beyond the swing's wick (M1 bot, 12 Nov 2026)."""
     require_fresh_since_bos: bool = True
+    used_once_left: bool = True
+    """Zone used once price has left it and come back, even before the
+    BOS (Tommy's freshness rule, 13 Nov 2026, both bots)."""
 
     # TP1 target — read by ``main`` when computing TP1 for each zone.
     # Kept on the pipeline config so the operator only tunes one config
@@ -231,6 +234,7 @@ def run_strategy_pipeline(
         bos_swing_strength=cfg.bos_swing_strength,
         bos_close_beyond_wick=cfg.bos_close_beyond_wick,
         require_fresh_since_bos=cfg.require_fresh_since_bos,
+        used_once_left=cfg.used_once_left,
     )
 
     # Swings are needed by every pattern's BOS check; compute them once.

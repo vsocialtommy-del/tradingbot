@@ -53,6 +53,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+import numpy as np
 import pandas as pd
 from loguru import logger
 
@@ -68,6 +69,7 @@ ValidationFailure = Literal[
     "PATTERN_NOT_ALLOWED",
     "NO_BOS",
     "ZONE_USED_SINCE_BOS",
+    "ZONE_REENTERED_BEFORE_BOS",
 ]
 
 
@@ -102,6 +104,11 @@ class StrongPointConfig:
     """Swing pivot strength on closes (the line-chart W / M points)."""
 
     require_fresh_since_bos: bool = True
+    used_once_left: bool = True
+    """Tommy's freshness rule (13 Nov 2026, both bots): once a candle has
+    opened AND closed fully outside the zone, any later touch (even a
+    wick, even before the BOS) uses the zone up for good. A later BOS
+    doesn't make it fresh again."""
     """Only the first retest is traded: if any bar after the BOS bar has
     already traded into the zone edge (BUY: low <= top, SELL:
     high >= bottom) the zone is used (``ZONE_USED_SINCE_BOS``). Bars
@@ -200,6 +207,9 @@ def validate_strong_point(
             refined, df, bos_idx,
         ):
             failures.append("ZONE_USED_SINCE_BOS")
+            return _build_unvalidated(refined, failures)
+        if cfg.used_once_left and _reentered_after_leaving(refined, df, bos_idx):
+            failures.append("ZONE_REENTERED_BEFORE_BOS")
             return _build_unvalidated(refined, failures)
 
     logger.debug(
@@ -342,6 +352,32 @@ def _zone_touched_after(
         return bool((lows <= refined.top).any())
     highs = df["high"].to_numpy()[bos_idx + 1:]
     return bool((highs >= refined.bottom).any())
+
+
+def _reentered_after_leaving(
+    refined: RefinedZone, df: pd.DataFrame, bos_idx: int,
+) -> bool:
+    """True iff, between the base and the BOS, price left the zone (a
+    candle opened AND closed fully outside it) and then came back into it
+    (SELL: high >= bottom, BUY: low <= top). Touches after the BOS are
+    the normal ``_zone_touched_after`` check."""
+    base_end = refined.source_pattern.base.end_index
+    end = min(bos_idx, len(df) - 1)
+    if end <= base_end + 1:
+        return False
+    o = df["open"].to_numpy()[base_end + 1:end + 1]
+    c = df["close"].to_numpy()[base_end + 1:end + 1]
+    if refined.direction == "SELL":
+        out = np.nonzero((o < refined.bottom) & (c < refined.bottom))[0]
+        if not len(out):
+            return False
+        highs = df["high"].to_numpy()[base_end + 2 + out[0]:end + 1]
+        return bool((highs >= refined.bottom).any())
+    out = np.nonzero((o > refined.top) & (c > refined.top))[0]
+    if not len(out):
+        return False
+    lows = df["low"].to_numpy()[base_end + 2 + out[0]:end + 1]
+    return bool((lows <= refined.top).any())
 
 
 def _pattern_code(pattern: Pattern) -> str:
