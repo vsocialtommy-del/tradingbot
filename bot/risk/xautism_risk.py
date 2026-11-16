@@ -3,7 +3,9 @@
 * Fixed money risk per trade (both layers together), sized off the
   broker's own loss-per-lot so it's right in the account currency.
 * Daily loss limit: realised today + floating on open positions.
-* Two losing trades and done for the day.
+* Two losing trades and done for the day. On the M5 bot a trade where
+  only the 0.01 entry layer filled (layer 2 never did) doesn't count
+  toward that limit (16 Nov 2026); the daily £ limit still sees it.
 * Spread filter on new entries.
 
 (One trade at a time = ``BotLoopConfig.max_simultaneous_setups = 1``.)
@@ -44,6 +46,10 @@ class RiskConfig:
     max_daily_loss: float = 300.0
     """Realised today + floating. At or past this, no new trades today."""
     max_losses_per_day: int = 2
+    count_first_layer_only_losses: bool = True
+    """False = a losing trade where only the 0.01 entry layer filled
+    (layer 2 never did) doesn't count toward ``max_losses_per_day``. Its
+    money still counts toward the daily £ limit. M5 bot: False (16 Nov 2026)."""
     max_loss_streak: int | None = None
     """Stop for the day after this many losing trades IN A ROW (a win
     resets it, a breakeven doesn't). None = off. M1 bot: 4 (12 Nov 2026)."""
@@ -124,6 +130,9 @@ class DailyRisk:
     losing_trades: int
     winning_trades: int = 0  # net above zero; breakevens count as neither
     loss_streak: int = 0     # losing trades in a row at the end of today
+    first_layer_only_losses: int = 0
+    """Losing trades (included in ``losing_trades``) where only the 0.01
+    entry layer filled."""
 
     @property
     def total(self) -> float:
@@ -151,6 +160,7 @@ def summarise_day(
     day_start: datetime,
     trading_day: str,
     known: dict[int, str] | None = None,
+    first_layer_lots: float = 0.01,
 ) -> DailyRisk:
     """Group the bot's deals into trades (one setup = layer 1 + layer 2)
     and total today's P/L.
@@ -179,6 +189,18 @@ def summarise_day(
         trade_of_pos[ticket] = tag
 
     open_trades = {trade_of_pos[p["ticket"]] for p in open_positions if p["ticket"] in trade_of_pos}
+
+    # Lots each trade actually opened. A trade whose fills add up to no
+    # more than the 0.01 entry layer never got layer 2. Deals without a
+    # volume leave the trade unknown, so it counts as a normal trade.
+    in_lots: dict[str, float | None] = {}
+    for d in deals:
+        if d.get("entry") != DEAL_ENTRY_IN or d.get("position_id") not in trade_of_pos:
+            continue
+        key = trade_of_pos[d.get("position_id")]
+        vol = d.get("volume")
+        prev = in_lots.get(key, 0.0)
+        in_lots[key] = None if vol is None or prev is None else prev + float(vol)
 
     realised = 0.0
     net: dict[str, float] = {}
@@ -219,6 +241,10 @@ def summarise_day(
         losing_trades=sum(1 for v in closed.values() if v < 0),
         winning_trades=sum(1 for v in closed.values() if v > 0),
         loss_streak=streak,
+        first_layer_only_losses=sum(
+            1 for k, v in closed.items()
+            if v < 0 and in_lots.get(k) is not None and in_lots[k] <= first_layer_lots + 1e-9
+        ),
     )
 
 
@@ -227,9 +253,12 @@ def check_risk(daily: DailyRisk, config: RiskConfig) -> RiskVerdict:
         return RiskVerdict(True, (
             f"daily loss {daily.total:.2f} at or past -{config.max_daily_loss:.0f}"
         ), daily)
-    if daily.losing_trades >= config.max_losses_per_day:
+    counted = daily.losing_trades
+    if not config.count_first_layer_only_losses:
+        counted -= daily.first_layer_only_losses
+    if counted >= config.max_losses_per_day:
         return RiskVerdict(True, (
-            f"{daily.losing_trades} losing trades today "
+            f"{counted} losing trades today "
             f"(max {config.max_losses_per_day})"
         ), daily)
     if config.max_loss_streak and daily.loss_streak >= config.max_loss_streak:

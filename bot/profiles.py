@@ -155,6 +155,9 @@ def build_profile(name: str, risk: str | None = None, max_losses=None):
         return replace(
             base, bot_name="M5",
             direction_gate=trend_gate(base.direction_gate, "M5", "off"),
+            # 16 Nov 2026: a 0.01-only loss (layer 2 never filled) doesn't
+            # use up one of the 2 losses a day. The daily £ limit still counts it.
+            risk=replace(base.risk, count_first_layer_only_losses=False),
         ), pipeline
     if name == "m1":
         losses = (

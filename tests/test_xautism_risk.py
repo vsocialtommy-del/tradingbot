@@ -127,6 +127,61 @@ class TestCheckRisk:
         assert not check_risk(DailyRisk("x", -100.0, 0.0, 1, 1), self.cfg).blocked
 
 
+def vdeal(pos, entry, vol, *, profit=0.0, comment=""):
+    d = deal(pos, entry, profit=profit, comment=comment)
+    d["volume"] = vol
+    return d
+
+
+class TestFirstLayerOnlyLosses:
+    """16 Nov 2026: on the M5 a 0.01-only loss doesn't use up one of the 2 losses."""
+
+    def _day(self):
+        return [
+            # 0.01 only, SL: -£2.50
+            vdeal(1, DEAL_ENTRY_IN, 0.01, comment="s=aaaaaaaa"), vdeal(1, DEAL_ENTRY_OUT, 0.01, profit=-2.5),
+            # full trade, 0.01 + 0.18, SL: -£100
+            vdeal(2, DEAL_ENTRY_IN, 0.01, comment="s=bbbbbbbb"), vdeal(3, DEAL_ENTRY_IN, 0.18, comment="s=bbbbbbbb"),
+            vdeal(2, DEAL_ENTRY_OUT, 0.01, profit=-5.0), vdeal(3, DEAL_ENTRY_OUT, 0.18, profit=-95.0),
+            # another 0.01 only, SL: -£12
+            vdeal(4, DEAL_ENTRY_IN, 0.01, comment="s=cccccccc"), vdeal(4, DEAL_ENTRY_OUT, 0.01, profit=-12.0),
+        ]
+
+    def test_counted_in_summary(self) -> None:
+        d = summarise_day(self._day(), [], magic=MAGIC, day_start=DAY_START, trading_day="x")
+        assert d.losing_trades == 3
+        assert d.first_layer_only_losses == 2
+
+    def test_m5_rule_ignores_them(self) -> None:
+        d = summarise_day(self._day(), [], magic=MAGIC, day_start=DAY_START, trading_day="x")
+        assert not check_risk(d, RiskConfig(count_first_layer_only_losses=False)).blocked
+        assert check_risk(d, RiskConfig()).blocked          # old rule: 3 losses
+
+    def test_two_full_losses_still_stop(self) -> None:
+        deals = self._day() + [
+            vdeal(5, DEAL_ENTRY_IN, 0.01, comment="s=dddddddd"), vdeal(6, DEAL_ENTRY_IN, 0.20, comment="s=dddddddd"),
+            vdeal(5, DEAL_ENTRY_OUT, 0.01, profit=-5.0), vdeal(6, DEAL_ENTRY_OUT, 0.20, profit=-95.0),
+        ]
+        d = summarise_day(deals, [], magic=MAGIC, day_start=DAY_START, trading_day="x")
+        v = check_risk(d, RiskConfig(count_first_layer_only_losses=False, max_daily_loss=1000))
+        assert v.blocked and "2 losing" in v.reason
+
+    def test_money_still_counts_toward_daily_limit(self) -> None:
+        d = DailyRisk("x", -305.0, 0.0, 3, 3, first_layer_only_losses=3)
+        v = check_risk(d, RiskConfig(count_first_layer_only_losses=False))
+        assert v.blocked and "daily loss" in v.reason
+
+    def test_unknown_volume_counts_as_a_normal_loss(self) -> None:
+        deals = [deal(1, DEAL_ENTRY_IN, comment="s=aaaaaaaa"), deal(1, DEAL_ENTRY_OUT, profit=-2.5)]
+        d = summarise_day(deals, [], magic=MAGIC, day_start=DAY_START, trading_day="x")
+        assert d.losing_trades == 1 and d.first_layer_only_losses == 0
+
+    def test_first_layer_only_win_not_flagged(self) -> None:
+        deals = [vdeal(1, DEAL_ENTRY_IN, 0.01, comment="s=aaaaaaaa"), vdeal(1, DEAL_ENTRY_OUT, 0.01, profit=0.8)]
+        d = summarise_day(deals, [], magic=MAGIC, day_start=DAY_START, trading_day="x")
+        assert d.first_layer_only_losses == 0
+
+
 def test_trading_day_starts_17_00_new_york() -> None:
     now = datetime(2026, 11, 4, 5, 42, tzinfo=timezone.utc)
     assert trading_day_start(now) == datetime(2026, 11, 3, 22, 0, tzinfo=timezone.utc)

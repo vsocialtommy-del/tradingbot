@@ -149,6 +149,11 @@ class TestLiveRisk:
         assert live_risk(base) is base
         assert live_risk(base, "", "") is base
 
+    def test_m5_ignores_first_layer_only_losses_m1_does_not(self) -> None:
+        assert build_profile("m5")[0].risk.count_first_layer_only_losses is False
+        assert live_risk(build_profile("m5")[0].risk, None, 3).count_first_layer_only_losses is False
+        assert build_profile("m1", "1%")[0].risk.count_first_layer_only_losses is True
+
     def test_m5_can_switch_to_percent(self) -> None:
         base = build_profile("m5")[0].risk
         r = live_risk(base, "0.5%", 4)

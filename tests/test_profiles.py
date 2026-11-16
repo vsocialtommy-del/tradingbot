@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import sys
 from unittest.mock import MagicMock
 
@@ -21,7 +23,8 @@ class TestProfiles:
         base = BotLoopConfig()
         assert cfg.bot_name == "M5"
         assert cfg.ohlc_timeframe == "M5"
-        assert cfg.risk == base.risk                       # £100, 2 losses, -£300
+        # £100, 2 losses, -£300; 0.01-only losses don't count (16 Nov 2026)
+        assert cfg.risk == replace(base.risk, count_first_layer_only_losses=False)
         # 12 Nov 2026: trend read on M5 (its own chart), fresh H1 exception
         assert cfg.direction_gate.trend_timeframe == "5min"
         assert cfg.direction_gate.enabled is False           # filter off by default
