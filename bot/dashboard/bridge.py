@@ -56,6 +56,26 @@ def _deal_pnl(d: dict[str, Any]) -> float:
     )
 
 
+def positions_missing_open(deals: Iterable[dict[str, Any]]) -> set[int]:
+    """Positions with a closing deal in ``deals`` but no opening deal.
+
+    The calendar sync only reads a short window of history, so a trade
+    held longer than that (over a weekend, say) arrives without its
+    opening deal and would be dropped. The caller looks these up by
+    position id."""
+    opened: set[int] = set()
+    closed: set[int] = set()
+    for d in deals:
+        pos = d.get("position_id")
+        if pos is None:
+            continue
+        if d.get("entry") == DEAL_ENTRY_IN:
+            opened.add(int(pos))
+        elif d.get("entry") in _OUT_ENTRIES:
+            closed.add(int(pos))
+    return closed - opened
+
+
 def build_closed_trades(
     deals: Iterable[dict[str, Any]],
     *,

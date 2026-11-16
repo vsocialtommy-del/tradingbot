@@ -107,6 +107,7 @@ from bot.dashboard.bridge import (
     build_closed_trades,
     calendar_day,
     pick_closest_zones,
+    positions_missing_open,
 )
 from bot.filters.forex_factory import ForexFactoryCalendar
 from bot.filters.news_filter import NewsFilter, NewsFilterConfig
@@ -2485,6 +2486,15 @@ class Bot:
             offset = self.daily_risk.offset
             since = now - timedelta(days=days) + offset
             deals = self.mt5.get_deals(since, now + timedelta(days=1))
+            # A trade held longer than the window (a weekend hold) closes
+            # inside it but opened before it: fetch its opening deal by
+            # position id, or the calendar never shows that trade.
+            seen = {d.get("ticket") for d in deals}
+            for pos in positions_missing_open(deals):
+                for d in self.mt5.get_position_deals(pos):
+                    if d.get("ticket") not in seen:
+                        deals.append(d)
+                        seen.add(d.get("ticket"))
             rows = build_closed_trades(
                 deals, bot=self.config.bot_name, magic=self.mt5.magic,
                 server_offset=offset, known=self.daily_risk.known,
