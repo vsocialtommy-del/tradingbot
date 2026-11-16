@@ -4234,6 +4234,42 @@ class TestCalendarSyncClock:
         assert since == NOW - timedelta(days=2) + timedelta(hours=2)
 
 
+class TestCalendarLongHolds:
+    """A trade held longer than the sync window (a weekend hold) still lands
+    on the calendar: its opening deal is fetched by position id."""
+
+    def _deal(self, ticket, pos, entry, t, vol=0.07, profit=0.0):
+        return {"ticket": ticket, "position_id": pos, "entry": entry, "time": t,
+                "volume": vol, "price": 3874.17, "profit": profit, "swap": 0.0,
+                "commission": 0.0, "fee": 0.0, "magic": 0, "type": 0, "comment": "bot:L2stop:s=abc12345"}
+
+    def test_open_deal_outside_window_is_fetched(self, bot, mock_supabase) -> None:
+        b, _ = bot
+        b.mt5.get_current_price.return_value = {
+            "bid": 1.0, "ask": 1.1, "time": NOW + timedelta(hours=2), "time_msc": 0,
+        }
+        magic = b.mt5.magic
+        t_open = (NOW - timedelta(days=3)).timestamp()
+        t_close = (NOW - timedelta(hours=1)).timestamp()
+        opening = self._deal(1, 77, 0, t_open) | {"magic": magic}
+        closing = self._deal(2, 77, 1, t_close, profit=32.43)
+        b.mt5.get_deals.return_value = [closing]
+        b.mt5.get_position_deals.return_value = [opening, closing]
+        b._calendar_backfilled = True
+        b._sync_closed_trades(NOW)
+        b.mt5.get_position_deals.assert_called_once_with(77)
+        rows = [r for c in mock_supabase.upsert_rows.call_args_list if c.args[0] == "closed_trades"
+                for r in c.args[1]]
+        assert len(rows) == 1 and rows[0]["position_id"] == 77
+        assert rows[0]["profit"] == pytest.approx(32.43)   # closing deal not counted twice
+
+    def test_no_lookup_when_open_deal_is_in_window(self, bot, mock_supabase) -> None:
+        from bot.dashboard.bridge import positions_missing_open
+        assert positions_missing_open([self._deal(1, 5, 0, 1.0), self._deal(2, 5, 1, 2.0)]) == set()
+        assert positions_missing_open([self._deal(2, 5, 1, 2.0)]) == {5}
+        assert positions_missing_open([{"entry": 1}]) == set()
+
+
 class TestCalendarAccount:
     def test_rows_tagged_with_the_account_and_old_rows_claimed(self) -> None:
         from unittest.mock import MagicMock

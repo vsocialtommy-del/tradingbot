@@ -471,6 +471,13 @@ class MT5Connector:
             return []
         return [d._asdict() for d in deals]
 
+    def get_position_deals(self, position_id: int) -> list[dict[str, Any]]:
+        """Every deal of one position, however long ago it opened."""
+        deals = mt5.history_deals_get(position=int(position_id))
+        if deals is None:
+            return []
+        return [d._asdict() for d in deals]
+
     @property
     def magic(self) -> int:
         return self._magic
