@@ -158,7 +158,9 @@ def build_profile(name: str, risk: str | None = None, max_losses=None):
             # 16 Nov 2026: a 0.01-only loss (layer 2 never filled) doesn't
             # use up one of the 2 losses a day. The daily £ limit still counts it.
             risk=replace(base.risk, count_first_layer_only_losses=False),
-        ), pipeline
+            # 17 Nov 2026: tight 2-3 pt zones allowed (min 2 pts, was 3).
+            # 22-month backtest: +£7,214 vs +£6,915, drawdown -£1,295 vs -£1,551.
+        ), replace(pipeline, zone_min_size_points=2.0)
     if name == "m1":
         losses = (
             parse_max_losses(max_losses) if max_losses not in (None, "")
