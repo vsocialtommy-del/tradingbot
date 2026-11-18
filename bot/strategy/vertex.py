@@ -25,6 +25,12 @@ Supply (RBD), mirrored for demand (DBR):
   (``leg_min_frac``). The foot is the BOS level and the TP.
 * When several vertex lengths fit, the shortest one (latest start) is
   used: the candles after the last leg-in candle.
+* **M / W only** (``require_mw``, on for the M5 bot from 18 Nov 2026):
+  on the line chart (closes, from 2 candles before the vertex to the
+  first leg-out candle) price must make two tops (sell) / two lows (buy)
+  inside the zone, with a pullback between them that is also inside the
+  zone and at least ``mw_min_pull`` (10 %) of the zone height deep. A
+  single spike (one top, price straight in and out) is not a zone.
 
 The resulting :class:`Pattern` goes through the normal pipeline (size
 filter, body-break, BOS, fresh-since-BOS) exactly like classic patterns.
@@ -58,6 +64,11 @@ class VertexConfig:
     """The leg out must close beyond the zone by at least this fraction
     of the zone height. Stops a small dip just under the vertex low from
     counting as the exit (that would cut the vertex short)."""
+    require_mw: bool = False
+    """Keep only clear M (sell) / W (buy) zones; drop single spikes."""
+    mw_min_pull: float = 0.10
+    """The pullback between the two tops / lows must be at least this
+    fraction of the zone height (a tiny wiggle doesn't make an M)."""
 
 
 def detect_vertex_patterns(df: pd.DataFrame, config: VertexConfig | None = None) -> list[Pattern]:
@@ -95,7 +106,54 @@ def detect_vertex_patterns(df: pd.DataFrame, config: VertexConfig | None = None)
                 found.append(_pattern(direction, idx, o, h, l, c, in_s, in_e, s, e,
                                       out_s, out_e, top, bottom, foot))
                 break
-    return _dedupe(found)
+    out = _dedupe(found)
+    if cfg.require_mw:
+        out = [p for p in out if is_mw_shape(
+            c, p.base.start_index, p.base.end_index, p.base.bottom, p.base.top,
+            p.direction == "SELL", cfg.mw_min_pull)]
+    return out
+
+
+def is_mw_shape(c, s: int, e: int, bottom: float, top: float, sell: bool,
+                min_pull: float = 0.10) -> bool:
+    """True when the line chart makes an M (sell) / W (buy) inside the zone.
+
+    Looks at the closes from 2 candles before the vertex (``s``) to the first
+    leg-out candle (``e + 1``). Needs two tops (sell) / lows (buy) whose
+    closes are inside ``bottom``-``top``, with a pullback between them that
+    is inside the zone too and at least ``min_pull`` of the zone height deep.
+    """
+    if s < 2:
+        return False
+    seq = np.asarray(c[s - 2:e + 2], dtype=float)
+    v = seq if sell else -seq
+    peaks: list[int] = []
+    troughs: list[int] = []
+    for i in range(1, len(v) - 1):
+        a = i - 1
+        while a > 0 and v[a] == v[i]:
+            a -= 1
+        b = i + 1
+        while b < len(v) - 1 and v[b] == v[i]:
+            b += 1
+        if v[i] > v[a] and v[i] > v[b]:
+            peaks.append(i)
+        if v[i] < v[a] and v[i] < v[b]:
+            troughs.append(i)
+
+    def inside(i: int) -> bool:
+        return bottom - 1e-9 <= seq[i] <= top + 1e-9
+
+    tops = [i for i in peaks if inside(i)]
+    need = min_pull * (top - bottom) - 1e-9
+    for x in range(len(tops)):
+        for y in range(x + 1, len(tops)):
+            between = [k for k in troughs if tops[x] < k < tops[y]]
+            if between and all(inside(k) for k in between):
+                depth = min(v[tops[x]], v[tops[y]]) - min(v[k] for k in between)
+                if depth >= need:
+                    return True
+    return False
 
 
 def _try(direction, s, e, out_start, top, bottom, o, h, l, c,

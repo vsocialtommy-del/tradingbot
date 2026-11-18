@@ -160,7 +160,9 @@ def build_profile(name: str, risk: str | None = None, max_losses=None):
             risk=replace(base.risk, count_first_layer_only_losses=False),
             # 17 Nov 2026: tight 2-3 pt zones allowed (min 2 pts, was 3).
             # 22-month backtest: +£7,214 vs +£6,915, drawdown -£1,295 vs -£1,551.
-        ), replace(pipeline, zone_min_size_points=2.0)
+            # 18 Nov 2026: M / W zones only, no single spikes (pullback at least
+            # 10% of the zone). Tommy's rule: a spike is not a zone.
+        ), replace(pipeline, zone_min_size_points=2.0, vertex_require_mw=True)
     if name == "m1":
         losses = (
             parse_max_losses(max_losses) if max_losses not in (None, "")

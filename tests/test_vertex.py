@@ -114,3 +114,60 @@ def test_zigzag_foot_skips_small_pullback() -> None:
 
 def test_default_foot_is_zigzag_quarter() -> None:
     assert StrategyPipelineConfig().vertex_foot_zigzag_frac == 0.25
+
+
+# 18 Nov 2026: M / W only. Same rally in and drop out as M_TOP, but the
+# vertex just slides down from one top: a single spike, not a zone.
+SPIKE_TOP = FLAT + [
+    (4014.2, 4016.8, 4014.0, 4016.6),   # leg in (bull)
+    (4016.6, 4018.6, 4014.8, 4018.4),   # leg in (bull)
+    (4017.5, 4023.2, 4017.4, 4023.0),   # leg in (bull, big): the only top
+    (4023.0, 4025.3, 4022.0, 4022.4),   # vertex, each close lower
+    (4022.4, 4022.8, 4021.0, 4021.5),
+    (4021.5, 4021.9, 4020.0, 4020.6),
+    (4020.6, 4021.0, 4018.8, 4019.6),
+    (4019.6, 4020.0, 4018.0, 4019.2),
+    (4019.2, 4019.5, 4015.4, 4015.6),   # leg out (bear)
+    (4015.6, 4016.2, 4011.0, 4011.5),
+]
+
+
+def test_spike_found_without_the_mw_rule() -> None:
+    sells = [p for p in detect_vertex_patterns(frame(SPIKE_TOP)) if p.direction == "SELL"]
+    assert len(sells) == 1
+
+
+def test_mw_rule_keeps_the_m_and_drops_the_spike() -> None:
+    cfg = VertexConfig(require_mw=True)
+    assert len([p for p in detect_vertex_patterns(frame(M_TOP), cfg) if p.direction == "SELL"]) == 1
+    assert [p for p in detect_vertex_patterns(frame(SPIKE_TOP), cfg) if p.direction == "SELL"] == []
+
+
+def test_mw_rule_mirror_for_buys() -> None:
+    cfg = VertexConfig(require_mw=True)
+    flip = lambda rows: [(8000 - o, 8000 - l, 8000 - h, 8000 - c) for o, h, l, c in rows]
+    assert len([p for p in detect_vertex_patterns(frame(flip(M_TOP)), cfg) if p.direction == "BUY"]) == 1
+    assert [p for p in detect_vertex_patterns(frame(flip(SPIKE_TOP)), cfg) if p.direction == "BUY"] == []
+
+
+class TestIsMwShape:
+    # closes: 2 before the vertex, the vertex, the first leg-out candle
+    def test_two_tops_with_a_real_pullback(self) -> None:
+        from bot.strategy.vertex import is_mw_shape
+        c = [4010, 4019, 4018.2, 4016.6, 4018.0, 4012]   # tops 4018.2 / 4018.0, pullback 4016.6
+        assert is_mw_shape(c, 2, 4, 4016.0, 4020.0, sell=True)   # 1.4 pts = 35% of a 4 pt zone
+
+    def test_tiny_wiggle_is_a_spike(self) -> None:
+        from bot.strategy.vertex import is_mw_shape
+        c = [4010, 4019, 4018.2, 4018.0, 4018.1, 4012]   # 0.1 pt dip = 2.5% of the zone
+        assert not is_mw_shape(c, 2, 4, 4016.0, 4020.0, sell=True)
+
+    def test_pullback_outside_the_zone_doesnt_count(self) -> None:
+        from bot.strategy.vertex import is_mw_shape
+        c = [4010, 4019, 4018.2, 4015.0, 4018.0, 4012]   # pullback below the zone bottom
+        assert not is_mw_shape(c, 2, 4, 4016.0, 4020.0, sell=True)
+
+    def test_w_for_buys(self) -> None:
+        from bot.strategy.vertex import is_mw_shape
+        c = [4030, 4021, 4021.8, 4023.4, 4022.0, 4028]
+        assert is_mw_shape(c, 2, 4, 4020.0, 4024.0, sell=False)

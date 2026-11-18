@@ -489,7 +489,8 @@ def _precompute_vertex(m5: pd.DataFrame, pcfg: StrategyPipelineConfig) -> list:
         min_base=pcfg.vertex_min_base, max_base=pcfg.vertex_max_base,
         max_leg=pcfg.vertex_max_leg, exit_frac=pcfg.vertex_exit_frac,
         leg_min_frac=pcfg.vertex_leg_min_frac,
-        foot_zigzag_frac=pcfg.vertex_foot_zigzag_frac))
+        foot_zigzag_frac=pcfg.vertex_foot_zigzag_frac,
+        require_mw=pcfg.vertex_require_mw, mw_min_pull=pcfg.vertex_mw_min_pull))
     c = m5["close"].to_numpy(float)
     out = []
     for p in pats:
