@@ -25,7 +25,7 @@ Supply (RBD), mirrored for demand (DBR):
   (``leg_min_frac``). The foot is the BOS level and the TP.
 * When several vertex lengths fit, the shortest one (latest start) is
   used: the candles after the last leg-in candle.
-* **M / W only** (``require_mw``, on for the M5 bot from 18 Nov 2026):
+* **M / W only** (``require_mw``, on for both bots from 18 Nov 2026):
   on the line chart (closes, from 2 candles before the vertex to the
   first leg-out candle) price must make two tops (sell) / two lows (buy)
   inside the zone, with a pullback between them that is also inside the

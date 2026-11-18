@@ -42,7 +42,8 @@ class TestProfiles:
         assert cfg.bot_name == "M1" and cfg.ohlc_timeframe == "M1"
         assert pipe.zone_min_size_points == 1.0
         assert pipe.bos_close_beyond_wick is True          # wick-close BOS, M1 only
-        assert pipe.vertex_require_mw is False             # no-spike rule is M5 only (18 Nov 2026)
+        assert pipe.vertex_require_mw is True              # no spikes, M / W only (18 Nov 2026)
+        assert pipe.vertex_mw_min_pull == 0.10
         assert cfg.direction_gate.trend_timeframe == "1min"   # its own chart (12 Nov 2026)
         assert cfg.direction_gate.enabled is False           # filter off by default
         assert cfg.direction_gate.htf_timeframe == "15min"

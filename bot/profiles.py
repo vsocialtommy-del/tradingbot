@@ -197,5 +197,9 @@ def build_profile(name: str, risk: str | None = None, max_losses=None):
         )
         # 12 Nov 2026: BOS must close beyond the swing's wick (M1 only;
         # 3-month backtest: +£11,085 vs +£10,118, drawdown -£1,547 vs -£2,053).
-        return cfg, replace(pipeline, zone_min_size_points=1.0, bos_close_beyond_wick=True)
+        # 18 Nov 2026: M / W zones only, no single spikes (same rule as the M5
+        # bot, pullback at least 10% of the zone). 3-month M1 backtest: TP rate
+        # 68.9% vs 67.0%, 707 trades vs 870.
+        return cfg, replace(pipeline, zone_min_size_points=1.0, bos_close_beyond_wick=True,
+                            vertex_require_mw=True)
     raise ValueError(f"unknown bot {name!r} (expected one of {sorted(ENV_FILES)})")
