@@ -131,6 +131,10 @@ class StrategyPipelineConfig:
     """Zigzag foot: ignore pullbacks whose bounce is under 25 % of the zone
     height when finding the BOS / TP level (Nov 2026 backtest: +£1,788 vs
     +£1,148 with the first-dip foot). 0 = old first-dip foot."""
+    vertex_require_mw: bool = False
+    """Only clear M / W zones, no single spikes (see :mod:`bot.strategy.vertex`)."""
+    vertex_mw_min_pull: float = 0.10
+    """M / W pullback must be at least this share of the zone height."""
     require_bos: bool = True
     bos_swing_strength: int = 2
     bos_close_beyond_wick: bool = False
@@ -217,6 +221,8 @@ def run_strategy_pipeline(
             max_leg=cfg.vertex_max_leg, exit_frac=cfg.vertex_exit_frac,
             leg_min_frac=cfg.vertex_leg_min_frac,
             foot_zigzag_frac=cfg.vertex_foot_zigzag_frac,
+            require_mw=cfg.vertex_require_mw,
+            mw_min_pull=cfg.vertex_mw_min_pull,
         ))
         wick_extend = 0   # vertex zones are exactly wick to wick
     else:

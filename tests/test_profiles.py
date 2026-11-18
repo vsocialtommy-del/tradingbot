@@ -32,7 +32,8 @@ class TestProfiles:
         assert cfg.direction_gate.trend_rule == "bos"
         assert cfg.xautism_entries == base.xautism_entries  # 75/25, 4 pt trail
         assert cfg.xautism_entries.m5_close_exit is False   # 30% SL only (10 Nov 2026)
-        assert pipe == replace(StrategyPipelineConfig(), zone_min_size_points=2.0)
+        assert pipe == replace(StrategyPipelineConfig(), zone_min_size_points=2.0, vertex_require_mw=True)
+        assert pipe.vertex_require_mw is True and pipe.vertex_mw_min_pull == 0.10   # 18 Nov 2026: no spikes
         assert pipe.zone_min_size_points == 2.0            # 17 Nov 2026 (was 3)
         assert pipe.bos_close_beyond_wick is False         # M5 keeps the standard BOS
 
@@ -41,6 +42,7 @@ class TestProfiles:
         assert cfg.bot_name == "M1" and cfg.ohlc_timeframe == "M1"
         assert pipe.zone_min_size_points == 1.0
         assert pipe.bos_close_beyond_wick is True          # wick-close BOS, M1 only
+        assert pipe.vertex_require_mw is False             # no-spike rule is M5 only (18 Nov 2026)
         assert cfg.direction_gate.trend_timeframe == "1min"   # its own chart (12 Nov 2026)
         assert cfg.direction_gate.enabled is False           # filter off by default
         assert cfg.direction_gate.htf_timeframe == "15min"
