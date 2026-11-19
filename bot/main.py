@@ -97,6 +97,7 @@ from bot.execution.layer2_stop import (
 )
 from bot.exits.m5_close_exit import run_m5_close_exit
 from bot.exits.runner_trail import RunnerTrailManager
+from bot.plan import DrawdownBreaker, PlanConfig
 from bot.exits.trailing_stop_manager import TrailingStopManager
 from bot.exits.zone_exit_manager import ZoneExitManager
 from bot.signals.next_signal_writer import NextSignalWriter
@@ -323,6 +324,10 @@ class BotLoopConfig:
     enable_balance_pct_halt: bool = False
     """Old % of balance daily halt. XAUTISM uses the -£300 / 2 losses
     rule in ``risk`` instead."""
+    plan: PlanConfig | None = None
+    """Claude's plan (19 Nov 2026, M1 bot): also trade M5 zones, runner
+    doesn't block, -£200 room-checked dead stop, drawdown breaker. See
+    :mod:`bot.plan`. None = the bot as before."""
     ohlc_timeframe: Literal["M1", "M5"] = "M5"
     """Entry timeframe: zones, the close exit and the layer logic all run
     on these bars. ``M5`` for the M5 bot, ``M1`` for the M1 bot
@@ -428,6 +433,18 @@ class Bot:
             self.config.xautism_entries, symbol=self.config.symbol,
         )
         self.daily_risk = DailyRiskTracker(mt5, symbol=self.config.symbol)
+        # Claude's plan (M1 bot): M5 zones alongside M1, per-timeframe runner.
+        self._zone_tf: dict[UUID, str] = {}
+        self._setup_tf: dict[str, str] = {}
+        self._plan_m5_df: pd.DataFrame | None = None
+        self._plan_m5_pending: list[tuple[ValidatedZone, UUID]] = []
+        self._plan_m5_cache: VertexPatternCache | None = None
+        self._plan_breaker: DrawdownBreaker | None = None
+        if self.config.plan is not None:
+            self._plan_breaker = DrawdownBreaker(
+                self.config.plan.state_file, self.config.plan.drawdown_steps,
+            )
+            self.runner_trail.trail_for = self._trail_for_setup
         # Phone dashboard (Nov 2026): status / calendar / live settings.
         self.dashboard = DashboardBridge(supabase, self.config.bot_name)
         self._base_risk = self.config.risk
@@ -516,6 +533,17 @@ class Bot:
                if xc.runner_enabled else "off")
             + f", candle close exit {'on' if xc.m5_close_exit else 'off (30% SL only)'}"
         )
+        if self.config.plan is not None:
+            pc = self.config.plan
+            logger.info(
+                f"Claude's plan ON: M1 zones ({self.config.ohlc_count} M1 bars) + M5 zones "
+                f"({pc.m5_ohlc_count} M5 bars); M5 runner "
+                f"{(1 - pc.m5_entries.runner_keep_frac) * 100:.0f}/{pc.m5_entries.runner_keep_frac * 100:.0f} "
+                f"{pc.m5_entries.runner_trail_points:g} pt trail; one trade at a time"
+                f"{', a risk-free runner does not block' if pc.runner_frees_slot else ''}; "
+                f"-£{pc.daily_stop:.0f} dead stop with room check; drawdown breaker "
+                + ", ".join(f"x{m:g} at -£{b:.0f}" for b, m in sorted(pc.drawdown_steps))
+            )
         self.mt5.connect()
         try:
             self.state.starting_balance = self.mt5.get_balance()
@@ -1005,6 +1033,8 @@ class Bot:
             self._live_risk_raw = raw
             return
         self._live_risk_raw = raw
+        if self.config.plan is not None:
+            new = plan_risk(new, self.config.plan)
         if new != self.config.risk:
             self.config = replace(self.config, risk=new)
             self.daily_risk.invalidate()
@@ -1093,27 +1123,45 @@ class Bot:
         so the bot keeps trading, and warn once. The first good fetch
         logs how far back the history actually reaches."""
         cfg = self.config
-        count = cfg.ohlc_count
-        if getattr(self, "_ohlc_fell_back", False):
-            count = min(count, cfg.ohlc_fallback_count)
+        return self._get_ohlc_with_fallback(
+            cfg.ohlc_timeframe, cfg.ohlc_count, cfg.ohlc_fallback_count, "main",
+        )
+
+    def _get_ohlc_with_fallback(
+        self, timeframe: str, count: int, fallback: int, key: str,
+    ) -> pd.DataFrame:
+        cfg = self.config
+        fell = getattr(self, "_ohlc_fell_back_set", None)
+        if fell is None:
+            fell = self._ohlc_fell_back_set = set()
+        if getattr(self, "_ohlc_fell_back", False):   # older attribute name
+            fell.add("main")
+        if key in fell:
+            count = min(count, fallback)
         try:
-            df = self.ohlc_provider.get(cfg.symbol, cfg.ohlc_timeframe, count)
+            df = self.ohlc_provider.get(cfg.symbol, timeframe, count)
         except Exception:
-            if count <= cfg.ohlc_fallback_count:
+            if count <= fallback:
                 raise
             logger.warning(
-                f"MT5 wouldn't give {count} {cfg.ohlc_timeframe} bars; "
-                f"falling back to {cfg.ohlc_fallback_count}. To see further "
+                f"MT5 wouldn't give {count} {timeframe} bars; "
+                f"falling back to {fallback}. To see further "
                 f"back, set MT5 Tools > Options > Charts > Max bars in chart "
                 f"to {count} or more (or Unlimited) and restart the bot"
             )
-            self._ohlc_fell_back = True
-            count = cfg.ohlc_fallback_count
-            df = self.ohlc_provider.get(cfg.symbol, cfg.ohlc_timeframe, count)
-        if len(df) and not getattr(self, "_logged_history", False):
+            fell.add(key)
+            if key == "main":
+                self._ohlc_fell_back = True
+            count = fallback
+            df = self.ohlc_provider.get(cfg.symbol, timeframe, count)
+        logged = getattr(self, "_logged_history_set", None)
+        if logged is None:
+            logged = self._logged_history_set = set()
+        if len(df) and key not in logged:
+            logged.add(key)
             self._logged_history = True
             logger.info(
-                f"history: asked MT5 for {count} {cfg.ohlc_timeframe} bars, "
+                f"history: asked MT5 for {count} {timeframe} bars, "
                 f"got {len(df)}, back to {df.index[0]:%Y-%m-%d %H:%M}"
             )
         return df
@@ -1253,6 +1301,9 @@ class Bot:
                 continue
             new_pipeline_pending.append((zone, zid))
 
+        if self.config.plan is not None:
+            # Claude's plan: M5 zones first (the backtest checked M5 then M1).
+            new_pipeline_pending = self._plan_m5_candidates() + new_pipeline_pending
         self._pending_pipeline_zones = new_pipeline_pending
         self._pending_flipped_zones = list(flipped_candidates)
         if self._pending_pipeline_zones or self._pending_flipped_zones:
@@ -1273,6 +1324,96 @@ class Bot:
                     "zone snapshot write raised; visualization will "
                     "be stale until the next M5 close"
                 )
+
+    # ------------------------------------------------------------------ #
+    # Claude's plan (19 Nov 2026): M5 zones on the M1 bot
+    # ------------------------------------------------------------------ #
+
+    def _plan_m5_candidates(self) -> list[tuple[ValidatedZone, UUID]]:
+        """Fresh M5 zones (M5 bot rules, 100,000 M5 candles) to trade
+        alongside the M1 zones. Re-scanned when a new M5 candle appears;
+        in between the last scan's zones are reused. Each one is saved
+        (tagged "M5") and remembered as an M5 zone for placement."""
+        plan = self.config.plan
+        if plan is None:
+            return []
+        try:
+            df5 = self._get_ohlc_with_fallback(
+                "M5", plan.m5_ohlc_count, plan.m5_fallback_count, "plan_m5",
+            )
+        except Exception:
+            logger.exception("plan: M5 OHLC fetch failed; using the last M5 zones")
+            df5 = None
+        prev = self._plan_m5_df
+        if df5 is not None and len(df5) and (prev is None or df5.index[-1] != prev.index[-1]):
+            recent = plan.m5_fallback_count
+            try:
+                self._run_zone_lifecycle(df5.iloc[-recent:] if len(df5) > recent else df5, only="M5")
+            except Exception:
+                logger.exception("plan: M5 zone lifecycle pass raised")
+            try:
+                t0 = time.monotonic()
+                pats = None
+                if len(df5) > recent and plan.m5_pipeline.pattern_detector == "vertex":
+                    vcfg = vertex_config(plan.m5_pipeline)
+                    if self._plan_m5_cache is None or self._plan_m5_cache.cfg != vcfg:
+                        self._plan_m5_cache = VertexPatternCache(vcfg)
+                    pats = self._plan_m5_cache.patterns(df5)
+                zones = (run_strategy_pipeline(df5, plan.m5_pipeline, patterns=pats)
+                         if pats is not None else run_strategy_pipeline(df5, plan.m5_pipeline))
+                secs = time.monotonic() - t0
+                if not getattr(self, "_logged_m5_scan", False) or secs > 10:
+                    self._logged_m5_scan = True
+                    logger.info(f"plan: M5 zone scan {len(df5)} bars in {secs:.1f}s, {len(zones)} zones")
+            except Exception:
+                logger.exception("plan: M5 strategy pipeline raised; using the last M5 zones")
+            else:
+                pending: list[tuple[ValidatedZone, UUID]] = []
+                for z in zones:
+                    if not (z.is_strong_point and z.refined_zone.is_tradeable):
+                        continue
+                    zid = self._persist_zone_if_new(z, timeframe="M5")
+                    if zid is None:
+                        continue
+                    self._zone_tf[zid] = "M5"
+                    pending.append((z, zid))
+                self._plan_m5_pending = pending
+                self._plan_m5_df = df5
+        return [(z, zid) for z, zid in self._plan_m5_pending if zid not in self._traded_zone_ids]
+
+    def _zone_timeframe(self, zone_id: UUID | None) -> str:
+        """"M5" for a Claude's plan M5 zone, else the bot's own timeframe."""
+        if zone_id is not None and self._zone_tf.get(zone_id) == "M5":
+            return "M5"
+        return self.config.ohlc_timeframe
+
+    def _setup_timeframe(self, setup: Any) -> str:
+        """Which timeframe a setup's zone came from (remembered at
+        placement; after a restart read from the zone row's tag)."""
+        key = str(setup.id)
+        tf = self._setup_tf.get(key)
+        if tf is not None:
+            return tf
+        zid = getattr(setup, "zone_id", None)
+        if zid is not None and self._zone_tf.get(zid) == "M5":
+            tf = "M5"
+        elif zid is not None:
+            try:
+                row = self.supabase.get_zone_by_id(zid)
+            except Exception:
+                logger.exception(f"plan: zone lookup failed for setup {key[:8]}")
+                return self.config.ohlc_timeframe
+            tf = _zone_tag(row) or self.config.ohlc_timeframe
+        else:
+            tf = self.config.ohlc_timeframe
+        self._setup_tf[key] = tf
+        return tf
+
+    def _trail_for_setup(self, setup: Any) -> float:
+        plan = self.config.plan
+        if plan is not None and self._setup_timeframe(setup) == "M5":
+            return plan.m5_entries.runner_trail_points
+        return self.config.xautism_entries.runner_trail_points
 
     def _refresh_stack_candidates(self, m5_zones: list[ValidatedZone]) -> None:
         """Fresh M5 zones (+ M1 zones) that can be the outer zone of a
@@ -1646,6 +1787,12 @@ class Bot:
         except Exception:
             logger.exception("main loop: get_active_setups failed")
             return
+        plan = self.config.plan
+        if plan is not None and plan.runner_frees_slot:
+            # Claude's plan: a risk-free runner (TP1 hit, stop at breakeven
+            # or better) doesn't block a new trade.
+            free = self.runner_trail.started
+            active_setups = [s for s in active_setups if getattr(s, "id", None) not in free]
         active_count = count_active_setups(active_setups)
 
         for source_label, queue in (
@@ -1667,10 +1814,18 @@ class Bot:
                     remaining.append((zone, zid))
                     remaining.extend(queue[queue.index((zone, zid)) + 1:])
                     break
+                tf = self._zone_timeframe(zid) if not is_flipped_retrade else None
+                zone_df = df
+                if tf == "M5" and self.config.plan is not None:
+                    zone_df = self._plan_m5_df
+                    if zone_df is None:
+                        remaining.append((zone, zid))
+                        continue
                 if self._try_place_setup(
-                    zone, df, zid,
+                    zone, zone_df, zid,
                     bid=bid, ask=ask,
                     is_flipped_retrade=is_flipped_retrade,
+                    timeframe=tf,
                 ):
                     self._traded_zone_ids.add(zid)
                     active_count += 1
@@ -1689,7 +1844,9 @@ class Bot:
             else:
                 self._pending_flipped_zones = remaining
 
-    def _persist_zone_if_new(self, zone: ValidatedZone) -> UUID | None:
+    def _persist_zone_if_new(
+        self, zone: ValidatedZone, *, timeframe: str | None = None,
+    ) -> UUID | None:
         """Insert the zone row (status=CONFIRMED) if not already cached.
 
         Returns the row UUID on success or cache hit; ``None`` on
@@ -1701,7 +1858,7 @@ class Bot:
         if cached is not None:
             return cached
         try:
-            zone_row = self.supabase.log_zone(_zone_to_input(zone))
+            zone_row = self.supabase.log_zone(_zone_to_input(zone, timeframe=timeframe))
             zone_id = UUID(str(zone_row["id"]))
         except Exception:
             logger.exception(
@@ -1770,7 +1927,7 @@ class Bot:
             )
         return candidates
 
-    def _run_zone_lifecycle(self, df: pd.DataFrame) -> None:
+    def _run_zone_lifecycle(self, df: pd.DataFrame, *, only: str | None = None) -> None:
         """Apply consumption / violation / flip detection to the last bar.
 
         Operates on the most recently closed M5 bar (``df.iloc[-1]``).
@@ -1813,6 +1970,10 @@ class Bot:
             logger.exception("zone lifecycle: get_zones_by_status failed")
             return
 
+        if self.config.plan is not None:
+            # Claude's plan: M5 zones are checked on M5 candles, M1 zones
+            # on M1 candles (``only`` = "M5" for the M5 pass).
+            zones = [z for z in zones if (_zone_tag(z) == "M5") == (only == "M5")]
         for z in zones:
             # PR #58: FLIPPED zones get their own narrow consumption-
             # only path. The retest direction is ``flipped_direction``,
@@ -1903,6 +2064,7 @@ class Bot:
         *,
         bid: float, ask: float,
         is_flipped_retrade: bool = False,
+        timeframe: str | None = None,
     ) -> bool:
         """Compute SL + TP1 + lot size, validate, place orders.
 
@@ -1929,6 +2091,10 @@ class Bot:
         Returns True iff ``order_manager.place_layered_orders`` reported
         ``PLACED`` (not FAILED, not SKIPPED-via-gap).
         """
+        # Claude's plan: an M5 zone uses the M5 bot's zone settings.
+        pcfg = self.strategy_pipeline_config
+        if timeframe == "M5" and self.config.plan is not None:
+            pcfg = self.config.plan.m5_pipeline
         # 0. Dedup — skip if a CONFIRMED/ACTIVE/CONSUMED/VIOLATED/FLIPPED
         # zone with overlapping bounds already exists (within the
         # freshness window). PR #59 added CONFIRMED + ACTIVE to the
@@ -2044,7 +2210,7 @@ class Bot:
                 # the trend only changes on a candle CLOSE.
                 df_m5=ohlc_df.iloc[:-1] if len(ohlc_df) > 1 else ohlc_df,
                 config=self.config.direction_gate,
-                pipeline_cfg=self.strategy_pipeline_config,
+                pipeline_cfg=pcfg,
             )
             if not decision.allowed:
                 logger.info(
@@ -2115,7 +2281,7 @@ class Bot:
         # / TP3 are best-effort; NULLs are recomputed by tp_manager
         # at the previous layer's TP hit. Q-B decision: a layer with
         # no TP rides on the cascaded SL until external close.
-        lookback = self.strategy_pipeline_config.tp1_local_peak_lookback_bars
+        lookback = pcfg.tp1_local_peak_lookback_bars
         if levels is not None and levels.tp1 is not None:
             tp1_price = levels.tp1
         else:
@@ -2140,6 +2306,7 @@ class Bot:
             return self._place_xautism(
                 zone, zone_id, entry_price=entry_price,
                 sl_price=sl_price, tp1_price=tp1_price, stack=stack,
+                timeframe=timeframe,
             )
 
         tp2_price = find_nearest_local_peak(
@@ -2232,23 +2399,32 @@ class Bot:
         """The risk settings in £ right now. Fixed-£ (M5 bot) is returned
         as is; % of balance (M1 bot) is worked out from the live balance."""
         cfg = self.config.risk
-        if cfg.risk_pct is None and cfg.max_daily_loss_pct is None:
-            return cfg
-        try:
-            balance = self.mt5.get_balance()
-        except Exception:
-            logger.exception("risk: get_balance failed; using fixed £ settings")
-            return cfg
-        return effective_risk(cfg, balance)
+        if cfg.risk_pct is not None or cfg.max_daily_loss_pct is not None:
+            try:
+                balance = self.mt5.get_balance()
+            except Exception:
+                logger.exception("risk: get_balance failed; using fixed £ settings")
+            else:
+                cfg = effective_risk(cfg, balance)
+        breaker = getattr(self, "_plan_breaker", None)
+        if self.config.plan is not None and breaker is not None:
+            mult = breaker.multiplier(self.mt5)
+            if mult != 1.0:
+                cfg = replace(cfg, risk_per_trade=cfg.risk_per_trade * mult)
+        return cfg
 
     def _place_xautism(
         self, zone: ValidatedZone, zone_id: UUID, *,
         entry_price: float, sl_price: float, tp1_price: float,
         stack: StackedPlan | None = None,
+        timeframe: str | None = None,
     ) -> bool:
         """0.01 first touch now; the rest as a layer 2 broker stop (or,
         stacked, a limit at the outer zone)."""
         xc = self.config.xautism_entries
+        if timeframe == "M5" and self.config.plan is not None:
+            # Claude's plan: M5 trades get the M5 runner (75/25, 4 pt trail).
+            xc = self.config.plan.m5_entries
         # Stacked: the main size goes in at the outer zone.
         layer2_entry = stack.outer_entry if stack is not None else entry_price
         layer2_lots: float | None = None
@@ -2312,6 +2488,8 @@ class Bot:
             self.position_tracker.invalidate_active_setups_cache()
             self.daily_risk.register(result.layer_1_ticket, result.setup_id)
             self.daily_risk.invalidate()
+            if timeframe and result.setup_id is not None:
+                self._setup_tf[str(result.setup_id)] = timeframe
             if stack is not None:
                 self._stacked_outer_keys.add((
                     zone.direction,
@@ -2320,7 +2498,8 @@ class Bot:
                 ))
             logger.info(
                 f"new XAUTISM setup placed: id={result.setup_id} "
-                f"direction={zone.direction} "
+                + (f"tf={timeframe} " if self.config.plan is not None and timeframe else "")
+                + f"direction={zone.direction} "
                 f"layer1_ticket={result.layer_1_ticket} "
                 f"sl={result.sl_price} tp1={result.tp1_price}"
             )
@@ -2421,15 +2600,18 @@ class Bot:
         cutoff = time.monotonic() - 15.0
         views: list[ZoneView] = []
         for zone, _zid in list(self._pending_pipeline_zones):
+            zdf = df
+            if self.config.plan is not None and self._zone_timeframe(_zid) == "M5":
+                zdf = self._plan_m5_df
             key = (zone.direction, round(float(zone.top), 2), round(float(zone.bottom), 2))
             if seen.get(key, 0.0) < cutoff:
                 continue
             buy = zone.direction == "BUY"
             entry = float(zone.top) if buy else float(zone.bottom)
             sl = tp1 = None
-            if df is not None and len(df):
+            if zdf is not None and len(zdf):
                 try:
-                    lv = compute_levels(zone, df, self.config.levels)
+                    lv = compute_levels(zone, zdf, self.config.levels)
                     entry, sl, tp1 = lv.entry, lv.sl, lv.tp1
                 except Exception:
                     pass
@@ -2490,6 +2672,18 @@ class Bot:
                       f"{int(round(self.config.xautism_entries.runner_keep_frac * 100))}, "
                       f"{self.config.xautism_entries.runner_trail_points:g} pt trail",
         }
+        if self.config.plan is not None:
+            pc = self.config.plan
+            breaker = self._plan_breaker
+            data["plan"] = {
+                "name": "Claude's plan",
+                "zones": "M5 + M1",
+                "daily_stop": pc.daily_stop,
+                "drawdown_peak": breaker.peak if breaker is not None else None,
+                "m5_runner": f"{int(round((1 - pc.m5_entries.runner_keep_frac) * 100))}/"
+                             f"{int(round(pc.m5_entries.runner_keep_frac * 100))}, "
+                             f"{pc.m5_entries.runner_trail_points:g} pt trail",
+            }
         try:
             acct = self.mt5.get_account_info()
             data["account"] = {
@@ -2849,7 +3043,7 @@ def _zone_key_from_row(
     )
 
 
-def _zone_to_input(zone: ValidatedZone) -> ZoneInput:
+def _zone_to_input(zone: ValidatedZone, *, timeframe: str | None = None) -> ZoneInput:
     """Project an in-memory zone into the ``zones`` table insert payload.
 
     v1 only handles Strong Point setups → ``zone_type=STRONG_POINT``.
@@ -2868,6 +3062,29 @@ def _zone_to_input(zone: ValidatedZone) -> ZoneInput:
         approach_count=0,            # Imbalance-only field; 0 in v1
         qualified_imbalance_at=None,  # Imbalance-only field; None in v1
         formed_at=zone.formed_at.to_pydatetime(),
+        # Claude's plan: M5 zones on the M1 bot's account are tagged so the
+        # lifecycle and the runner know their timeframe.
+        last_evaluation_result={"timeframe": timeframe} if timeframe else None,
+    )
+
+
+def _zone_tag(zone_row: Any) -> str | None:
+    """The timeframe tag stored on a zone row ("M5" for Claude's plan M5
+    zones), or None for an untagged (own-timeframe) zone."""
+    ev = getattr(zone_row, "last_evaluation_result", None)
+    if isinstance(ev, dict):
+        tf = ev.get("timeframe")
+        return str(tf) if tf else None
+    return None
+
+
+def plan_risk(risk: RiskConfig, plan: PlanConfig) -> RiskConfig:
+    """Claude's plan risk rules over whatever £ risk is set: -£200 hard
+    daily stop with the room check, no loss count, no streak stop."""
+    return replace(
+        risk, max_daily_loss=plan.daily_stop, room_check=True,
+        max_losses_per_day=50, max_loss_streak=None,
+        max_daily_loss_pct=None,
     )
 
 
@@ -3025,7 +3242,14 @@ def main() -> None:
         risk = args.risk or os.environ.get("RISK") or None
         max_losses = args.max_losses or os.environ.get("MAX_LOSSES") or None
     try:
-        loop_config, pipeline_config = build_profile(args.bot, risk, max_losses)
+        plan_on = (
+            args.bot == "m1"
+            and os.environ.get("M1_PLAN", "on").strip().lower() not in ("off", "0", "no", "false")
+        )
+        if plan_on:
+            risk = None
+            max_losses = None
+        loop_config, pipeline_config = build_profile(args.bot, risk, max_losses, plan=plan_on)
     except ValueError as e:
         raise SystemExit(str(e)) from None
     # One copy of each bot at a time: two would double every trade.

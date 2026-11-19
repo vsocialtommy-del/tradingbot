@@ -65,6 +65,10 @@ class RiskConfig:
     max_daily_loss_pct: float | None = None
     """If set (e.g. 0.30), the daily loss limit is this share of the
     current balance instead of the fixed ``max_daily_loss``."""
+    room_check: bool = False
+    """True = a hard daily limit: no new trade if the day's P&L minus that
+    trade's risk would go past ``-max_daily_loss`` (at -£160 with £50 at
+    risk and a £200 limit, no trade). Claude's plan (19 Nov 2026)."""
 
 
 def effective_risk(config: "RiskConfig", balance: float | None) -> "RiskConfig":
@@ -260,6 +264,11 @@ def check_risk(daily: DailyRisk, config: RiskConfig) -> RiskVerdict:
     if daily.total <= -config.max_daily_loss:
         return RiskVerdict(True, (
             f"daily loss {daily.total:.2f} at or past -{config.max_daily_loss:.0f}"
+        ), daily)
+    if config.room_check and daily.total - config.risk_per_trade < -config.max_daily_loss:
+        return RiskVerdict(True, (
+            f"daily P&L {daily.total:.2f}: no room for a {config.risk_per_trade:.0f} trade "
+            f"inside -{config.max_daily_loss:.0f}"
         ), daily)
     counted = daily.losing_trades
     if not config.count_first_layer_only_losses:

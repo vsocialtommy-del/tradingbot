@@ -4381,3 +4381,153 @@ class TestLongHistorySaveRule:
         assert old_dead in saved
         (arg,), _ = life.call_args
         assert arg is df
+
+
+# --------------------------------------------------------------------------- #
+# Claude's plan (19 Nov 2026): the M1 bot also trades M5 zones
+# --------------------------------------------------------------------------- #
+
+from bot.plan import DrawdownBreaker, PlanConfig
+
+
+class TestClaudesPlan:
+    def _plan_bot(self, bot, tmp_path):
+        b, mgrs = bot
+        b.config = replace(
+            b.config, ohlc_timeframe="M1", bot_name="M1",
+            plan=PlanConfig(m5_ohlc_count=300, m5_fallback_count=100,
+                            state_file=str(tmp_path / "plan.json")),
+            xautism_entries=replace(b.config.xautism_entries,
+                                    runner_keep_frac=0.5, runner_trail_points=2.0),
+        )
+        b._plan_breaker = DrawdownBreaker(tmp_path / "plan.json", b.config.plan.drawdown_steps,
+                                          refresh_seconds=0)
+        b.runner_trail.trail_for = b._trail_for_setup
+        return b, mgrs
+
+    def test_m5_zones_first_tagged_and_only_strong_ones(self, bot, mocker, tmp_path) -> None:
+        b, mgrs = self._plan_bot(bot, tmp_path)
+        df1 = make_ohlc(n=60)
+        df5 = make_ohlc(n=300)
+        b._latest_ohlc = df1
+        mgrs["ohlc_provider"].get.side_effect = (
+            lambda sym, tf, count: df5 if tf == "M5" else df1
+        )
+        m1_zone = _make_validated_for_persistence(_PT.DBR)
+        m5_strong = replace(_make_validated_for_persistence(_PT.RBD), top=1950.0, bottom=1948.0)
+        m5_dead = replace(m5_strong, top=1960.0, bottom=1958.0, is_strong_point=False)
+
+        def pipeline(df, cfg, **kw):
+            return [m5_strong, m5_dead] if cfg is b.config.plan.m5_pipeline else [m1_zone]
+
+        run = mocker.patch("bot.main.run_strategy_pipeline", side_effect=pipeline)
+        life = mocker.patch.object(b, "_run_zone_lifecycle")
+        saved = []
+        mocker.patch.object(b, "_persist_zone_if_new",
+                            side_effect=lambda z, timeframe=None: saved.append((z, timeframe)) or uuid4())
+        b._detect_new_zones(NOW)
+        pend = b._pending_pipeline_zones
+        assert [z for z, _ in pend] == [m5_strong, m1_zone]
+        assert b._zone_tf[pend[0][1]] == "M5" and pend[1][1] not in b._zone_tf
+        assert (m5_strong, "M5") in saved and all(z is not m5_dead for z, _ in saved)
+        assert {c.kwargs.get("only") for c in life.call_args_list} == {None, "M5"}
+        # Same M5 candle next minute: M5 zones reused, not re-scanned.
+        n = run.call_count
+        b._detect_new_zones(NOW)
+        assert run.call_count == n + 1          # only the M1 scan ran
+        assert [z for z, _ in b._pending_pipeline_zones] == [m5_strong, m1_zone]
+
+    def test_m5_zone_placed_with_m5_candles(self, bot, mocker, tmp_path) -> None:
+        b, mgrs = self._plan_bot(bot, tmp_path)
+        b._latest_ohlc = make_ohlc(n=60)
+        b._plan_m5_df = make_ohlc(n=300)
+        zone = _make_validated_for_persistence(_PT.RBD)
+        zid = uuid4()
+        b._zone_tf[zid] = "M5"
+        b._pending_pipeline_zones = [(zone, zid)]
+        place = mocker.patch.object(b, "_try_place_setup", return_value=False)
+        b._try_place_pending(bid=1900.0, ask=1900.1)
+        args, kwargs = place.call_args
+        assert args[1] is b._plan_m5_df and kwargs["timeframe"] == "M5"
+
+    def test_risk_free_runner_does_not_block(self, bot, mocker, tmp_path) -> None:
+        b, mgrs = self._plan_bot(bot, tmp_path)
+        b._latest_ohlc = make_ohlc(n=60)
+        running = make_setup()
+        mgrs["position_tracker"].get_active_setups.return_value = [running]
+        b.runner_trail._runners = {running.id: MagicMock()}
+        zone = _make_validated_for_persistence(_PT.DBR)
+        b._pending_pipeline_zones = [(zone, uuid4())]
+        place = mocker.patch.object(b, "_try_place_setup", return_value=False)
+        b._try_place_pending(bid=1900.0, ask=1900.1)
+        place.assert_called_once()
+        # A setup that hasn't reached TP1 still blocks.
+        b.runner_trail._runners = {}
+        place.reset_mock()
+        b._try_place_pending(bid=1900.0, ask=1900.1)
+        place.assert_not_called()
+
+    def test_m5_trade_gets_the_m5_runner(self, bot, mocker, tmp_path) -> None:
+        b, mgrs = self._plan_bot(bot, tmp_path)
+        b.mt5.get_account_info.return_value = {"login": 1, "balance": 10_000.0}
+        sid = uuid4()
+        orders = mocker.patch("bot.main.place_xautism_orders", return_value=MagicMock(
+            status="PLACED", setup_id=sid, layer_1_ticket=1, sl_price=1895.0,
+            tp1_price=1910.0, error_messages=[]))
+        zone = _make_validated_for_persistence(_PT.DBR)
+        assert b._place_xautism(zone, uuid4(), entry_price=1900.5, sl_price=1895.0,
+                                tp1_price=1910.0, timeframe="M5")
+        assert orders.call_args.kwargs["runner_keep_frac"] == 0.25
+        assert b._setup_tf[str(sid)] == "M5"
+        assert b._place_xautism(zone, uuid4(), entry_price=1900.5, sl_price=1895.0,
+                                tp1_price=1910.0, timeframe="M1")
+        assert orders.call_args.kwargs["runner_keep_frac"] == 0.5
+
+    def test_trail_per_timeframe_also_after_a_restart(self, bot, mocker, tmp_path) -> None:
+        b, mgrs = self._plan_bot(bot, tmp_path)
+        m5_setup, m1_setup = make_setup(), make_setup()
+        m5_row = _make_zone_row().model_copy(update={"last_evaluation_result": {"timeframe": "M5"}})
+        m1_row = _make_zone_row()
+        b.supabase.get_zone_by_id.side_effect = (
+            lambda zid: m5_row if zid == m5_setup.zone_id else m1_row
+        )
+        assert b._trail_for_setup(m5_setup) == 4.0
+        assert b._trail_for_setup(m1_setup) == 2.0
+
+    def test_lifecycle_passes_split_by_timeframe(self, bot, mocker, tmp_path) -> None:
+        b, mgrs = self._plan_bot(bot, tmp_path)
+        m5_row = _make_zone_row(top=1950.0, bottom=1948.0).model_copy(
+            update={"last_evaluation_result": {"timeframe": "M5"}})
+        m1_row = _make_zone_row(top=1905.0, bottom=1900.0)
+        b.supabase.get_zones_by_status.return_value = [m5_row, m1_row]
+        seen = []
+        mocker.patch("bot.main.check_consumption",
+                     side_effect=lambda ref, **kw: seen.append(ref.top) or False)
+        mocker.patch("bot.main.check_violation", return_value=False)
+        b._run_zone_lifecycle(make_ohlc(n=10))
+        assert seen == [1905.0]
+        seen.clear()
+        b._run_zone_lifecycle(make_ohlc(n=10), only="M5")
+        assert seen == [1950.0]
+
+    def test_drawdown_breaker_halves_risk(self, bot, tmp_path) -> None:
+        b, mgrs = self._plan_bot(bot, tmp_path)
+        b.config = replace(b.config, risk=replace(b.config.risk, risk_per_trade=50.0, risk_pct=None))
+        b.mt5.get_account_info.return_value = {"login": 7, "balance": 10_000.0}
+        assert b._risk_now().risk_per_trade == 50.0
+        b.mt5.get_account_info.return_value = {"login": 7, "balance": 9_550.0}
+        assert b._risk_now().risk_per_trade == 25.0
+
+    def test_dashboard_risk_keeps_the_plan_rules(self, bot, tmp_path) -> None:
+        b, mgrs = self._plan_bot(bot, tmp_path)
+        b.supabase.get_config_values.return_value = {"risk": "50", "max_losses": 4}
+        b._refresh_live_risk()
+        r = b.config.risk
+        assert r.risk_per_trade == 50.0 and r.risk_pct is None
+        assert r.max_daily_loss == 200.0 and r.room_check is True
+        assert r.max_losses_per_day == 50 and r.max_loss_streak is None
+
+    def test_zone_row_carries_the_timeframe(self) -> None:
+        z = _make_validated_for_persistence(_PT.RBD)
+        assert _zone_to_input(z, timeframe="M5").last_evaluation_result == {"timeframe": "M5"}
+        assert _zone_to_input(z).last_evaluation_result is None

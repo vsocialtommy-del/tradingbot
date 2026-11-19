@@ -188,9 +188,12 @@ class TestM1RiskSwitch:
 
 
 class TestRiskFromEnvAndCommand:
-    def _run(self, mocker, argv, tmp_path, monkeypatch, env_text="MT5_LOGIN=1\n"):
+    def _run(self, mocker, argv, tmp_path, monkeypatch, env_text="MT5_LOGIN=1\n", plan="off"):
+        # The classic M1 risk switches; Claude's plan (on by default since
+        # 19 Nov 2026) is switched off here with M1_PLAN=off.
         monkeypatch.chdir(tmp_path)
-        (tmp_path / ".env.m1").write_text(env_text)
+        monkeypatch.setenv("M1_PLAN", plan)
+        (tmp_path / ".env.m1").write_text(env_text + f"M1_PLAN={plan}\n")
         mocker.patch.object(sys, "argv", ["bot.main", *argv])
         mocker.patch.object(main_mod.MT5Connector, "from_env", return_value=MagicMock())
         mocker.patch.object(main_mod.SupabaseLogger, "from_env", return_value=MagicMock())
@@ -215,6 +218,25 @@ class TestRiskFromEnvAndCommand:
         monkeypatch.delenv("RISK", raising=False)
         with pytest.raises(SystemExit, match="isn't valid"):
             self._run(mocker, ["--bot", "m1", "--risk", "lots"], tmp_path, monkeypatch)
+
+    def test_plan_is_on_by_default_and_ignores_env_risk(self, mocker, tmp_path, monkeypatch) -> None:
+        monkeypatch.delenv("RISK", raising=False)
+        monkeypatch.delenv("M1_PLAN", raising=False)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env.m1").write_text("RISK=5%\nMAX_LOSSES=4\n")
+        mocker.patch.object(sys, "argv", ["bot.main", "--bot", "m1"])
+        mocker.patch.object(main_mod.MT5Connector, "from_env", return_value=MagicMock())
+        mocker.patch.object(main_mod.SupabaseLogger, "from_env", return_value=MagicMock())
+        mocker.patch.object(main_mod.signal, "signal")
+        bot_cls = mocker.patch.object(main_mod, "Bot")
+        main_mod.main()
+        cfg = bot_cls.call_args.kwargs["config"]
+        assert cfg.plan is not None
+        assert cfg.risk.risk_pct is None and cfg.risk.risk_per_trade == 50.0
+        assert cfg.risk.max_daily_loss == 200.0 and cfg.risk.room_check is True
+        assert cfg.risk.max_losses_per_day == 50 and cfg.risk.max_loss_streak is None
+        monkeypatch.delenv("RISK", raising=False)
+        monkeypatch.delenv("MAX_LOSSES", raising=False)
 
     def test_m5_with_risk_refused(self, mocker) -> None:
         mocker.patch.object(sys, "argv", ["bot.main", "--risk", "5%"])
