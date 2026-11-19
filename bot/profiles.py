@@ -177,9 +177,9 @@ def build_profile(name: str, risk: str | None = None, max_losses=None, *, plan: 
             # 22-month backtest: +£7,214 vs +£6,915, drawdown -£1,295 vs -£1,551.
             # 18 Nov 2026: M / W zones only, no single spikes (pullback at least
             # 10% of the zone). Tommy's rule: a spike is not a zone.
-            # 19 Nov 2026: a 2-candle vertex counts (the 10% M / W dip still
-            # has to pass, so a spike is still out). Was 3.
-        ), replace(pipeline, zone_min_size_points=2.0, vertex_require_mw=True, vertex_min_base=2)
+            # 19 Nov 2026: tried a 2-candle vertex (PR #116); back to 3 the same
+            # evening (3-month backtest: 3 candles +£3,643 vs 2 candles +£2,850).
+        ), replace(pipeline, zone_min_size_points=2.0, vertex_require_mw=True)
     if name == "m1":
         losses = (
             parse_max_losses(max_losses) if max_losses not in (None, "")
@@ -229,8 +229,7 @@ def build_profile(name: str, risk: str | None = None, max_losses=None, *, plan: 
             from bot.main import plan_risk
             from bot.plan import PlanConfig
             pc = PlanConfig(
-                m5_pipeline=replace(pipeline, zone_min_size_points=2.0, vertex_require_mw=True,
-                                    vertex_min_base=2),
+                m5_pipeline=replace(pipeline, zone_min_size_points=2.0, vertex_require_mw=True),
                 m5_entries=replace(base.xautism_entries, m5_close_exit=False),
             )
             fixed = replace(cfg.risk, risk_pct=None, risk_per_trade=50.0,
