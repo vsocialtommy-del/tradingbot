@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
 
+import numpy as np
 import pandas as pd
 from loguru import logger
 
@@ -187,26 +188,23 @@ def detect_swings(df: pd.DataFrame, strength: int) -> list[Swing]:
     times = df.index
     swings: list[Swing] = []
 
-    for i in range(strength, n - strength):
-        window = closes[i - strength : i + strength + 1]
-        wmax = window.max()
-        wmin = window.min()
-        if wmax == wmin:
-            # Perfectly flat window — no swing.
-            continue
-
-        center = closes[i]
-        # The center's offset within the window is exactly `strength`.
-        if center == wmax and int(window.argmax()) == strength:
-            swings.append(
-                Swing(index=i, time=times[i], price=float(center), kind="HIGH")
-            )
-        elif center == wmin and int(window.argmin()) == strength:
-            swings.append(
-                Swing(index=i, time=times[i], price=float(center), kind="LOW")
-            )
-        # A bar can't be both strict max and strict min in a non-flat
-        # window, so `elif` is safe.
+    # Vectorised (19 Nov 2026, same result as the old per-bar loop): the
+    # window around bar i is closes[i-strength : i+strength+1]; argmax /
+    # argmin return the first occurrence, so "leftmost bar achieving the
+    # max / min" is unchanged.
+    win = np.lib.stride_tricks.sliding_window_view(closes, 2 * strength + 1)
+    wmax = win.max(axis=1)
+    wmin = win.min(axis=1)
+    center = closes[strength:n - strength]
+    moving = wmax != wmin
+    is_high = moving & (center == wmax) & (win.argmax(axis=1) == strength)
+    is_low = moving & ~is_high & (center == wmin) & (win.argmin(axis=1) == strength)
+    for k in np.flatnonzero(is_high | is_low):
+        i = int(k) + strength
+        swings.append(
+            Swing(index=i, time=times[i], price=float(closes[i]),
+                  kind="HIGH" if is_high[k] else "LOW")
+        )
 
     return swings
 

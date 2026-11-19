@@ -171,3 +171,68 @@ class TestIsMwShape:
         from bot.strategy.vertex import is_mw_shape
         c = [4030, 4021, 4021.8, 4023.4, 4022.0, 4028]
         assert is_mw_shape(c, 2, 4, 4020.0, 4024.0, sell=False)
+
+
+# --------------------------------------------------------------------------- #
+# VertexPatternCache (19 Nov 2026): the M5 bot's 100,000-candle lookback
+# re-scans only the newest candles; it must give exactly the same zones.
+# --------------------------------------------------------------------------- #
+
+import numpy as np
+
+from bot.strategy.vertex import VertexPatternCache
+
+
+def _walk(n: int, seed: int = 7) -> pd.DataFrame:
+    """A random-walk gold-ish chart, rounded to cents so ties happen."""
+    rng = np.random.default_rng(seed)
+    close = 4000 + np.cumsum(rng.normal(0, 1.2, n))
+    open_ = np.r_[close[0], close[:-1]] + rng.normal(0, 0.2, n)
+    high = np.maximum(open_, close) + rng.exponential(0.6, n)
+    low = np.minimum(open_, close) - rng.exponential(0.6, n)
+    idx = pd.date_range("2026-01-01", periods=n, freq="5min", tz="UTC")
+    return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close},
+                        index=idx).round(2).assign(volume=1)
+
+
+def _key(ps):
+    return [(p.direction, p.base.start_index, p.base.end_index,
+             p.impulse_before.start_index, p.impulse_after.end_index,
+             p.foot_index, p.base.top, p.base.bottom) for p in ps]
+
+
+@pytest.mark.parametrize("mw", [False, True])
+def test_cache_matches_full_scan_as_the_window_slides(mw: bool) -> None:
+    cfg = VertexConfig(require_mw=mw)
+    data = _walk(9000)
+    window = 4000
+    cache = VertexPatternCache(cfg, tail=400, context=150, min_bars=1000)
+    cache.front = 120
+    checked = 0
+    for end in list(range(window, window + 30)) + list(range(window + 30, 9000, 61)):
+        df = data.iloc[end - window:end]
+        got = cache.patterns(df)
+        assert _key(got) == _key(detect_vertex_patterns(df, cfg)), end
+        checked += 1
+    assert checked > 100
+    assert len(got) > 20                  # the chart really has zones in it
+    assert cache.full_scans < checked / 5  # mostly served from the cache
+
+
+def test_cache_rescans_when_the_candles_dont_line_up() -> None:
+    cfg = VertexConfig()
+    data = _walk(6000, seed=3)
+    cache = VertexPatternCache(cfg, tail=400, context=150, min_bars=1000)
+    cache.patterns(data.iloc[:4000])
+    other = _walk(4000, seed=11)          # a different chart, different times
+    other.index = other.index + pd.Timedelta(days=400)
+    assert _key(cache.patterns(other)) == _key(detect_vertex_patterns(other, cfg))
+    assert cache.full_scans == 2
+
+
+def test_short_history_is_always_a_full_scan() -> None:
+    cfg = VertexConfig()
+    df = _walk(800)
+    cache = VertexPatternCache(cfg, min_bars=1000)
+    assert _key(cache.patterns(df)) == _key(detect_vertex_patterns(df, cfg))
+    assert cache.full_scans == 0
