@@ -43,6 +43,7 @@ class TestProfiles:
         assert pipe.zone_min_size_points == 1.0
         assert pipe.bos_close_beyond_wick is True          # wick-close BOS, M1 only
         assert pipe.vertex_require_mw is True              # no spikes, M / W only (18 Nov 2026)
+        assert cfg.risk.count_first_layer_only_losses is False   # 19 Nov 2026: 0.01-only losses don't count
         assert pipe.vertex_mw_min_pull == 0.10
         assert cfg.direction_gate.trend_timeframe == "1min"   # its own chart (12 Nov 2026)
         assert cfg.direction_gate.enabled is False           # filter off by default
