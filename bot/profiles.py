@@ -158,11 +158,6 @@ def build_profile(name: str, risk: str | None = None, max_losses=None):
             # 16 Nov 2026: a 0.01-only loss (layer 2 never filled) doesn't
             # use up one of the 2 losses a day. The daily £ limit still counts it.
             risk=replace(base.risk, count_first_layer_only_losses=False),
-            # 19 Nov 2026: look back 100,000 M5 bars (about 17 months, was
-            # 5000 = 3.5 weeks) so still-fresh zones from when price was last
-            # at these levels (e.g. Sep 2025 demand) can be traded. Needs MT5
-            # "Max bars in chart" of 100000 or more; falls back to 5000 if not.
-            ohlc_count=100_000,
             # 17 Nov 2026: tight 2-3 pt zones allowed (min 2 pts, was 3).
             # 22-month backtest: +£7,214 vs +£6,915, drawdown -£1,295 vs -£1,551.
             # 18 Nov 2026: M / W zones only, no single spikes (pullback at least

@@ -36,13 +36,6 @@ class TestProfiles:
         assert pipe.vertex_require_mw is True and pipe.vertex_mw_min_pull == 0.10   # 18 Nov 2026: no spikes
         assert pipe.zone_min_size_points == 2.0            # 17 Nov 2026 (was 3)
         assert pipe.bos_close_beyond_wick is False         # M5 keeps the standard BOS
-        # 19 Nov 2026: looks back 100,000 M5 bars (about 17 months), was 5000
-        assert cfg.ohlc_count == 100_000
-        assert cfg.ohlc_fallback_count == 5000
-
-    def test_m1_keeps_the_5000_bar_window(self) -> None:
-        cfg, _ = build_profile("m1")
-        assert cfg.ohlc_count == 5000   # about 3.5 days of M1
 
     def test_m1_settings(self) -> None:
         cfg, pipe = build_profile("m1")

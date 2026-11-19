@@ -258,14 +258,7 @@ class BotLoopConfig:
     days (about 3.5 weeks). A zone stays tradeable for as long as it is
     fresh (untouched since its BOS, not closed through), however old,
     as long as it is inside this window. Nov 2026: 1000 → 5000; the old
-    3.5-day window dropped still-fresh zones the user trades manually.
-    19 Nov 2026: the M5 bot sets 100,000 (about 17 months) in
-    :mod:`bot.profiles`; the M1 bot keeps 5000."""
-    ohlc_fallback_count: int = 5000
-    """If MT5 refuses the full ``ohlc_count`` fetch (for example MT5's
-    "Max bars in chart" is set lower), the bot falls back to this many
-    bars and logs a warning, so it keeps trading on the old window
-    instead of stopping."""
+    3.5-day window dropped still-fresh zones the user trades manually."""
 
     direction_gate: DirectionGateConfig = field(default_factory=DirectionGateConfig)
     """M15 direction + fresh-H1-zone exception. See
@@ -1083,39 +1076,6 @@ class Bot:
     # Strategy / new setups
     # ------------------------------------------------------------------ #
 
-    def _get_main_ohlc(self) -> pd.DataFrame:
-        """The bot's own-timeframe bars (``ohlc_count`` of them).
-
-        If MT5 won't give that many (e.g. "Max bars in chart" is set
-        lower than ``ohlc_count``), fall back to ``ohlc_fallback_count``
-        so the bot keeps trading, and warn once. The first good fetch
-        logs how far back the history actually reaches."""
-        cfg = self.config
-        count = cfg.ohlc_count
-        if getattr(self, "_ohlc_fell_back", False):
-            count = min(count, cfg.ohlc_fallback_count)
-        try:
-            df = self.ohlc_provider.get(cfg.symbol, cfg.ohlc_timeframe, count)
-        except Exception:
-            if count <= cfg.ohlc_fallback_count:
-                raise
-            logger.warning(
-                f"MT5 wouldn't give {count} {cfg.ohlc_timeframe} bars; "
-                f"falling back to {cfg.ohlc_fallback_count}. To see further "
-                f"back, set MT5 Tools > Options > Charts > Max bars in chart "
-                f"to {count} or more (or Unlimited) and restart the bot"
-            )
-            self._ohlc_fell_back = True
-            count = cfg.ohlc_fallback_count
-            df = self.ohlc_provider.get(cfg.symbol, cfg.ohlc_timeframe, count)
-        if len(df) and not getattr(self, "_logged_history", False):
-            self._logged_history = True
-            logger.info(
-                f"history: asked MT5 for {count} {cfg.ohlc_timeframe} bars, "
-                f"got {len(df)}, back to {df.index[0]:%Y-%m-%d %H:%M}"
-            )
-        return df
-
     def _has_new_m5_close(self, now: datetime) -> bool:
         """True iff the most recent M5 bar's timestamp has advanced.
 
@@ -1125,7 +1085,11 @@ class Bot:
         re-running the strategy pipeline on every tick.
         """
         try:
-            df = self._get_main_ohlc()
+            df = self.ohlc_provider.get(
+                self.config.symbol,
+                self.config.ohlc_timeframe,
+                self.config.ohlc_count,
+            )
         except Exception:
             logger.exception("main loop: OHLC fetch failed")
             return False
@@ -1170,15 +1134,7 @@ class Bot:
             # Continue — pattern detection isn't impacted by lifecycle errors.
 
         try:
-            t0 = time.monotonic()
             zones = run_strategy_pipeline(df, self.strategy_pipeline_config)
-            secs = time.monotonic() - t0
-            if not getattr(self, "_logged_scan_time", False) or secs > 10:
-                self._logged_scan_time = True
-                logger.info(
-                    f"zone scan: {len(df)} bars in {secs:.1f}s, "
-                    f"{len(zones)} zones"
-                )
         except Exception:
             logger.exception("main loop: strategy pipeline raised")
             return
@@ -1467,7 +1423,10 @@ class Bot:
         if not setups:
             return
         try:
-            df = self._get_main_ohlc()
+            df = self.ohlc_provider.get(
+                self.config.symbol, self.config.ohlc_timeframe,
+                self.config.ohlc_count,
+            )
         except Exception:
             logger.exception("m5 close exit: OHLC fetch failed")
             return
