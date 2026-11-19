@@ -91,6 +91,23 @@ class RunnerTrailManager:
         self._config = config or XautismEntryConfig()
         self._symbol = symbol
         self._runners: dict[UUID, _Runner] = {}
+        self.trail_for: Any = None
+        """Optional ``setup -> trail points`` (Claude's plan: M5 setups
+        trail 4 pts, M1 setups 2 pts). None = ``runner_trail_points``."""
+
+    @property
+    def started(self) -> set[UUID]:
+        """Setups whose runner has started (TP1 hit, stop at breakeven or
+        better): risk-free, so Claude's plan lets a new trade open."""
+        return set(self._runners)
+
+    def _trail(self, setup: Setup) -> float:
+        if self.trail_for is not None:
+            try:
+                return float(self.trail_for(setup))
+            except Exception:
+                logger.exception(f"runner: trail lookup failed for {setup.id}")
+        return self._config.runner_trail_points
 
     def check_live(
         self, bid: float, ask: float,
@@ -182,7 +199,7 @@ class RunnerTrailManager:
 
         # Trail.
         state.best = max(state.best, price) if direction == "BUY" else min(state.best, price)
-        trail = self._config.runner_trail_points
+        trail = self._trail(setup)
         step = self._config.runner_trail_step
         moved: list[str] = []
         for t in open_trades:
@@ -263,6 +280,6 @@ class RunnerTrailManager:
             f"runner STARTED: setup={str(setup.id)[:8]} {direction} TP1 "
             f"{float(setup.planned_tp1_price):.2f} reached @ {price:.2f}; "  # type: ignore[arg-type]
             f"{'layer 1 closed, ' if l2_in else 'layer 2 never filled, '}"
-            f"trailing {who} {self._config.runner_trail_points} behind, SL at breakeven"
+            f"trailing {who} {self._trail(setup)} behind, SL at breakeven"
         )
         return RunnerEvent(setup.id, "STARTED", who)

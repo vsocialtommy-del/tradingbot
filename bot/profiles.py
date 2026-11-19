@@ -14,6 +14,15 @@
   ``.env.m1``, so it runs on its own MT5 account and its own Supabase
   project.
 
+**Claude's plan** (19 Nov 2026, on by default for ``m1``; ``M1_PLAN=off``
+in ``.env.m1`` turns it off): the M1 bot also trades M5 zones (M5 bot
+rules, 17 months of M5), each with its own runner; one trade at a time
+but a risk-free runner doesn't block; £50 a trade; -£200 dead stop with
+a room check; no losses-a-day / streak stop; drawdown breaker (half risk
+£400 below the peak since the plan started, quarter at £600). See
+:mod:`bot.plan`. ``RISK=`` / ``MAX_LOSSES=`` in ``.env.m1`` are ignored
+while it's on (the dashboard risk setting still works).
+
 Run them with ``python -m bot.main`` (or ``--bot m5``) and
 ``python -m bot.main --bot m1``, each in its own window.
 
@@ -136,11 +145,12 @@ def live_risk(base, risk=None, max_losses=None):
     )
 
 
-def build_profile(name: str, risk: str | None = None, max_losses=None):
+def build_profile(name: str, risk: str | None = None, max_losses=None, *, plan: bool = False):
     """Return ``(BotLoopConfig, StrategyPipelineConfig)`` for a bot.
 
     ``risk`` (M1 only): see :func:`parse_risk`; default 10%.
-    ``max_losses`` (M1 only): losing trades a day before it stops; default 2."""
+    ``max_losses`` (M1 only): losing trades a day before it stops; default 2.
+    ``plan`` (M1 only): Claude's plan (see the module docstring)."""
     from bot.main import BotLoopConfig  # local import: main imports this module
 
     base = BotLoopConfig()
@@ -209,6 +219,19 @@ def build_profile(name: str, risk: str | None = None, max_losses=None):
         # 18 Nov 2026: M / W zones only, no single spikes (same rule as the M5
         # bot, pullback at least 10% of the zone). 3-month M1 backtest: TP rate
         # 68.9% vs 67.0%, 707 trades vs 870.
-        return cfg, replace(pipeline, zone_min_size_points=1.0, bos_close_beyond_wick=True,
-                            vertex_require_mw=True)
+        m1_pipeline = replace(pipeline, zone_min_size_points=1.0, bos_close_beyond_wick=True,
+                              vertex_require_mw=True)
+        if plan:
+            # 19 Nov 2026: Claude's plan. £50 a trade (fixed), plan risk rules,
+            # M5 zones with the M5 bot's settings.
+            from bot.main import plan_risk
+            from bot.plan import PlanConfig
+            pc = PlanConfig(
+                m5_pipeline=replace(pipeline, zone_min_size_points=2.0, vertex_require_mw=True),
+                m5_entries=replace(base.xautism_entries, m5_close_exit=False),
+            )
+            fixed = replace(cfg.risk, risk_pct=None, risk_per_trade=50.0,
+                            count_first_layer_only_losses=False)
+            cfg = replace(cfg, plan=pc, risk=plan_risk(fixed, pc))
+        return cfg, m1_pipeline
     raise ValueError(f"unknown bot {name!r} (expected one of {sorted(ENV_FILES)})")
