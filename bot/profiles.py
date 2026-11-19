@@ -193,6 +193,10 @@ def build_profile(name: str, risk: str | None = None, max_losses=None):
                 # 12 Nov 2026: stop for the day after 4 losses in a row
                 # (3-month test: +£11,106 vs +£11,085, drawdown -£1,491 vs -£1,547).
                 max_loss_streak=4,
+                # 19 Nov 2026: a 0.01-only loss (layer 2 never filled) doesn't
+                # count toward the losses a day or the 4-in-a-row streak, same
+                # as the M5 bot. The daily £ limit still counts its money.
+                count_first_layer_only_losses=False,
             ),
         )
         # 12 Nov 2026: BOS must close beyond the swing's wick (M1 only;

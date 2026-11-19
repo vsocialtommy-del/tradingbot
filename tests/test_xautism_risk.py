@@ -318,3 +318,46 @@ class TestLossStreak:
                           "time": start.timestamp() + n * 60 + 30})
         d = summarise_day(deals, [], magic=7, day_start=start, trading_day="2026-11-12")
         assert d.losing_trades == 4 and d.loss_streak == 3
+
+
+class TestStreakSkipsFirstLayerOnly:
+    """19 Nov 2026: 0.01-only losses don't add to (or reset) the losing streak
+    when they don't count, same as the losses-a-day count."""
+
+    def _deals(self, trades):
+        from datetime import datetime, timezone
+        from bot.risk.xautism_risk import DEAL_ENTRY_IN, DEAL_ENTRY_OUT
+        start = datetime(2026, 11, 19, tzinfo=timezone.utc)
+        deals = []
+        for n, (pnl, vols) in enumerate(trades):
+            tag = f"{n:08d}"
+            for k, vol in enumerate(vols):
+                pid = n * 10 + k
+                deals.append({"entry": DEAL_ENTRY_IN, "magic": 7, "position_id": pid, "comment": f"s={tag}",
+                              "volume": vol, "time": start.timestamp() + n * 60})
+                deals.append({"entry": DEAL_ENTRY_OUT, "magic": 7, "position_id": pid,
+                              "profit": pnl / len(vols), "time": start.timestamp() + n * 60 + 30})
+        return start, deals
+
+    def test_streak_with_and_without_first_layer_only(self) -> None:
+        from bot.risk.xautism_risk import summarise_day
+        # full loss, 0.01-only loss, full loss, full loss, 0.01-only loss
+        start, deals = self._deals([(-50, [0.01, 0.2]), (-2, [0.01]), (-50, [0.01, 0.2]),
+                                    (-50, [0.01, 0.2]), (-2, [0.01])])
+        d = summarise_day(deals, [], magic=7, day_start=start, trading_day="2026-11-19")
+        assert d.loss_streak == 5 and d.loss_streak_full == 3 and d.first_layer_only_losses == 2
+
+    def test_win_resets_both(self) -> None:
+        from bot.risk.xautism_risk import summarise_day
+        start, deals = self._deals([(-50, [0.01, 0.2]), (10, [0.01, 0.2]), (-2, [0.01]), (-50, [0.01, 0.2])])
+        d = summarise_day(deals, [], magic=7, day_start=start, trading_day="2026-11-19")
+        assert d.loss_streak == 2 and d.loss_streak_full == 1
+
+    def test_check_risk_uses_the_right_streak(self) -> None:
+        from bot.risk.xautism_risk import DailyRisk, RiskConfig, check_risk
+        d = DailyRisk("x", -160.0, 0.0, 5, 5, loss_streak=5, first_layer_only_losses=2, loss_streak_full=3)
+        counted = RiskConfig(max_losses_per_day=50, max_daily_loss=1e9, max_loss_streak=4)
+        skipped = RiskConfig(max_losses_per_day=50, max_daily_loss=1e9, max_loss_streak=4,
+                             count_first_layer_only_losses=False)
+        assert check_risk(d, counted).blocked
+        assert not check_risk(d, skipped).blocked

@@ -133,6 +133,9 @@ class DailyRisk:
     first_layer_only_losses: int = 0
     """Losing trades (included in ``losing_trades``) where only the 0.01
     entry layer filled."""
+    loss_streak_full: int = 0
+    """Losing trades in a row, skipping 0.01-only losses (they neither add
+    to the streak nor reset it). Used when those losses don't count."""
 
     @property
     def total(self) -> float:
@@ -227,12 +230,19 @@ def summarise_day(
         float(p.get("profit", 0.0)) + float(p.get("swap", 0.0))
         for p in open_positions if p["ticket"] in trade_of_pos
     )
+    def _first_layer_only(k: str) -> bool:
+        return in_lots.get(k) is not None and in_lots[k] <= first_layer_lots + 1e-9
+
     streak = 0
+    streak_full = 0
     for key in sorted(closed, key=lambda k: last_close.get(k, 0.0)):
         if closed[key] < 0:
             streak += 1
+            if not _first_layer_only(key):
+                streak_full += 1
         elif closed[key] > 0:
             streak = 0
+            streak_full = 0
     return DailyRisk(
         trading_day=trading_day,
         realised=round(realised, 2),
@@ -241,10 +251,8 @@ def summarise_day(
         losing_trades=sum(1 for v in closed.values() if v < 0),
         winning_trades=sum(1 for v in closed.values() if v > 0),
         loss_streak=streak,
-        first_layer_only_losses=sum(
-            1 for k, v in closed.items()
-            if v < 0 and in_lots.get(k) is not None and in_lots[k] <= first_layer_lots + 1e-9
-        ),
+        first_layer_only_losses=sum(1 for k, v in closed.items() if v < 0 and _first_layer_only(k)),
+        loss_streak_full=streak_full,
     )
 
 
@@ -261,9 +269,10 @@ def check_risk(daily: DailyRisk, config: RiskConfig) -> RiskVerdict:
             f"{counted} losing trades today "
             f"(max {config.max_losses_per_day})"
         ), daily)
-    if config.max_loss_streak and daily.loss_streak >= config.max_loss_streak:
+    streak = daily.loss_streak if config.count_first_layer_only_losses else daily.loss_streak_full
+    if config.max_loss_streak and streak >= config.max_loss_streak:
         return RiskVerdict(True, (
-            f"{daily.loss_streak} losing trades in a row (max {config.max_loss_streak})"
+            f"{streak} losing trades in a row (max {config.max_loss_streak})"
         ), daily)
     return RiskVerdict(False, None, daily)
 
