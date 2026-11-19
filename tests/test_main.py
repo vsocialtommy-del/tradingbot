@@ -4531,3 +4531,98 @@ class TestClaudesPlan:
         z = _make_validated_for_persistence(_PT.RBD)
         assert _zone_to_input(z, timeframe="M5").last_evaluation_result == {"timeframe": "M5"}
         assert _zone_to_input(z).last_evaluation_result is None
+
+
+class TestM5Priority:
+    """19 Nov 2026: CLAUDE FTMO, M5 priority."""
+
+    _plan_bot = TestClaudesPlan._plan_bot
+
+    def _queue(self, b, tf):
+        zone = _make_validated_for_persistence(_PT.DBR)
+        zid = uuid4()
+        if tf == "M5":
+            b._zone_tf[zid] = "M5"
+        return zone, zid
+
+    def _setup(self, b, tf):
+        s = make_setup()
+        b._setup_tf[str(s.id)] = tf
+        return s
+
+    def test_m5_opens_beside_an_m1_trade(self, bot, mocker, tmp_path) -> None:
+        b, mgrs = self._plan_bot(bot, tmp_path)
+        b._latest_ohlc = make_ohlc(n=60)
+        b._plan_m5_df = make_ohlc(n=300)
+        mgrs["position_tracker"].get_active_setups.return_value = [self._setup(b, "M1")]
+        mocker.patch.object(b, "_plan_room_ok", return_value=True)
+        z5 = self._queue(b, "M5")
+        z1 = self._queue(b, "M1")
+        b._pending_pipeline_zones = [z5, z1]
+        place = mocker.patch.object(b, "_try_place_setup", return_value=False)
+        b._try_place_pending(bid=1900.0, ask=1900.1)
+        assert [c.kwargs["timeframe"] for c in place.call_args_list] == ["M5"]
+
+    def test_nothing_opens_beside_an_m5_trade_except_nothing(self, bot, mocker, tmp_path) -> None:
+        b, mgrs = self._plan_bot(bot, tmp_path)
+        b._latest_ohlc = make_ohlc(n=60)
+        b._plan_m5_df = make_ohlc(n=300)
+        mgrs["position_tracker"].get_active_setups.return_value = [self._setup(b, "M5")]
+        mocker.patch.object(b, "_plan_room_ok", return_value=True)
+        b._pending_pipeline_zones = [self._queue(b, "M5"), self._queue(b, "M1")]
+        place = mocker.patch.object(b, "_try_place_setup", return_value=False)
+        b._try_place_pending(bid=1900.0, ask=1900.1)
+        place.assert_not_called()
+
+    def test_second_trade_needs_room(self, bot, mocker, tmp_path) -> None:
+        b, mgrs = self._plan_bot(bot, tmp_path)
+        b._latest_ohlc = make_ohlc(n=60)
+        b._plan_m5_df = make_ohlc(n=300)
+        mgrs["position_tracker"].get_active_setups.return_value = [self._setup(b, "M1")]
+        mocker.patch.object(b, "_plan_room_ok", return_value=False)
+        b._pending_pipeline_zones = [self._queue(b, "M5")]
+        place = mocker.patch.object(b, "_try_place_setup", return_value=False)
+        b._try_place_pending(bid=1900.0, ask=1900.1)
+        place.assert_not_called()
+
+    @pytest.mark.parametrize("realised,ok", [(-100.0, True), (-110.0, False), (0.0, True)])
+    def test_room_counts_open_trades_to_their_stops(self, bot, mocker, tmp_path, realised, ok) -> None:
+        from bot.risk.xautism_risk import DailyRisk, RiskVerdict
+        b, mgrs = self._plan_bot(bot, tmp_path)
+        b.config = replace(b.config, risk=replace(b.config.risk, risk_per_trade=50.0, risk_pct=None))
+        b.mt5.get_account_info.return_value = {"login": 1, "balance": 10_000.0}
+        daily = DailyRisk(trading_day="d", realised=realised, floating=0.0,
+                          closed_trades=1, losing_trades=1)
+        mocker.patch.object(b.daily_risk, "check", return_value=RiskVerdict(False, None, daily))
+        mocker.patch.object(b, "_open_loss_to_stops", return_value=50.0)   # the open M1 trade
+        assert b._plan_room_ok() is ok
+
+    def test_open_loss_to_stops(self, bot, tmp_path) -> None:
+        b, mgrs = self._plan_bot(bot, tmp_path)
+        b.mt5.calc_loss_per_lot.return_value = 100.0     # £100 a lot to the stop
+        b.mt5.get_open_positions.return_value = [
+            {"type": 0, "volume": 0.2, "price_open": 1900.0, "sl": 1895.0},   # BUY, £20 to stop
+            {"type": 1, "volume": 0.3, "price_open": 1900.0, "sl": 1899.0},   # SELL, stop in profit: 0
+        ]
+        b.mt5.get_pending_orders.return_value = [
+            {"type": 4, "volume_current": 0.1, "price_open": 1900.0, "sl": 1895.0},  # buy stop, £10
+        ]
+        assert b._open_loss_to_stops() == pytest.approx(30.0)
+
+    def test_m1_zone_overlapping_an_m5_zone_is_dropped(self, bot, mocker, tmp_path) -> None:
+        b, mgrs = self._plan_bot(bot, tmp_path)
+        df1 = make_ohlc(n=60); df5 = make_ohlc(n=300)
+        b._latest_ohlc = df1
+        mgrs["ohlc_provider"].get.side_effect = lambda sym, tf, count: df5 if tf == "M5" else df1
+        m5_zone = replace(_make_validated_for_persistence(_PT.DBR), top=1902.0, bottom=1899.0)
+        m1_inside = replace(_make_validated_for_persistence(_PT.DBR), top=1900.5, bottom=1900.0)
+        m1_away = replace(_make_validated_for_persistence(_PT.DBR), top=1890.5, bottom=1890.0)
+        m1_other_dir = replace(_make_validated_for_persistence(_PT.RBD), top=1900.5, bottom=1900.0)
+        mocker.patch("bot.main.run_strategy_pipeline", side_effect=lambda df, cfg, **kw:
+                     [m5_zone] if cfg is b.config.plan.m5_pipeline else [m1_inside, m1_away, m1_other_dir])
+        mocker.patch.object(b, "_run_zone_lifecycle")
+        mocker.patch.object(b, "_persist_zone_if_new", side_effect=lambda z, timeframe=None: uuid4())
+        b._detect_new_zones(NOW)
+        zs = [z for z, _ in b._pending_pipeline_zones]
+        assert zs[0] is m5_zone and m1_away in zs and m1_other_dir in zs
+        assert m1_inside not in zs

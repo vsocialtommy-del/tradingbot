@@ -8,8 +8,12 @@ Runs on the M1 bot's account (``--bot m1``). Backtested 28 Jul - 13 Nov
   (2 pt min, normal BOS, M / W only, 100,000 M5 candles ≈ 17 months).
   Each zone keeps its own timeframe's BOS / TP and its own runner:
   M5 75/25 with a 4 pt trail, M1 50/50 with a 2 pt trail.
-* **One trade at a time**, except a risk-free runner (TP1 hit, stop at
-  breakeven or better) doesn't block a new trade.
+* **M5 priority** (19 Nov 2026): an M5 trade can open beside an open M1
+  trade; an M1 trade only when nothing else is open. An M1 zone that
+  overlaps a fresh M5 zone is traded as M5. A risk-free runner (TP1 hit,
+  stop at breakeven or better) doesn't block anything.
+* **M5 zones: 2-candle minimum vertex** (19 Nov 2026, the 10% dip stays);
+  M1 zones keep 3.
 * **Risk**: £50 a trade on both. A -£200 dead stop for the day with a
   room check: no trade opens if the day's P&L minus that trade's risk
   would go below -£200. No losses-a-day count, no losses-in-a-row stop,
@@ -40,7 +44,7 @@ class PlanConfig:
     """M5 candles scanned for M5 zones (about 17 months)."""
     m5_fallback_count: int = 5000
     m5_pipeline: StrategyPipelineConfig = field(default_factory=lambda: StrategyPipelineConfig(
-        zone_min_size_points=2.0, vertex_require_mw=True,
+        zone_min_size_points=2.0, vertex_require_mw=True, vertex_min_base=2,
     ))
     """Same zone rules as the live M5 bot."""
     m5_entries: XautismEntryConfig = field(default_factory=lambda: XautismEntryConfig(
@@ -49,6 +53,13 @@ class PlanConfig:
     """M5 trades: 75% at TP1, 25% trails 4 pts (as the M5 bot)."""
     daily_stop: float = 200.0
     runner_frees_slot: bool = True
+    m5_priority: bool = True
+    """19 Nov 2026: an M5 trade can open beside an open M1 trade (never two
+    M5); an M1 trade only when nothing else is open (risk-free runners
+    aside). An M1 zone that overlaps a fresh M5 zone is traded as the M5
+    trade. A second trade only opens if the day's realised P&L, plus every
+    open position and waiting order going to its stop, minus the new
+    trade's risk, stays inside the dead stop."""
     drawdown_steps: tuple[tuple[float, float], ...] = ((600.0, 0.25), (400.0, 0.5))
     """(£ below peak, risk multiplier), biggest drawdown first."""
     state_file: str = "logs/plan_state.json"

@@ -32,7 +32,9 @@ class TestProfiles:
         assert cfg.direction_gate.trend_rule == "bos"
         assert cfg.xautism_entries == base.xautism_entries  # 75/25, 4 pt trail
         assert cfg.xautism_entries.m5_close_exit is False   # 30% SL only (10 Nov 2026)
-        assert pipe == replace(StrategyPipelineConfig(), zone_min_size_points=2.0, vertex_require_mw=True)
+        assert pipe == replace(StrategyPipelineConfig(), zone_min_size_points=2.0, vertex_require_mw=True,
+                               vertex_min_base=2)
+        assert pipe.vertex_min_base == 2                   # 19 Nov 2026: 2-candle vertex (was 3)
         assert pipe.vertex_require_mw is True and pipe.vertex_mw_min_pull == 0.10   # 18 Nov 2026: no spikes
         assert pipe.zone_min_size_points == 2.0            # 17 Nov 2026 (was 3)
         assert pipe.bos_close_beyond_wick is False         # M5 keeps the standard BOS
