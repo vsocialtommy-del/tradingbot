@@ -538,3 +538,30 @@ class TestEndToEnd:
         assert snap.state == StructureState.DOWNTREND
         downs = [e for e in snap.bos_events if e.direction == "DOWN"]
         assert len(downs) >= 3
+
+
+# 19 Nov 2026: detect_swings is vectorised; same swings as the old loop.
+def _swings_loop(df, strength):
+    closes = df["close"].to_numpy()
+    out = []
+    for i in range(strength, len(df) - strength):
+        w = closes[i - strength:i + strength + 1]
+        if w.max() == w.min():
+            continue
+        c = closes[i]
+        if c == w.max() and int(w.argmax()) == strength:
+            out.append(Swing(index=i, time=df.index[i], price=float(c), kind="HIGH"))
+        elif c == w.min() and int(w.argmin()) == strength:
+            out.append(Swing(index=i, time=df.index[i], price=float(c), kind="LOW"))
+    return out
+
+
+@pytest.mark.parametrize("strength", [1, 2, 3, 5])
+@pytest.mark.parametrize("decimals", [0, 2])
+def test_vectorised_swings_match_the_loop(strength: int, decimals: int) -> None:
+    import numpy as np
+    rng = np.random.default_rng(strength)
+    closes = (4000 + np.cumsum(rng.normal(0, 1.0, 3000))).round(decimals)
+    closes[100:120] = closes[100]          # a flat stretch
+    df = make_df(list(closes))
+    assert detect_swings(df, strength) == _swings_loop(df, strength)

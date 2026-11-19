@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 
 import pandas as pd
 import pytest
+from dataclasses import replace
 from pytest_mock import MockerFixture
 
 from bot.data.ohlc_provider import OHLCProvider
@@ -4291,3 +4292,92 @@ class TestCalendarAccount:
         br = DashboardBridge(sb, "M5")
         assert br.sync_trades([{"position_id": 2, "profit": 1.0}], account=5058387501) == 1
         assert sb.upsert_rows.call_args.args[1] == [{"position_id": 2, "profit": 1.0}]
+
+
+class TestLongHistoryFetch:
+    """19 Nov 2026: the M5 bot asks for 100,000 bars; if MT5 refuses
+    (e.g. "Max bars in chart" set lower) it falls back to 5000 and keeps
+    trading instead of stopping."""
+
+    def test_asks_for_the_full_window(self, bot) -> None:
+        b, mgrs = bot
+        b.config = replace(b.config, ohlc_count=100_000)
+        df = make_ohlc(n=30)
+        mgrs["ohlc_provider"].get.return_value = df
+        out = b._get_main_ohlc()
+        assert len(out) == 30
+        mgrs["ohlc_provider"].get.assert_called_once_with(
+            b.config.symbol, b.config.ohlc_timeframe, 100_000,
+        )
+
+    def test_falls_back_when_mt5_refuses(self, bot) -> None:
+        b, mgrs = bot
+        b.config = replace(b.config, ohlc_count=100_000)
+        df = make_ohlc(n=30)
+
+        def get(symbol, tf, count):
+            if count > 5000:
+                raise RuntimeError("copy_rates_from_pos returned no data")
+            return df
+
+        mgrs["ohlc_provider"].get.side_effect = get
+        assert len(b._get_main_ohlc()) == 30
+        # Once fallen back it goes straight to 5000 (no failing call each tick).
+        mgrs["ohlc_provider"].get.reset_mock()
+        assert len(b._get_main_ohlc()) == 30
+        mgrs["ohlc_provider"].get.assert_called_once_with(
+            b.config.symbol, b.config.ohlc_timeframe, 5000,
+        )
+
+    def test_5000_window_failure_still_raises(self, bot) -> None:
+        b, mgrs = bot
+        b.config = replace(b.config, ohlc_count=5000)
+        mgrs["ohlc_provider"].get.side_effect = RuntimeError("no data")
+        with pytest.raises(RuntimeError):
+            b._get_main_ohlc()
+
+
+class TestLongHistorySaveRule:
+    """19 Nov 2026 (after PR #110 stalled the bot): with a long history,
+    old zones are only saved if the bot could trade them (fresh + BOS),
+    and the lifecycle only gets the recent window."""
+
+    def _zone(self, formed: str, strong: bool):
+        z = _make_validated_for_persistence(_PT.RBR)
+        ts = pd.Timestamp(formed)
+        return replace(z, formed_at=ts, is_strong_point=strong)
+
+    def _run(self, bot, mocker, zones, n=300, recent=100):
+        b, mgrs = bot
+        b.config = replace(b.config, ohlc_count=n, ohlc_fallback_count=recent)
+        df = make_ohlc(n=n)
+        b._latest_ohlc = df
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=zones)
+        life = mocker.patch.object(b, "_run_zone_lifecycle")
+        saved = []
+        mocker.patch.object(b, "_persist_zone_if_new",
+                            side_effect=lambda z: saved.append(z) or uuid4())
+        b._detect_new_zones(NOW)
+        return df, life, saved
+
+    def test_old_dead_zone_not_saved_old_fresh_zone_saved(self, bot, mocker) -> None:
+        old_dead = self._zone("2026-04-01T00:00:00Z", strong=False)
+        old_fresh = self._zone("2026-04-01T01:00:00Z", strong=True)
+        recent_dead = self._zone("2026-05-08T11:00:00Z", strong=False)
+        _, _, saved = self._run(bot, mocker, [old_dead, old_fresh, recent_dead])
+        assert old_dead not in saved
+        assert old_fresh in saved
+        assert recent_dead in saved          # recent zones saved as before
+
+    def test_lifecycle_gets_only_the_recent_window(self, bot, mocker) -> None:
+        df, life, _ = self._run(bot, mocker, [])
+        (arg,), _ = life.call_args
+        assert len(arg) == 100 and arg.index[-1] == df.index[-1]
+
+    def test_short_history_unchanged(self, bot, mocker) -> None:
+        # M1 bot / 5000-bar window: everything as before
+        old_dead = self._zone("2026-04-01T00:00:00Z", strong=False)
+        df, life, saved = self._run(bot, mocker, [old_dead], n=100, recent=100)
+        assert old_dead in saved
+        (arg,), _ = life.call_args
+        assert arg is df

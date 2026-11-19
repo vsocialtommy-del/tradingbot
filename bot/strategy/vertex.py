@@ -73,6 +73,14 @@ class VertexConfig:
 
 def detect_vertex_patterns(df: pd.DataFrame, config: VertexConfig | None = None) -> list[Pattern]:
     cfg = config or VertexConfig()
+    return _finish(_raw_patterns(df, cfg), df, cfg)
+
+
+def _raw_patterns(df: pd.DataFrame, cfg: VertexConfig, first_out: int = 0) -> list[Pattern]:
+    """Every vertex candidate whose leg out starts at or after ``first_out``
+    (before de-duplication and the M / W filter). Each candidate only
+    depends on the candles around it, which is what lets
+    :class:`VertexPatternCache` reuse the old ones."""
     n = len(df)
     if n < cfg.min_base + 2:
         return []
@@ -85,7 +93,7 @@ def detect_vertex_patterns(df: pd.DataFrame, config: VertexConfig | None = None)
     bear = c < o
 
     found: list[Pattern] = []
-    for out_start in range(cfg.min_base + 1, n):
+    for out_start in range(max(cfg.min_base + 1, first_out), n):
         for direction in ("SELL", "BUY"):
             leg_out_dir = bear if direction == "SELL" else bull
             leg_in_dir = bull if direction == "SELL" else bear
@@ -106,12 +114,104 @@ def detect_vertex_patterns(df: pd.DataFrame, config: VertexConfig | None = None)
                 found.append(_pattern(direction, idx, o, h, l, c, in_s, in_e, s, e,
                                       out_s, out_e, top, bottom, foot))
                 break
+    return found
+
+
+def _finish(found: list[Pattern], df: pd.DataFrame, cfg: VertexConfig) -> list[Pattern]:
     out = _dedupe(found)
     if cfg.require_mw:
+        c = df["close"].to_numpy(float)
         out = [p for p in out if is_mw_shape(
             c, p.base.start_index, p.base.end_index, p.base.bottom, p.base.top,
             p.direction == "SELL", cfg.mw_min_pull)]
     return out
+
+
+def _shift_pattern(p: Pattern, off: int) -> Pattern:
+    """The same pattern with every candle index moved back by ``off``."""
+    if off == 0:
+        return p
+    from dataclasses import replace as _r
+    return _r(
+        p,
+        impulse_before=_r(p.impulse_before, start_index=p.impulse_before.start_index - off,
+                          end_index=p.impulse_before.end_index - off),
+        base=_r(p.base, start_index=p.base.start_index - off, end_index=p.base.end_index - off),
+        impulse_after=_r(p.impulse_after, start_index=p.impulse_after.start_index - off,
+                         end_index=p.impulse_after.end_index - off),
+        foot_index=None if p.foot_index is None else p.foot_index - off,
+    )
+
+
+class VertexPatternCache:
+    """Same answer as :func:`detect_vertex_patterns`, without re-scanning
+    the whole history on every new candle (19 Nov 2026, for the M5 bot's
+    100,000-candle lookback).
+
+    Vertex candidates are local: each one only looks at a few dozen
+    candles around its leg out. So candidates whose leg out starts more
+    than ``tail`` candles before the end can't change when new candles
+    arrive. Those are kept from the last full scan (re-indexed as old
+    candles drop off the front); only the last ``tail`` candles (plus
+    ``context`` candles before them to look back into) are scanned again, along with
+    the oldest 500 candles (a candidate right at the front can lose part
+    of its leg in as old candles drop off).
+    A full scan runs on the first call, when the candles don't line up
+    with the cached ones, and once the re-scanned part grows to
+    ``2 * tail``. Short histories (``min_bars`` or fewer) are always
+    scanned in full, so the M1 bot's 5,000-candle window is unchanged.
+    """
+
+    def __init__(self, config: VertexConfig, *, tail: int = 3000,
+                 context: int = 1000, min_bars: int = 20000) -> None:
+        self.cfg = config
+        self.tail = tail
+        self.context = context
+        self.min_bars = min_bars
+        self.front = 500
+        self._idx: pd.DatetimeIndex | None = None
+        self._frozen: list[Pattern] = []   # raw candidates, leg out before _cut
+        self._cut = 0                      # index (in the cached frame) of the first re-scanned leg out
+        self.full_scans = 0
+
+    def _full(self, df: pd.DataFrame) -> list[Pattern]:
+        self.full_scans += 1
+        raw = _raw_patterns(df, self.cfg)
+        self._idx = df.index.copy()
+        self._cut = max(0, len(df) - self.tail)
+        self._frozen = [p for p in raw if p.impulse_after.start_index < self._cut]
+        return _finish(raw, df, self.cfg)
+
+    def patterns(self, df: pd.DataFrame) -> list[Pattern]:
+        n = len(df)
+        if n <= self.min_bars:
+            return detect_vertex_patterns(df, self.cfg)
+        if self._idx is None or len(df.index) == 0:
+            return self._full(df)
+        pos = self._idx.get_indexer([df.index[0]])[0]
+        if pos < 0:
+            return self._full(df)
+        d = int(pos)                        # candles dropped off the front since the full scan
+        cut = self._cut - d                 # first re-scanned leg out, in this frame
+        overlap = len(self._idx) - d        # candles this frame shares with the cached one
+        if (cut < self.front + self.context or n - cut > 2 * self.tail or overlap <= cut
+                or not df.index[:overlap].equals(self._idx[d:])):
+            return self._full(df)
+        # The oldest candles are re-scanned too: as they drop off the front,
+        # a candidate there can lose part of its leg in or foot.
+        front = self.front
+        head = [p for p in _raw_patterns(df.iloc[:front + 2 * self.context], self.cfg)
+                if p.impulse_after.start_index < front]
+        frozen = []
+        for p in self._frozen:
+            q = _shift_pattern(p, d)
+            if q.impulse_after.start_index < front:
+                continue
+            frozen.append(q)
+        start = cut - self.context
+        recent = [_shift_pattern(p, -start)
+                  for p in _raw_patterns(df.iloc[start:], self.cfg, first_out=self.context)]
+        return _finish(head + frozen + recent, df, self.cfg)
 
 
 def is_mw_shape(c, s: int, e: int, bottom: float, top: float, sell: bool,

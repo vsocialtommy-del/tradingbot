@@ -147,7 +147,9 @@ from bot.risk.xautism_risk import (
 from bot.strategy.pipeline import (
     StrategyPipelineConfig,
     run_strategy_pipeline,
+    vertex_config,
 )
+from bot.strategy.vertex import VertexPatternCache
 from bot.strategy.tp_target import find_nearest_local_peak
 from bot.strategy.zone_marking import Zone as _ZoneShape
 from bot.strategy.zone_refinement import RefinedZone as _RefinedZone
@@ -258,7 +260,14 @@ class BotLoopConfig:
     days (about 3.5 weeks). A zone stays tradeable for as long as it is
     fresh (untouched since its BOS, not closed through), however old,
     as long as it is inside this window. Nov 2026: 1000 → 5000; the old
-    3.5-day window dropped still-fresh zones the user trades manually."""
+    3.5-day window dropped still-fresh zones the user trades manually.
+    19 Nov 2026: the M5 bot sets 100,000 (about 17 months) in
+    :mod:`bot.profiles`; the M1 bot keeps 5000."""
+    ohlc_fallback_count: int = 5000
+    """If MT5 refuses the full ``ohlc_count`` fetch (for example MT5's
+    "Max bars in chart" is set lower), the bot falls back to this many
+    bars and logs a warning, so it keeps trading on the old window
+    instead of stopping."""
 
     direction_gate: DirectionGateConfig = field(default_factory=DirectionGateConfig)
     """M15 direction + fresh-H1-zone exception. See
@@ -1076,6 +1085,39 @@ class Bot:
     # Strategy / new setups
     # ------------------------------------------------------------------ #
 
+    def _get_main_ohlc(self) -> pd.DataFrame:
+        """The bot's own-timeframe bars (``ohlc_count`` of them).
+
+        If MT5 won't give that many (e.g. "Max bars in chart" is set
+        lower than ``ohlc_count``), fall back to ``ohlc_fallback_count``
+        so the bot keeps trading, and warn once. The first good fetch
+        logs how far back the history actually reaches."""
+        cfg = self.config
+        count = cfg.ohlc_count
+        if getattr(self, "_ohlc_fell_back", False):
+            count = min(count, cfg.ohlc_fallback_count)
+        try:
+            df = self.ohlc_provider.get(cfg.symbol, cfg.ohlc_timeframe, count)
+        except Exception:
+            if count <= cfg.ohlc_fallback_count:
+                raise
+            logger.warning(
+                f"MT5 wouldn't give {count} {cfg.ohlc_timeframe} bars; "
+                f"falling back to {cfg.ohlc_fallback_count}. To see further "
+                f"back, set MT5 Tools > Options > Charts > Max bars in chart "
+                f"to {count} or more (or Unlimited) and restart the bot"
+            )
+            self._ohlc_fell_back = True
+            count = cfg.ohlc_fallback_count
+            df = self.ohlc_provider.get(cfg.symbol, cfg.ohlc_timeframe, count)
+        if len(df) and not getattr(self, "_logged_history", False):
+            self._logged_history = True
+            logger.info(
+                f"history: asked MT5 for {count} {cfg.ohlc_timeframe} bars, "
+                f"got {len(df)}, back to {df.index[0]:%Y-%m-%d %H:%M}"
+            )
+        return df
+
     def _has_new_m5_close(self, now: datetime) -> bool:
         """True iff the most recent M5 bar's timestamp has advanced.
 
@@ -1085,11 +1127,7 @@ class Bot:
         re-running the strategy pipeline on every tick.
         """
         try:
-            df = self.ohlc_provider.get(
-                self.config.symbol,
-                self.config.ohlc_timeframe,
-                self.config.ohlc_count,
-            )
+            df = self._get_main_ohlc()
         except Exception:
             logger.exception("main loop: OHLC fetch failed")
             return False
@@ -1127,14 +1165,38 @@ class Bot:
         # just-closed M5 bar, BEFORE detecting new Strong Points. This
         # ensures the dedup pre-flight in _try_place_setup sees the
         # freshly-CONSUMED state from this bar.
+        # 19 Nov 2026: with the M5 bot's long history the lifecycle (which
+        # only looks at the last candle, plus recent structure for a flip)
+        # gets the recent window, so a flip check never re-reads 17 months.
+        recent = self.config.ohlc_fallback_count
+        long_history = len(df) > recent
         try:
-            self._run_zone_lifecycle(df)
+            self._run_zone_lifecycle(df.iloc[-recent:] if long_history else df)
         except Exception:
             logger.exception("main loop: zone lifecycle pass raised")
             # Continue — pattern detection isn't impacted by lifecycle errors.
 
         try:
-            zones = run_strategy_pipeline(df, self.strategy_pipeline_config)
+            t0 = time.monotonic()
+            if long_history and self.strategy_pipeline_config.pattern_detector == "vertex":
+                vcfg = vertex_config(self.strategy_pipeline_config)
+                cache = getattr(self, "_vertex_cache", None)
+                if cache is None or cache.cfg != vcfg:
+                    cache = self._vertex_cache = VertexPatternCache(vcfg)
+                # Only the newest candles are re-scanned; same zones as a
+                # full scan (see VertexPatternCache).
+                zones = run_strategy_pipeline(
+                    df, self.strategy_pipeline_config, patterns=cache.patterns(df),
+                )
+            else:
+                zones = run_strategy_pipeline(df, self.strategy_pipeline_config)
+            secs = time.monotonic() - t0
+            if not getattr(self, "_logged_scan_time", False) or secs > 10:
+                self._logged_scan_time = True
+                logger.info(
+                    f"zone scan: {len(df)} bars in {secs:.1f}s, "
+                    f"{len(zones)} zones"
+                )
         except Exception:
             logger.exception("main loop: strategy pipeline raised")
             return
@@ -1151,8 +1213,16 @@ class Bot:
         # ``_persisted_zone_keys`` cache). This populates the data
         # trail the lifecycle scanner and dedup pre-flight rely on.
         zone_ids: dict[int, UUID] = {}
+        # 19 Nov 2026: beyond the recent window only zones the bot could
+        # actually trade (fresh, with a BOS) are saved. Saving every old,
+        # long-dead zone from 17 months of history flooded the database and
+        # stalled the lifecycle (PR #110 / #111).
+        recent_start = df.index[-recent] if long_history else None
         for zone in zones:
             if not zone.refined_zone.is_tradeable:
+                continue
+            if (recent_start is not None and not zone.is_strong_point
+                    and pd.Timestamp(zone.formed_at) < recent_start):
                 continue
             zid = self._persist_zone_if_new(zone)
             if zid is not None:
@@ -1423,10 +1493,7 @@ class Bot:
         if not setups:
             return
         try:
-            df = self.ohlc_provider.get(
-                self.config.symbol, self.config.ohlc_timeframe,
-                self.config.ohlc_count,
-            )
+            df = self._get_main_ohlc()
         except Exception:
             logger.exception("m5 close exit: OHLC fetch failed")
             return

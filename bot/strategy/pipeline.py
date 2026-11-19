@@ -192,6 +192,18 @@ class StrategyPipelineConfig:
     zone_wick_extend_bars: int = 0
 
 
+def vertex_config(cfg: StrategyPipelineConfig) -> VertexConfig:
+    """The vertex detector settings that go with a pipeline config."""
+    return VertexConfig(
+        min_base=cfg.vertex_min_base, max_base=cfg.vertex_max_base,
+        max_leg=cfg.vertex_max_leg, exit_frac=cfg.vertex_exit_frac,
+        leg_min_frac=cfg.vertex_leg_min_frac,
+        foot_zigzag_frac=cfg.vertex_foot_zigzag_frac,
+        require_mw=cfg.vertex_require_mw,
+        mw_min_pull=cfg.vertex_mw_min_pull,
+    )
+
+
 def run_strategy_pipeline(
     df: pd.DataFrame,
     config: StrategyPipelineConfig | None = None,
@@ -216,14 +228,7 @@ def run_strategy_pipeline(
         # Pre-detected patterns (backtest cache); indices are df-relative.
         wick_extend = 0 if cfg.pattern_detector == "vertex" else cfg.zone_wick_extend_bars
     elif cfg.pattern_detector == "vertex":
-        patterns = detect_vertex_patterns(df, VertexConfig(
-            min_base=cfg.vertex_min_base, max_base=cfg.vertex_max_base,
-            max_leg=cfg.vertex_max_leg, exit_frac=cfg.vertex_exit_frac,
-            leg_min_frac=cfg.vertex_leg_min_frac,
-            foot_zigzag_frac=cfg.vertex_foot_zigzag_frac,
-            require_mw=cfg.vertex_require_mw,
-            mw_min_pull=cfg.vertex_mw_min_pull,
-        ))
+        patterns = detect_vertex_patterns(df, vertex_config(cfg))
         wick_extend = 0   # vertex zones are exactly wick to wick
     else:
         patterns = detect_patterns(df, pattern_cfg)
