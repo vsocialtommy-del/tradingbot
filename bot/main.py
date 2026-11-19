@@ -1303,7 +1303,16 @@ class Bot:
 
         if self.config.plan is not None:
             # Claude's plan: M5 zones first (the backtest checked M5 then M1).
-            new_pipeline_pending = self._plan_m5_candidates() + new_pipeline_pending
+            m5_cands = self._plan_m5_candidates()
+            if self.config.plan.m5_priority:
+                # 19 Nov 2026: an M1 zone that overlaps a fresh M5 zone is
+                # traded as the M5 trade (M5 SL / TP / runner), not as M1.
+                fresh5 = [z5 for z5, _ in self._plan_m5_pending]
+                new_pipeline_pending = [
+                    (z, zid) for z, zid in new_pipeline_pending
+                    if not any(_zones_overlap(z, z5) for z5 in fresh5)
+                ]
+            new_pipeline_pending = m5_cands + new_pipeline_pending
         self._pending_pipeline_zones = new_pipeline_pending
         self._pending_flipped_zones = list(flipped_candidates)
         if self._pending_pipeline_zones or self._pending_flipped_zones:
@@ -1380,6 +1389,55 @@ class Bot:
                 self._plan_m5_pending = pending
                 self._plan_m5_df = df5
         return [(z, zid) for z, zid in self._plan_m5_pending if zid not in self._traded_zone_ids]
+
+    def _plan_room_ok(self) -> bool:
+        """Claude's plan, a second trade beside an open one: the day's
+        realised P&L, plus every open position and waiting order going to
+        its stop, minus the new trade's risk, must stay inside the
+        -£200 dead stop. Errs on the side of no trade."""
+        plan = self.config.plan
+        if plan is None:
+            return True
+        risk = self._risk_now()
+        try:
+            v = self.daily_risk.check(datetime.now(timezone.utc), risk)
+            realised = float(v.daily.realised) if v.daily is not None else 0.0
+            at_stop = self._open_loss_to_stops()
+        except Exception:
+            logger.exception("plan: room check failed; no second trade")
+            return False
+        worst = realised - at_stop - risk.risk_per_trade
+        if worst < -plan.daily_stop:
+            logger.info(
+                f"plan: no second trade, realised {realised:.2f} - open risk "
+                f"{at_stop:.2f} - new {risk.risk_per_trade:.2f} = {worst:.2f} "
+                f"past -{plan.daily_stop:.0f}"
+            )
+            return False
+        return True
+
+    def _open_loss_to_stops(self) -> float:
+        """What the bot's open positions and waiting orders lose if they all
+        go to their stop (account currency, >= 0). A stop at breakeven or
+        better counts as 0."""
+        sym = self.config.symbol
+        total = 0.0
+        items = [(p, p.get("type"), p.get("volume")) for p in self.mt5.get_open_positions(sym)]
+        items += [(o, o.get("type"), o.get("volume_current") or o.get("volume_initial"))
+                  for o in self.mt5.get_pending_orders(sym)]
+        for row, typ, vol in items:
+            direction = "BUY" if typ in (0, 2, 4, 6) else "SELL"
+            entry = float(row.get("price_open") or 0.0)
+            sl = float(row.get("sl") or 0.0)
+            if not vol or not entry:
+                continue
+            if not sl:
+                total += self.config.risk.risk_per_trade   # no stop: assume a full loss
+                continue
+            if (direction == "BUY" and sl >= entry) or (direction == "SELL" and sl <= entry):
+                continue
+            total += float(vol) * self._loss_per_lot(direction, entry, sl)
+        return total
 
     def _zone_timeframe(self, zone_id: UUID | None) -> str:
         """"M5" for a Claude's plan M5 zone, else the bot's own timeframe."""
@@ -1794,6 +1852,13 @@ class Bot:
             free = self.runner_trail.started
             active_setups = [s for s in active_setups if getattr(s, "id", None) not in free]
         active_count = count_active_setups(active_setups)
+        # Claude's plan, M5 priority (19 Nov 2026): what's open, by timeframe.
+        busy_tfs: list[str] = []
+        if plan is not None and plan.m5_priority:
+            busy_tfs = [
+                self._setup_timeframe(s) for s in active_setups
+                if _setup_status(s) in ("ACTIVE", "PENDING")
+            ]
 
         for source_label, queue in (
             ("pipeline", self._pending_pipeline_zones),
@@ -1803,12 +1868,25 @@ class Bot:
             # Iterate over a copy so we can mutate the underlying list.
             remaining: list[tuple[ValidatedZone, UUID]] = []
             for zone, zid in queue:
-                exp = check_exposure(
-                    active_count=active_count,
-                    max_simultaneous=self.config.max_simultaneous_setups,
-                    with_candidate=True,
-                )
-                if not exp.can_open_new:
+                if plan is not None and plan.m5_priority and not is_flipped_retrade:
+                    # An M5 trade can open beside an M1 trade (never two M5);
+                    # an M1 trade only when nothing else is open.
+                    tf_c = self._zone_timeframe(zid)
+                    ok = ("M5" not in busy_tfs) if tf_c == "M5" else not busy_tfs
+                    if not ok:
+                        remaining.append((zone, zid))
+                        continue
+                    if busy_tfs and not self._plan_room_ok():
+                        remaining.append((zone, zid))
+                        continue
+                    exp_ok = True
+                else:
+                    exp_ok = check_exposure(
+                        active_count=active_count,
+                        max_simultaneous=self.config.max_simultaneous_setups,
+                        with_candidate=True,
+                    ).can_open_new
+                if not exp_ok:
                     # Out of exposure — leave this and everything
                     # after in the queue for a future tick.
                     remaining.append((zone, zid))
@@ -1829,6 +1907,8 @@ class Bot:
                 ):
                     self._traded_zone_ids.add(zid)
                     active_count += 1
+                    if plan is not None and plan.m5_priority:
+                        busy_tfs.append(tf or self.config.ohlc_timeframe)
                     self.state.placed_setup_count += 1
                     logger.info(
                         f"setup placed from source={source_label} "
@@ -3066,6 +3146,18 @@ def _zone_to_input(zone: ValidatedZone, *, timeframe: str | None = None) -> Zone
         # lifecycle and the runner know their timeframe.
         last_evaluation_result={"timeframe": timeframe} if timeframe else None,
     )
+
+
+def _zones_overlap(a: Any, b: Any) -> bool:
+    """Same direction and the price ranges touch or overlap."""
+    return (a.direction == b.direction
+            and float(a.bottom) <= float(b.top) and float(b.bottom) <= float(a.top))
+
+
+def _setup_status(setup: Any) -> str | None:
+    if isinstance(setup, dict):
+        return setup.get("status")
+    return getattr(setup, "status", None)
 
 
 def _zone_tag(zone_row: Any) -> str | None:

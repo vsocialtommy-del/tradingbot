@@ -236,3 +236,37 @@ def test_short_history_is_always_a_full_scan() -> None:
     cache = VertexPatternCache(cfg, min_bars=1000)
     assert _key(cache.patterns(df)) == _key(detect_vertex_patterns(df, cfg))
     assert cache.full_scans == 0
+
+
+# 19 Nov 2026: M5 zones may have a 2-candle vertex; the 10% M / W dip
+# still decides (Tommy's 18:30-18:35 sell, 19 Nov).
+TWO_CANDLE_M = [
+    (3676.2, 3677.8, 3675.7, 3677.6),   # leg in
+    (3677.6, 3679.3, 3677.2, 3678.9),   # leg in
+    (3678.9, 3685.5, 3678.6, 3684.5),   # leg in (big)
+    (3684.6, 3686.3, 3682.3, 3683.8),   # vertex
+    (3683.8, 3687.3, 3682.1, 3685.0),   # vertex
+    (3685.0, 3685.0, 3678.5, 3678.7),   # leg out
+    (3678.7, 3679.0, 3672.0, 3672.4),   # leg out, more than half a zone below
+]
+
+
+def test_two_candle_vertex_m_zone() -> None:
+    from dataclasses import replace as _r
+    df = frame([(3681.0, 3681.2, 3676.9, 3679.1), (3679.1, 3679.3, 3675.9, 3676.1)] + TWO_CANDLE_M)
+    three = detect_vertex_patterns(df, VertexConfig(require_mw=True))
+    two = detect_vertex_patterns(df, VertexConfig(require_mw=True, min_base=2))
+    sells = [p for p in two if p.direction == "SELL"]
+    assert len(sells) == 1
+    p = sells[0]
+    assert (p.base.candle_count, p.base.bottom, p.base.top) == (2, 3682.1, 3687.3)
+    assert not [q for q in three if q.direction == "SELL" and q.base.bottom > 3680]
+
+
+def test_two_candle_spike_still_rejected() -> None:
+    # same move, but the second vertex candle closes LOWER (no second top)
+    rows = list(TWO_CANDLE_M)
+    rows[4] = (3683.8, 3687.3, 3682.1, 3683.0)
+    df = frame([(3681.0, 3681.2, 3676.9, 3679.1), (3679.1, 3679.3, 3675.9, 3676.1)] + rows)
+    two = detect_vertex_patterns(df, VertexConfig(require_mw=True, min_base=2))
+    assert not [p for p in two if p.direction == "SELL" and p.base.candle_count == 2]
