@@ -46,6 +46,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+import numpy as np
 import pandas as pd
 from loguru import logger
 
@@ -202,22 +203,18 @@ def flipped_zone_body_broken_since_flip(
     tradeable. The lookup is strict ``time > flipped_at`` so the flip
     bar itself isn't re-checked.
     """
-    times = df.index
-    start_idx: int | None = None
-    for i, t in enumerate(times):
-        if t > flipped_at:
-            start_idx = i
-            break
-    if start_idx is None:
+    # Vectorised (19 Nov 2026, same answer as the old per-bar loop): with
+    # the M5 bot's 100,000-bar history the loop over every timestamp, for
+    # every flipped zone on every candle, froze the bot for ~50 s.
+    after = np.asarray(df.index > flipped_at)
+    if not after.any():
         return False
-
-    closes = df["close"].to_numpy()
-    for i in range(start_idx, len(df)):
-        bar_close = float(closes[i])
-        if flipped_direction == "BUY" and bar_close < zone_bottom:
-            return True
-        if flipped_direction == "SELL" and bar_close > zone_top:
-            return True
+    start_idx = int(after.argmax())          # first bar after the flip
+    closes = df["close"].to_numpy(dtype=float)[start_idx:]
+    if flipped_direction == "BUY":
+        return bool((closes < zone_bottom).any())
+    if flipped_direction == "SELL":
+        return bool((closes > zone_top).any())
     return False
 
 

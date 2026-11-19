@@ -540,3 +540,47 @@ class TestFlippedZoneBodyBrokenSinceFlip:
             flipped_direction="SELL",
             flipped_at=flipped_at, df=df,
         ) is False
+
+
+# 19 Nov 2026: flipped_zone_body_broken_since_flip is vectorised (the
+# per-bar loop froze the M5 bot on 100,000 bars). Same answers as the loop.
+def _flip_broken_loop(zone_top, zone_bottom, flipped_direction, flipped_at, df):
+    start = None
+    for i, t in enumerate(df.index):
+        if t > flipped_at:
+            start = i
+            break
+    if start is None:
+        return False
+    closes = df["close"].to_numpy()
+    for i in range(start, len(df)):
+        c = float(closes[i])
+        if flipped_direction == "BUY" and c < zone_bottom:
+            return True
+        if flipped_direction == "SELL" and c > zone_top:
+            return True
+    return False
+
+
+def test_flip_broken_vectorised_matches_loop() -> None:
+    import numpy as np
+    import pandas as pd
+    from bot.strategy.zone_lifecycle import flipped_zone_body_broken_since_flip
+    rng = np.random.default_rng(5)
+    n = 2000
+    closes = 1900 + np.cumsum(rng.normal(0, 1.0, n))
+    idx = pd.date_range("2026-01-01", periods=n, freq="5min", tz="UTC")
+    df = pd.DataFrame({"open": closes, "high": closes + 1, "low": closes - 1,
+                       "close": closes}, index=idx)
+    checked = 0
+    for k in range(400):
+        at = idx[int(rng.integers(0, n))] + pd.Timedelta(minutes=int(rng.integers(-3, 3)))
+        mid = float(rng.uniform(closes.min(), closes.max()))
+        top, bottom = mid + 2, mid - 2
+        for d in ("BUY", "SELL"):
+            assert flipped_zone_body_broken_since_flip(top, bottom, d, at, df) == \
+                _flip_broken_loop(top, bottom, d, at, df)
+            checked += 1
+    late = idx[-1] + pd.Timedelta(minutes=5)
+    assert flipped_zone_body_broken_since_flip(1, 0, "BUY", late, df) is False
+    assert checked == 800
