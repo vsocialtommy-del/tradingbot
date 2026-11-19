@@ -23,6 +23,7 @@ type StatusData = {
   } | null;
   open_positions?: Position[];
   next_buy?: Zone | null; next_sell?: Zone | null;
+  plan?: { name: string; zones: string; daily_stop: number; drawdown_peak: number | null; m5_runner: string } | null;
   trend?: { state: "UPTREND" | "DOWNTREND" | "RANGE"; timeframe: string; rule: string;
     since: string | null; up_above: number | null; down_below: number | null; filter?: string } | null;
 };
@@ -51,6 +52,8 @@ type DayTrade = {
 // ------------------------------------------------------------------ helpers
 
 const TZ = "Europe/London";
+// 19 Nov 2026: the M1 bot running Claude's plan shows as "CLAUDE FTMO".
+const botName = (b: BotRow) => (b.status?.data?.plan ? "CLAUDE FTMO" : `${b.bot} BOT`);
 const sym = (cur?: string) => (cur === "USD" ? "$" : cur === "EUR" ? "€" : "£");
 const money = (v: number, cur?: string, dp = 0) =>
   `${v < 0 ? "−" : ""}${sym(cur)}${Math.abs(v).toLocaleString("en-GB", { minimumFractionDigits: dp, maximumFractionDigits: dp })}`;
@@ -277,7 +280,7 @@ export default function Dashboard() {
       <h2 className="sec">{monthName(thisMonth)}</h2>
       <div className="row">
         {bots.map((b) => (
-          <MiniCal key={b.bot} bot={b.bot} ym={thisMonth} month={months[`${b.bot}|${thisMonth}`]}
+          <MiniCal key={b.bot} bot={b.bot} label={botName(b)} ym={thisMonth} month={months[`${b.bot}|${thisMonth}`]}
             today={b.status?.data?.today?.trading_day ?? londonDate()}
             currency={b.status?.data?.account?.currency}
             onOpen={() => setCalOpen(b.bot)} />
@@ -295,6 +298,7 @@ export default function Dashboard() {
 
       {calOpen && (
         <BigCal bot={calOpen} start={thisMonth} months={months} load={loadMonth} api={api}
+          label={(() => { const cb = bots.find((b) => b.bot === calOpen); return cb ? botName(cb) : undefined; })()}
           currency={bots.find((b) => b.bot === calOpen)?.status?.data?.account?.currency}
           today={bots.find((b) => b.bot === calOpen)?.status?.data?.today?.trading_day ?? londonDate()}
           onClose={() => setCalOpen(null)} />
@@ -331,7 +335,7 @@ function BotCard({ b, now, trading, onOpen, onToggle }: {
     <div className="card tap" onClick={onOpen} role="button">
       <div className="hd">
         <div style={{ minWidth: 0 }}>
-          <div className="name">{b.bot} BOT</div>
+          <div className="name">{botName(b)}</div>
           <div className="sub">{[riskText(d.settings?.risk), d.account?.login ? `#${d.account.login}` : null].filter(Boolean).join(" · ") || " "}</div>
         </div>
         <button className={`sw ${trading ? "on" : ""}`} aria-label={trading ? "Turn off" : "Turn on"}
@@ -401,9 +405,9 @@ function BotPopup({ b, now, trading, onClose, onToggle, onCommand, api, say, rel
         <button className="x" onClick={onClose} aria-label="Close">✕</button>
         <div className="hd" style={{ paddingRight: 30 }}>
           <div style={{ minWidth: 0 }}>
-            <div className="name" style={{ fontSize: 17 }}>{b.bot} BOT</div>
+            <div className="name" style={{ fontSize: 17 }}>{botName(b)}</div>
             <div className="sub">
-              {[d.account?.login ? `#${d.account.login}` : null, d.timeframe ? `${d.timeframe} zones` : null, d.settings?.runner].filter(Boolean).join(" · ")}
+              {[d.account?.login ? `#${d.account.login}` : null, d.plan ? `${d.plan.zones} zones` : d.timeframe ? `${d.timeframe} zones` : null, d.settings?.runner].filter(Boolean).join(" · ")}
             </div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, fontWeight: 600, color: "var(--gold2)" }}>
@@ -554,7 +558,7 @@ function SettingsEditor({ b, onClose, api, say, reload }: {
     <>
       <div className="ov top" onClick={onClose} />
       <div className="confirm" style={{ top: "12%" }}>
-        <div className="name" style={{ fontSize: 14 }}>{b.bot} BOT SETTINGS</div>
+        <div className="name" style={{ fontSize: 14 }}>{botName(b)} SETTINGS</div>
         <h3>RISK PER TRADE</h3>
         <div className="chips">
           <button className={`chip ${risk === "" ? "on" : ""}`} onClick={() => setRisk("")}>Bot default</button>
@@ -641,7 +645,7 @@ function LoginEditor({ b, onClose, api, say, reload }: {
     <>
       <div className="ov top" onClick={onClose} />
       <div className="confirm" style={{ top: "12%" }}>
-        <div className="name" style={{ fontSize: 14 }}>{b.bot} BOT · LOG IN</div>
+        <div className="name" style={{ fontSize: 14 }}>{botName(b)} · LOG IN</div>
         <h3>ACCOUNT NUMBER</h3>
         <input className="input" inputMode="numeric" autoComplete="off" value={login} onChange={(e) => setLogin(e.target.value.replace(/\D/g, ""))} />
         <h3>PASSWORD</h3>
@@ -676,12 +680,12 @@ function cells(ym: string): (string | null)[] {
 }
 const WEEK = ["M", "T", "W", "T", "F", "S", "S"];
 
-function MiniCal({ bot, ym, month, today, currency, onOpen }: {
-  bot: string; ym: string; month?: Month; today: string; currency?: string; onOpen: () => void;
+function MiniCal({ bot, label, ym, month, today, currency, onOpen }: {
+  bot: string; label?: string; ym: string; month?: Month; today: string; currency?: string; onOpen: () => void;
 }) {
   return (
     <div className="card tap" onClick={onOpen} role="button">
-      <div className="ct"><b>{bot} BOT</b><span className={tone(month?.total ?? 0)}>{month ? signed(month.total, currency, 0) : "–"}</span></div>
+      <div className="ct"><b>{label ?? `${bot} BOT`}</b><span className={tone(month?.total ?? 0)}>{month ? signed(month.total, currency, 0) : "–"}</span></div>
       <div className="cm">{month ? `${month.trades} TRADES · ` : ""}TAP TO ENLARGE</div>
       <div className="mw">{WEEK.map((w, i) => <div key={i}>{w}</div>)}</div>
       <div className="mg">
@@ -700,8 +704,8 @@ function MiniCal({ bot, ym, month, today, currency, onOpen }: {
   );
 }
 
-function BigCal({ bot, start, months, load, api, currency, today, onClose }: {
-  bot: string; start: string; months: Record<string, Month>; load: (b: string, ym: string) => Promise<void>;
+function BigCal({ bot, label, start, months, load, api, currency, today, onClose }: {
+  bot: string; label?: string; start: string; months: Record<string, Month>; load: (b: string, ym: string) => Promise<void>;
   api: (u: string, i?: RequestInit) => Promise<any>; currency?: string; today: string; onClose: () => void;
 }) {
   const [ym, setYm] = useState(start);
@@ -727,7 +731,7 @@ function BigCal({ bot, start, months, load, api, currency, today, onClose }: {
         <button className="x" onClick={onClose} aria-label="Close">✕</button>
         {!day ? (
           <>
-            <div className="name" style={{ fontSize: 16, marginBottom: 8 }}>{bot} BOT CALENDAR</div>
+            <div className="name" style={{ fontSize: 16, marginBottom: 8 }}>{label ?? `${bot} BOT`} CALENDAR</div>
             <div className="cal-nav">
               <button onClick={() => setYm(shiftMonth(ym, -1))} aria-label="Previous month">‹</button>
               <b>{monthName(ym)}</b>
