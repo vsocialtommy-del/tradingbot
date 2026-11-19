@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 
 import pandas as pd
 import pytest
+from dataclasses import replace
 from pytest_mock import MockerFixture
 
 from bot.data.ohlc_provider import OHLCProvider
@@ -4291,3 +4292,46 @@ class TestCalendarAccount:
         br = DashboardBridge(sb, "M5")
         assert br.sync_trades([{"position_id": 2, "profit": 1.0}], account=5058387501) == 1
         assert sb.upsert_rows.call_args.args[1] == [{"position_id": 2, "profit": 1.0}]
+
+
+class TestLongHistoryFetch:
+    """19 Nov 2026: the M5 bot asks for 100,000 bars; if MT5 refuses
+    (e.g. "Max bars in chart" set lower) it falls back to 5000 and keeps
+    trading instead of stopping."""
+
+    def test_asks_for_the_full_window(self, bot) -> None:
+        b, mgrs = bot
+        b.config = replace(b.config, ohlc_count=100_000)
+        df = make_ohlc(n=30)
+        mgrs["ohlc_provider"].get.return_value = df
+        out = b._get_main_ohlc()
+        assert len(out) == 30
+        mgrs["ohlc_provider"].get.assert_called_once_with(
+            b.config.symbol, b.config.ohlc_timeframe, 100_000,
+        )
+
+    def test_falls_back_when_mt5_refuses(self, bot) -> None:
+        b, mgrs = bot
+        b.config = replace(b.config, ohlc_count=100_000)
+        df = make_ohlc(n=30)
+
+        def get(symbol, tf, count):
+            if count > 5000:
+                raise RuntimeError("copy_rates_from_pos returned no data")
+            return df
+
+        mgrs["ohlc_provider"].get.side_effect = get
+        assert len(b._get_main_ohlc()) == 30
+        # Once fallen back it goes straight to 5000 (no failing call each tick).
+        mgrs["ohlc_provider"].get.reset_mock()
+        assert len(b._get_main_ohlc()) == 30
+        mgrs["ohlc_provider"].get.assert_called_once_with(
+            b.config.symbol, b.config.ohlc_timeframe, 5000,
+        )
+
+    def test_5000_window_failure_still_raises(self, bot) -> None:
+        b, mgrs = bot
+        b.config = replace(b.config, ohlc_count=5000)
+        mgrs["ohlc_provider"].get.side_effect = RuntimeError("no data")
+        with pytest.raises(RuntimeError):
+            b._get_main_ohlc()
