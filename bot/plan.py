@@ -12,8 +12,8 @@ Runs on the M1 bot's account (``--bot m1``). Backtested 28 Jul - 13 Nov
   trade; an M1 trade only when nothing else is open. An M1 zone that
   overlaps a fresh M5 zone is traded as M5. A risk-free runner (TP1 hit,
   stop at breakeven or better) doesn't block anything.
-* **M5 zones: 2-candle minimum vertex** (19 Nov 2026, the 10% dip stays);
-  M1 zones keep 3.
+* Vertex minimum 3 candles on both timeframes (a 2-candle minimum for
+  M5 zones was tried on 19 Nov 2026 and taken back the same evening).
 * **Risk**: £50 a trade on both. A -£200 dead stop for the day with a
   room check: no trade opens if the day's P&L minus that trade's risk
   would go below -£200. No losses-a-day count, no losses-in-a-row stop,
@@ -44,7 +44,7 @@ class PlanConfig:
     """M5 candles scanned for M5 zones (about 17 months)."""
     m5_fallback_count: int = 5000
     m5_pipeline: StrategyPipelineConfig = field(default_factory=lambda: StrategyPipelineConfig(
-        zone_min_size_points=2.0, vertex_require_mw=True, vertex_min_base=2,
+        zone_min_size_points=2.0, vertex_require_mw=True,
     ))
     """Same zone rules as the live M5 bot."""
     m5_entries: XautismEntryConfig = field(default_factory=lambda: XautismEntryConfig(
