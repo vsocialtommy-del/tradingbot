@@ -66,6 +66,9 @@ class VertexConfig:
     leg_min_frac: float = 1.0
     """Leg in and leg out must each move at least this many zone heights
     on the line chart (cuts flat, dead-market 'zones')."""
+    leg_in_min_frac: float | None = None
+    """Leg-in size only (None = ``leg_min_frac``). 0 turns the leg-in size
+    rule off; the spike / V FVG check uses that to find bases of any kind."""
     foot_zigzag_frac: float = 0.0
     """0 = foot is the first line-chart dip before the leg in (current).
     > 0 = 'zigzag' foot: keep walking back past dips whose bounce is
@@ -349,7 +352,8 @@ def _try(direction, s, e, out_start, top, bottom, o, h, l, c,
     else:
         while foot - 1 >= 0 and c[foot - 1] > c[foot]:
             foot -= 1
-    if abs(c[in_e] - c[foot]) < cfg.leg_min_frac * height:
+    leg_in_frac = cfg.leg_min_frac if cfg.leg_in_min_frac is None else cfg.leg_in_min_frac
+    if abs(c[in_e] - c[foot]) < leg_in_frac * height:
         return None
     # Leg out: consecutive same-colour candles from out_start; one closes beyond.
     k = out_start

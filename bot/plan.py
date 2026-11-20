@@ -21,6 +21,11 @@ Runs on the M1 bot's account (``--bot m1``). Backtested 28 Jul - 13 Nov
   room check: no trade opens if the day's P&L minus that trade's risk
   would go below -£200. No losses-a-day count, no losses-in-a-row stop,
   no profit target.
+* **Spike / V FVG** (20 Nov 2026): also trades BOS + FVG setups where
+  the move came from a spike / V (no base): entry at the first touch of
+  the FVG, TP at the BOS line, SL 0.5 past the low (M5) / candle 1 of the
+  FVG (M1). Same £50, runners, slots and risk rules as the zones. See
+  :mod:`bot.strategy.fvg_v`.
 * **Drawdown breaker**: half risk once the balance is £400 below its
   peak, a quarter at £600 below. The peak counts from when the plan
   started on this account (stored in ``logs/plan_state.json``), not the
@@ -38,6 +43,7 @@ from typing import Any
 from loguru import logger
 
 from bot.execution.layer2_stop import XautismEntryConfig
+from bot.strategy.fvg_v import FvgVConfig
 from bot.strategy.pipeline import StrategyPipelineConfig
 
 
@@ -63,6 +69,14 @@ class PlanConfig:
     trade. A second trade only opens if the day's realised P&L, plus every
     open position and waiting order going to its stop, minus the new
     trade's risk, stays inside the dead stop."""
+    fvg_v: bool = True
+    """20 Nov 2026: also trade spike / V BOS + FVG setups on both timeframes
+    (see :mod:`bot.strategy.fvg_v`). Only when the move came from a spike /
+    V, never a base: a W / M is left to the normal zone rules."""
+    fvg_m5: FvgVConfig = field(default_factory=lambda: FvgVConfig(sl_mode="low"))
+    """M5 FVG: SL 0.5 past the low / high of the move, TP the BOS line."""
+    fvg_m1: FvgVConfig = field(default_factory=lambda: FvgVConfig(sl_mode="candle1"))
+    """M1 FVG: SL 0.5 past candle 1 of the FVG, TP the BOS line."""
     drawdown_steps: tuple[tuple[float, float], ...] = ((600.0, 0.25), (400.0, 0.5))
     """(£ below peak, risk multiplier), biggest drawdown first."""
     state_file: str = "logs/plan_state.json"
