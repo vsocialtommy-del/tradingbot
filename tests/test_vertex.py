@@ -15,6 +15,7 @@ def frame(rows: list[tuple[float, float, float, float]]) -> pd.DataFrame:
 
 
 # 29 Oct-style sell: rally in, M-shaped top of 5 candles, big drop out.
+# Real M on the wicks (20 Nov 2026 rule): tops 4025.3 and 4024.5, dip to 4020.0 between.
 FLAT = [(4014.0, 4014.6, 4013.6, 4014.2)] * 6
 M_TOP = FLAT + [
     (4014.2, 4016.8, 4014.0, 4016.6),   # leg in (bull)
@@ -22,7 +23,7 @@ M_TOP = FLAT + [
     (4017.5, 4023.2, 4017.4, 4023.0),   # leg in (bull, big)
     (4023.0, 4025.3, 4020.0, 4020.4),   # vertex
     (4020.4, 4023.0, 4020.0, 4022.3),   # vertex
-    (4022.3, 4022.7, 4019.9, 4020.2),   # vertex
+    (4022.3, 4024.5, 4019.9, 4020.2),   # vertex: second top (wick 4024.5, 0.8 under the first)
     (4020.2, 4021.0, 4018.8, 4019.4),   # vertex
     (4019.4, 4021.1, 4018.0, 4019.45),  # vertex (doji-ish)
     (4019.4, 4019.5, 4015.4, 4015.6),   # leg out (bear) closes below 4018.0
@@ -133,7 +134,8 @@ SPIKE_TOP = FLAT + [
 
 
 def test_spike_found_without_the_mw_rule() -> None:
-    sells = [p for p in detect_vertex_patterns(frame(SPIKE_TOP)) if p.direction == "SELL"]
+    sells = [p for p in detect_vertex_patterns(frame(SPIKE_TOP), VertexConfig(require_mw=False))
+             if p.direction == "SELL"]
     assert len(sells) == 1
 
 
@@ -215,7 +217,7 @@ def test_cache_matches_full_scan_as_the_window_slides(mw: bool) -> None:
         assert _key(got) == _key(detect_vertex_patterns(df, cfg)), end
         checked += 1
     assert checked > 100
-    assert len(got) > 20                  # the chart really has zones in it
+    assert len(got) > (5 if mw else 20)   # the chart really has zones in it
     assert cache.full_scans < checked / 5  # mostly served from the cache
 
 
@@ -251,16 +253,15 @@ TWO_CANDLE_M = [
 ]
 
 
-def test_two_candle_vertex_m_zone() -> None:
-    from dataclasses import replace as _r
+def test_two_candle_vertex_is_not_a_real_m() -> None:
+    # 20 Nov 2026: a real M needs two tops on base candles with a dip
+    # BETWEEN them, so a 2-candle vertex can't be one. Without the M / W
+    # rule the detector still finds it.
     df = frame([(3681.0, 3681.2, 3676.9, 3679.1), (3679.1, 3679.3, 3675.9, 3676.1)] + TWO_CANDLE_M)
-    three = detect_vertex_patterns(df, VertexConfig(require_mw=True))
-    two = detect_vertex_patterns(df, VertexConfig(require_mw=True, min_base=2))
-    sells = [p for p in two if p.direction == "SELL"]
-    assert len(sells) == 1
-    p = sells[0]
-    assert (p.base.candle_count, p.base.bottom, p.base.top) == (2, 3682.1, 3687.3)
-    assert not [q for q in three if q.direction == "SELL" and q.base.bottom > 3680]
+    loose = detect_vertex_patterns(df, VertexConfig(require_mw=False, min_base=2))
+    real = detect_vertex_patterns(df, VertexConfig(require_mw=True, min_base=2))
+    assert [p for p in loose if p.direction == "SELL" and p.base.candle_count == 2]
+    assert not [p for p in real if p.direction == "SELL" and p.base.candle_count == 2]
 
 
 def test_two_candle_spike_still_rejected() -> None:
@@ -270,3 +271,80 @@ def test_two_candle_spike_still_rejected() -> None:
     df = frame([(3681.0, 3681.2, 3676.9, 3679.1), (3679.1, 3679.3, 3675.9, 3676.1)] + rows)
     two = detect_vertex_patterns(df, VertexConfig(require_mw=True, min_base=2))
     assert not [p for p in two if p.direction == "SELL" and p.base.candle_count == 2]
+
+
+# --------------------------------------------------------------------------- #
+# 20 Nov 2026: Tommy's real W / M rule, on the wicks, for every bot and
+# timeframe. Buys shown (W); sells are the mirror (M).
+# --------------------------------------------------------------------------- #
+
+from bot.strategy.vertex import is_real_mw
+
+
+def _hl(rows):
+    """rows of (high, low) -> arrays; index 0 = candle before the base."""
+    import numpy as _np
+    return _np.array([r[0] for r in rows], float), _np.array([r[1] for r in rows], float)
+
+
+def _w(second_low: float):
+    # candle before the base (end of the drop in), 5 base candles, first leg-out candle.
+    return _hl([(24.0, 16.0),                       # end of the drop in
+                (17.0, 13.0),                       # bottom 1 (wick 13.0)
+                (19.0, 13.5), (19.5, 16.5),         # middle top 19.5
+                (17.5, second_low),                 # bottom 2
+                (18.0, 13.6) if second_low < 13.6 else (18.0, second_low + 0.4),
+                (26.0, 17.0)])                      # leg out
+
+
+@pytest.mark.parametrize("second_low,ok", [
+    (13.2, True),    # A: level
+    (14.6, True),    # B: about 25% of the zone higher
+    (16.2, True),    # C: about half the zone higher
+    (18.4, False),   # D: most of the zone away
+])
+def test_bottoms_at_most_half_the_zone_apart(second_low: float, ok: bool) -> None:
+    h, l = _w(second_low)
+    lo, hi = float(l[1:6].min()), float(h[1:6].max())
+    assert is_real_mw(h, l, 1, 5, lo, hi, sell=False) is ok
+
+
+def test_end_of_the_drop_in_is_not_a_bottom() -> None:
+    # 20 Nov 2026 loser (BUY 3566.73-3576.78): drop in ends, chop, ONE lower
+    # low, rally. The old close check called it a W; the real rule doesn't.
+    h, l = _hl([(3581.5, 3572.0),                   # end of the drop in
+                (3575.0, 3572.6), (3575.6, 3572.9), (3576.8, 3573.0),
+                (3575.0, 3569.0), (3570.5, 3566.7), (3576.0, 3568.4),
+                (3575.5, 3572.0),                   # small bounce down, higher low
+                (3577.5, 3572.5)])                  # leg out
+    assert not is_real_mw(h, l, 1, 7, 3566.7, 3576.8, sell=False)
+
+
+def test_lower_low_between_the_bottoms_kills_the_w() -> None:
+    h, l = _hl([(24.0, 16.0), (17.0, 13.0), (19.0, 14.0), (16.0, 6.0),
+                (19.5, 14.0), (17.5, 13.2), (26.0, 17.0)])
+    # 13.0 and 13.2 are level, but 6.0 between them is lower (and more than
+    # half the zone below either): a V, not a W
+    assert not is_real_mw(h, l, 1, 5, 6.0, 19.5, sell=False)
+
+
+def test_tiny_middle_top_is_not_a_w() -> None:
+    h, l = _hl([(24.0, 16.0), (14.0, 13.0), (13.3, 13.1), (14.0, 13.05), (20.0, 14.0)])
+    assert not is_real_mw(h, l, 1, 3, 13.0, 20.0, sell=False)   # 0.25 pt pullback on a 7 pt zone
+
+
+def test_real_m_mirror_for_sells() -> None:
+    h, l = _w(13.2)
+    mh, ml = 100.0 - l, 100.0 - h          # flip the W into an M
+    lo, hi = float(ml[1:6].min()), float(mh[1:6].max())
+    assert is_real_mw(mh, ml, 1, 5, lo, hi, sell=True)
+    h, l = _w(18.4)
+    mh, ml = 100.0 - l, 100.0 - h
+    lo, hi = float(ml[1:6].min()), float(mh[1:6].max())
+    assert not is_real_mw(mh, ml, 1, 5, lo, hi, sell=True)
+
+
+def test_real_mw_is_the_default_everywhere() -> None:
+    assert VertexConfig().require_mw is True
+    cfg = StrategyPipelineConfig()
+    assert cfg.vertex_require_mw is True and cfg.vertex_mw_max_apart == 0.5

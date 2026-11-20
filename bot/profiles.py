@@ -175,8 +175,11 @@ def build_profile(name: str, risk: str | None = None, max_losses=None, *, plan: 
             ohlc_count=100_000,
             # 17 Nov 2026: tight 2-3 pt zones allowed (min 2 pts, was 3).
             # 22-month backtest: +£7,214 vs +£6,915, drawdown -£1,295 vs -£1,551.
-            # 18 Nov 2026: M / W zones only, no single spikes (pullback at least
-            # 10% of the zone). Tommy's rule: a spike is not a zone.
+            # 18 Nov 2026: M / W zones only, no single spikes. Tommy's rule: a
+            # spike is not a zone. 20 Nov 2026: the REAL M / W rule on the
+            # wicks (two bottoms / tops on base candles, at most half the zone
+            # apart, nothing lower / higher between, 10% middle top / dip) is
+            # the standard for every bot and timeframe (pipeline default).
             # 19 Nov 2026: tried a 2-candle vertex (PR #116); back to 3 the same
             # evening (3-month backtest: 3 candles +£3,643 vs 2 candles +£2,850).
         ), replace(pipeline, zone_min_size_points=2.0, vertex_require_mw=True)
@@ -218,9 +221,10 @@ def build_profile(name: str, risk: str | None = None, max_losses=None, *, plan: 
         )
         # 12 Nov 2026: BOS must close beyond the swing's wick (M1 only;
         # 3-month backtest: +£11,085 vs +£10,118, drawdown -£1,547 vs -£2,053).
-        # 18 Nov 2026: M / W zones only, no single spikes (same rule as the M5
-        # bot, pullback at least 10% of the zone). 3-month M1 backtest: TP rate
-        # 68.9% vs 67.0%, 707 trades vs 870.
+        # 18 Nov 2026: M / W zones only, no single spikes. 20 Nov 2026: the
+        # real M / W rule on the wicks, same as every bot and timeframe (the
+        # 18 Nov 3-month M1 test of the old close check: TP rate 68.9% vs
+        # 67.0%, 707 trades vs 870; the wick rule isn't M1-tested yet).
         m1_pipeline = replace(pipeline, zone_min_size_points=1.0, bos_close_beyond_wick=True,
                               vertex_require_mw=True)
         if plan:

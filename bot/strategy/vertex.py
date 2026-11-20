@@ -25,12 +25,22 @@ Supply (RBD), mirrored for demand (DBR):
   (``leg_min_frac``). The foot is the BOS level and the TP.
 * When several vertex lengths fit, the shortest one (latest start) is
   used: the candles after the last leg-in candle.
-* **M / W only** (``require_mw``, on for both bots from 18 Nov 2026):
-  on the line chart (closes, from 2 candles before the vertex to the
-  first leg-out candle) price must make two tops (sell) / two lows (buy)
-  inside the zone, with a pullback between them that is also inside the
-  zone and at least ``mw_min_pull`` (10 %) of the zone height deep. A
-  single spike (one top, price straight in and out) is not a zone.
+* **Real M / W only** (``require_mw``; Tommy's standard zone rule for
+  every bot and every timeframe from 20 Nov 2026), on the WICKS:
+
+  - two bottoms (W, buys) / two tops (M, sells) that are wick turning
+    points on BASE candles (the end of the leg in never counts);
+  - no more than ``mw_max_apart`` (50 %) of the zone height apart
+    (level, a bit lower or half the zone lower is fine; 80 % isn't);
+  - nothing between them goes lower (W) / higher (M) than them;
+  - a middle top (W) / dip (M) between them at least ``mw_min_pull``
+    (10 %) of the zone height.
+
+  A single spike, or a drop with one lower low (a V), is not a zone.
+  12-month M5 backtest (Nov 2025 - Nov 2026, £100): 227 trades, +£1,407,
+  max drawdown -£660 vs the old close-based check 538 trades, +£2,174,
+  -£949 (£6.20 a trade vs £4.04). The old check (``is_mw_shape``,
+  closes from 2 candles before the base) is kept for reference only.
 
 The resulting :class:`Pattern` goes through the normal pipeline (size
 filter, body-break, BOS, fresh-since-BOS) exactly like classic patterns.
@@ -64,11 +74,15 @@ class VertexConfig:
     """The leg out must close beyond the zone by at least this fraction
     of the zone height. Stops a small dip just under the vertex low from
     counting as the exit (that would cut the vertex short)."""
-    require_mw: bool = False
-    """Keep only clear M (sell) / W (buy) zones; drop single spikes."""
+    require_mw: bool = True
+    """Keep only real M (sell) / W (buy) zones (see :func:`is_real_mw`).
+    Tommy's standard for every bot and timeframe (20 Nov 2026)."""
     mw_min_pull: float = 0.10
-    """The pullback between the two tops / lows must be at least this
-    fraction of the zone height (a tiny wiggle doesn't make an M)."""
+    """The middle top / dip between the two bottoms / tops must be at least
+    this fraction of the zone height (a tiny wiggle doesn't make a W)."""
+    mw_max_apart: float = 0.5
+    """The two bottoms / tops may be at most this fraction of the zone
+    height apart (Tommy's A / B / C, 20 Nov 2026)."""
 
 
 def detect_vertex_patterns(df: pd.DataFrame, config: VertexConfig | None = None) -> list[Pattern]:
@@ -120,10 +134,11 @@ def _raw_patterns(df: pd.DataFrame, cfg: VertexConfig, first_out: int = 0) -> li
 def _finish(found: list[Pattern], df: pd.DataFrame, cfg: VertexConfig) -> list[Pattern]:
     out = _dedupe(found)
     if cfg.require_mw:
-        c = df["close"].to_numpy(float)
-        out = [p for p in out if is_mw_shape(
-            c, p.base.start_index, p.base.end_index, p.base.bottom, p.base.top,
-            p.direction == "SELL", cfg.mw_min_pull)]
+        h = df["high"].to_numpy(float)
+        l = df["low"].to_numpy(float)
+        out = [p for p in out if is_real_mw(
+            h, l, p.base.start_index, p.base.end_index, p.base.bottom, p.base.top,
+            p.direction == "SELL", min_pull=cfg.mw_min_pull, max_apart=cfg.mw_max_apart)]
     return out
 
 
@@ -212,6 +227,55 @@ class VertexPatternCache:
         recent = [_shift_pattern(p, -start)
                   for p in _raw_patterns(df.iloc[start:], self.cfg, first_out=self.context)]
         return _finish(head + frozen + recent, df, self.cfg)
+
+
+def is_real_mw(h, l, s: int, e: int, bottom: float, top: float, sell: bool, *,
+               min_pull: float = 0.10, max_apart: float = 0.5) -> bool:
+    """True when the base candles ``s``..``e`` make a real W (buy) / M (sell)
+    on the wicks (Tommy, 20 Nov 2026):
+
+    * two bottoms (W) / tops (M): lows / highs of base candles that are
+      turning points (lower / higher than the candles either side; the
+      candle before the base and the one after it count as neighbours,
+      so the end of the leg in can never be one of them);
+    * at most ``max_apart`` of the zone height apart;
+    * nothing between them lower (W) / higher (M) than them;
+    * a middle top (W) / dip (M) between them at least ``min_pull`` of the
+      zone height above the higher bottom / below the lower top.
+    """
+    height = top - bottom
+    n = len(h)
+    if height <= 0 or s < 1 or e + 1 >= n:
+        return False
+    v = np.asarray(h if sell else -np.asarray(l, dtype=float), dtype=float)
+    hh = np.asarray(h, dtype=float)
+    ll = np.asarray(l, dtype=float)
+    ext: list[int] = []
+    for i in range(s, e + 1):
+        a = i - 1
+        while a > s - 1 and v[a] == v[i]:
+            a -= 1
+        b = i + 1
+        while b < e + 1 and v[b] == v[i]:
+            b += 1
+        if v[i] > v[a] and v[i] > v[b]:
+            ext.append(i)
+    for x in range(len(ext)):
+        for y in range(x + 1, len(ext)):
+            i, j = ext[x], ext[y]
+            if j - i < 2:
+                continue
+            if abs(v[i] - v[j]) > max_apart * height + 1e-9:
+                continue
+            if v[i + 1:j].max() > max(v[i], v[j]) + 1e-9:
+                continue
+            if sell:
+                pull = min(hh[i], hh[j]) - ll[i + 1:j].min()
+            else:
+                pull = hh[i + 1:j].max() - max(ll[i], ll[j])
+            if pull >= min_pull * height - 1e-9:
+                return True
+    return False
 
 
 def is_mw_shape(c, s: int, e: int, bottom: float, top: float, sell: bool,
