@@ -15,17 +15,17 @@ def frame(rows: list[tuple[float, float, float, float]]) -> pd.DataFrame:
 
 
 # 29 Oct-style sell: rally in, M-shaped top of 5 candles, big drop out.
-# Real M on the wicks (20 Nov 2026 rule): tops 4025.3 and 4024.5, dip to 4020.0 between.
+# Real M on the line chart (20 Nov 2026 rule): top closes 4022.6 and 4022.45, dip close 4020.0.
 FLAT = [(4014.0, 4014.6, 4013.6, 4014.2)] * 6
 M_TOP = FLAT + [
     (4014.2, 4016.8, 4014.0, 4016.6),   # leg in (bull)
     (4016.6, 4018.6, 4014.8, 4018.4),   # leg in (bull)
     (4017.5, 4023.2, 4017.4, 4023.0),   # leg in (bull, big)
     (4023.0, 4025.3, 4020.0, 4020.4),   # vertex
-    (4020.4, 4023.0, 4020.0, 4022.3),   # vertex
-    (4022.3, 4024.5, 4019.9, 4020.2),   # vertex: second top (wick 4024.5, 0.8 under the first)
-    (4020.2, 4021.0, 4018.8, 4019.4),   # vertex
-    (4019.4, 4021.1, 4018.0, 4019.45),  # vertex (doji-ish)
+    (4020.4, 4023.0, 4020.0, 4022.6),   # vertex: top 1 on the line chart (close 4022.6)
+    (4022.6, 4024.5, 4019.9, 4020.0),   # vertex: the dip between (close 4020.0)
+    (4020.0, 4022.8, 4018.8, 4022.4),   # vertex
+    (4022.4, 4022.5, 4018.0, 4022.45),  # vertex: top 2 on the line chart (close 4022.45)
     (4019.4, 4019.5, 4015.4, 4015.6),   # leg out (bear) closes below 4018.0
     (4015.6, 4016.2, 4011.0, 4011.5),   # leg out continues: a full zone height below
 ]
@@ -79,8 +79,11 @@ def test_foot_is_the_bos_level_and_tp() -> None:
 
 
 def test_small_leg_out_rejected() -> None:
-    rows = M_TOP[:-1] + [(4015.6, 4016.0, 4014.0, 4014.2)]  # only 5.25 below the vertex close
-    assert [p for p in detect_vertex_patterns(frame(rows)) if p.direction == "SELL"] == []
+    # (leg-out size rule only, so the M / W rule is off here)
+    rows = M_TOP[:-3] + [(4019.4, 4022.5, 4018.0, 4019.45),   # last vertex close 4019.45 (doji)
+                         M_TOP[-2], (4015.6, 4016.0, 4014.0, 4014.2)]  # only 5.25 below it
+    cfg = VertexConfig(require_mw=False)
+    assert [p for p in detect_vertex_patterns(frame(rows), cfg) if p.direction == "SELL"] == []
 
 
 def test_vertex_is_the_default_detector() -> None:
@@ -106,8 +109,9 @@ def test_zigzag_foot_skips_small_pullback() -> None:
         (4101.4, 4101.6, 4097.0, 4097.5),
     ]
     df = frame(rows)
-    near = [p for p in detect_vertex_patterns(df) if p.direction == "SELL"]
-    far = [p for p in detect_vertex_patterns(df, VertexConfig(foot_zigzag_frac=0.5)) if p.direction == "SELL"]
+    near = [p for p in detect_vertex_patterns(df, VertexConfig(require_mw=False)) if p.direction == "SELL"]
+    far = [p for p in detect_vertex_patterns(df, VertexConfig(foot_zigzag_frac=0.5, require_mw=False))
+           if p.direction == "SELL"]
     assert near and far
     assert df["close"].iloc[near[0].foot_index] == pytest.approx(4101.9)
     assert df["close"].iloc[far[0].foot_index] == pytest.approx(4092.6)
@@ -274,74 +278,60 @@ def test_two_candle_spike_still_rejected() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 20 Nov 2026: Tommy's real W / M rule, on the wicks, for every bot and
-# timeframe. Buys shown (W); sells are the mirror (M).
+# 20 Nov 2026: Tommy's real W / M rule for every bot and timeframe. The W / M
+# must show on the LINE CHART (closes); the box is wick to wick. Buys shown
+# (W); sells are the mirror (M). Closes: index 0 = the candle before the base
+# (end of the drop in), then the base candles, then the first leg-out candle.
 # --------------------------------------------------------------------------- #
+
+import numpy as _npv
 
 from bot.strategy.vertex import is_real_mw
 
 
-def _hl(rows):
-    """rows of (high, low) -> arrays; index 0 = candle before the base."""
-    import numpy as _np
-    return _np.array([r[0] for r in rows], float), _np.array([r[1] for r in rows], float)
+def _w(b1: float, b2: float = 13.0):
+    return _npv.array([20.0, b1, 19.0, 17.5, b2, 18.0, 26.0])   # box 12.0 - 20.0 (8 pts)
 
 
-def _w(second_low: float):
-    # candle before the base (end of the drop in), 5 base candles, first leg-out candle.
-    return _hl([(24.0, 16.0),                       # end of the drop in
-                (17.0, 13.0),                       # bottom 1 (wick 13.0)
-                (19.0, 13.5), (19.5, 16.5),         # middle top 19.5
-                (17.5, second_low),                 # bottom 2
-                (18.0, 13.6) if second_low < 13.6 else (18.0, second_low + 0.4),
-                (26.0, 17.0)])                      # leg out
-
-
-@pytest.mark.parametrize("second_low,ok", [
+@pytest.mark.parametrize("b1,ok", [
     (13.2, True),    # A: level
-    (14.6, True),    # B: about 25% of the zone higher
-    (16.2, True),    # C: about half the zone higher
-    (18.4, False),   # D: most of the zone away
+    (15.0, True),    # B: about 25% of the zone apart
+    (16.6, True),    # C: under half the zone apart
+    (18.0, False),   # D: most of the zone apart
 ])
-def test_bottoms_at_most_half_the_zone_apart(second_low: float, ok: bool) -> None:
-    h, l = _w(second_low)
-    lo, hi = float(l[1:6].min()), float(h[1:6].max())
-    assert is_real_mw(h, l, 1, 5, lo, hi, sell=False) is ok
+def test_bottoms_at_most_half_the_zone_apart(b1: float, ok: bool) -> None:
+    assert is_real_mw(_w(b1), 1, 5, 12.0, 20.0, sell=False) is ok
+
+
+def test_w_only_in_the_wicks_is_not_a_w() -> None:
+    # 20 Nov 2026 18:47-18:50 UK, M1 BUY 3502.81-3507.27: the wicks made a little
+    # W at the bottom, but the line chart is a straight V (one bottom close).
+    c = _npv.array([3510.0, 3507.5, 3505.0, 3504.0, 3505.5, 3509.0, 3514.0])
+    assert not is_real_mw(c, 1, 5, 3502.81, 3507.27, sell=False)
 
 
 def test_end_of_the_drop_in_is_not_a_bottom() -> None:
-    # 20 Nov 2026 loser (BUY 3566.73-3576.78): drop in ends, chop, ONE lower
-    # low, rally. The old close check called it a W; the real rule doesn't.
-    h, l = _hl([(3581.5, 3572.0),                   # end of the drop in
-                (3575.0, 3572.6), (3575.6, 3572.9), (3576.8, 3573.0),
-                (3575.0, 3569.0), (3570.5, 3566.7), (3576.0, 3568.4),
-                (3575.5, 3572.0),                   # small bounce down, higher low
-                (3577.5, 3572.5)])                  # leg out
-    assert not is_real_mw(h, l, 1, 7, 3566.7, 3576.8, sell=False)
+    # 20 Nov 2026 loser (BUY 3566.73-3576.78): the drop in ends at 3572.7, chop,
+    # then ONE lower low and the rally. Not a W.
+    c = _npv.array([3572.7, 3574.4, 3573.8, 3575.5, 3573.3, 3569.0, 3568.6, 3575.0, 3577.5])
+    assert not is_real_mw(c, 1, 7, 3566.73, 3576.78, sell=False)
 
 
 def test_lower_low_between_the_bottoms_kills_the_w() -> None:
-    h, l = _hl([(24.0, 16.0), (17.0, 13.0), (19.0, 14.0), (16.0, 6.0),
-                (19.5, 14.0), (17.5, 13.2), (26.0, 17.0)])
-    # 13.0 and 13.2 are level, but 6.0 between them is lower (and more than
-    # half the zone below either): a V, not a W
-    assert not is_real_mw(h, l, 1, 5, 6.0, 19.5, sell=False)
+    # 16.0 and 16.2 are level, but 6.0 closes between them (a V), and 6.0 is
+    # more than half the zone away from either: no W.
+    c = _npv.array([21.0, 16.0, 19.0, 6.0, 19.5, 16.2, 26.0])
+    assert not is_real_mw(c, 1, 5, 5.5, 20.0, sell=False)
 
 
 def test_tiny_middle_top_is_not_a_w() -> None:
-    h, l = _hl([(24.0, 16.0), (14.0, 13.0), (13.3, 13.1), (14.0, 13.05), (20.0, 14.0)])
-    assert not is_real_mw(h, l, 1, 3, 13.0, 20.0, sell=False)   # 0.25 pt pullback on a 7 pt zone
+    c = _npv.array([16.0, 13.0, 13.2, 13.05, 20.0])
+    assert not is_real_mw(c, 1, 3, 12.5, 19.5, sell=False)   # 0.15 pt on a 7 pt zone
 
 
 def test_real_m_mirror_for_sells() -> None:
-    h, l = _w(13.2)
-    mh, ml = 100.0 - l, 100.0 - h          # flip the W into an M
-    lo, hi = float(ml[1:6].min()), float(mh[1:6].max())
-    assert is_real_mw(mh, ml, 1, 5, lo, hi, sell=True)
-    h, l = _w(18.4)
-    mh, ml = 100.0 - l, 100.0 - h
-    lo, hi = float(ml[1:6].min()), float(mh[1:6].max())
-    assert not is_real_mw(mh, ml, 1, 5, lo, hi, sell=True)
+    assert is_real_mw(100.0 - _w(13.2), 1, 5, 80.0, 88.0, sell=True)
+    assert not is_real_mw(100.0 - _w(18.0), 1, 5, 80.0, 88.0, sell=True)
 
 
 def test_real_mw_is_the_default_everywhere() -> None:

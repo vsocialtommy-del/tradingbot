@@ -1,7 +1,7 @@
 """Claude's plan (19 Nov 2026): one bot trading M5 AND M1 zones.
 
-Real M / W zones (20 Nov 2026): both timeframes use Tommy's wick-based
-M / W rule (see :func:`bot.strategy.vertex.is_real_mw`).
+Real M / W zones (20 Nov 2026): both timeframes use Tommy's M / W rule,
+the W / M on the line chart (see :func:`bot.strategy.vertex.is_real_mw`).
 
 Runs on the M1 bot's account (``--bot m1``). Backtested 28 Jul - 13 Nov
 2026 (3 months) as the merged bot.

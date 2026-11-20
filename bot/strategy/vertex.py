@@ -26,21 +26,23 @@ Supply (RBD), mirrored for demand (DBR):
 * When several vertex lengths fit, the shortest one (latest start) is
   used: the candles after the last leg-in candle.
 * **Real M / W only** (``require_mw``; Tommy's standard zone rule for
-  every bot and every timeframe from 20 Nov 2026), on the WICKS:
+  every bot and every timeframe from 20 Nov 2026). The W / M must show
+  on the LINE CHART (closes), like Tommy finds his zones; the box is
+  still marked on the candles, tallest wick to lowest wick:
 
-  - two bottoms (W, buys) / two tops (M, sells) that are wick turning
-    points on BASE candles (the end of the leg in never counts);
+  - two bottoms (W, buys) / two tops (M, sells) that are line-chart
+    turning points on BASE candle closes (the end of the leg in never
+    counts);
   - no more than ``mw_max_apart`` (50 %) of the zone height apart
     (level, a bit lower or half the zone lower is fine; 80 % isn't);
-  - nothing between them goes lower (W) / higher (M) than them;
-  - a middle top (W) / dip (M) between them at least ``mw_min_pull``
-    (10 %) of the zone height.
+  - nothing between them closes lower (W) / higher (M) than them;
+  - a middle top (W) / dip (M) close between them at least
+    ``mw_min_pull`` (10 %) of the zone height.
 
-  A single spike, or a drop with one lower low (a V), is not a zone.
-  12-month M5 backtest (Nov 2025 - Nov 2026, £100): 227 trades, +£1,407,
-  max drawdown -£660 vs the old close-based check 538 trades, +£2,174,
-  -£949 (£6.20 a trade vs £4.04). The old check (``is_mw_shape``,
-  closes from 2 candles before the base) is kept for reference only.
+  A single spike, a V (even with a little W only in the wicks), or a
+  drop with one lower low is not a zone. (20 Nov 2026: first built on
+  the wicks; changed the same day to the line chart after a 1-minute V
+  with a W only in its wicks was taken as a zone.)
 
 The resulting :class:`Pattern` goes through the normal pipeline (size
 filter, body-break, BOS, fresh-since-BOS) exactly like classic patterns.
@@ -134,10 +136,9 @@ def _raw_patterns(df: pd.DataFrame, cfg: VertexConfig, first_out: int = 0) -> li
 def _finish(found: list[Pattern], df: pd.DataFrame, cfg: VertexConfig) -> list[Pattern]:
     out = _dedupe(found)
     if cfg.require_mw:
-        h = df["high"].to_numpy(float)
-        l = df["low"].to_numpy(float)
+        c = df["close"].to_numpy(float)
         out = [p for p in out if is_real_mw(
-            h, l, p.base.start_index, p.base.end_index, p.base.bottom, p.base.top,
+            c, p.base.start_index, p.base.end_index, p.base.bottom, p.base.top,
             p.direction == "SELL", min_pull=cfg.mw_min_pull, max_apart=cfg.mw_max_apart)]
     return out
 
@@ -229,27 +230,29 @@ class VertexPatternCache:
         return _finish(head + frozen + recent, df, self.cfg)
 
 
-def is_real_mw(h, l, s: int, e: int, bottom: float, top: float, sell: bool, *,
+def is_real_mw(c, s: int, e: int, bottom: float, top: float, sell: bool, *,
                min_pull: float = 0.10, max_apart: float = 0.5) -> bool:
     """True when the base candles ``s``..``e`` make a real W (buy) / M (sell)
-    on the wicks (Tommy, 20 Nov 2026):
+    on the LINE CHART (closes) (Tommy, 20 Nov 2026):
 
-    * two bottoms (W) / tops (M): lows / highs of base candles that are
-      turning points (lower / higher than the candles either side; the
+    * two bottoms (W) / tops (M): closes of base candles that are line-chart
+      turning points (lower / higher than the closes either side; the
       candle before the base and the one after it count as neighbours,
       so the end of the leg in can never be one of them);
     * at most ``max_apart`` of the zone height apart;
-    * nothing between them lower (W) / higher (M) than them;
-    * a middle top (W) / dip (M) between them at least ``min_pull`` of the
-      zone height above the higher bottom / below the lower top.
+    * nothing between them closes lower (W) / higher (M) than them;
+    * a middle top (W) / dip (M) close between them at least ``min_pull``
+      of the zone height above the higher bottom / below the lower top.
+
+    ``bottom`` / ``top`` are the zone's wick-to-wick box (only its height
+    is used here).
     """
     height = top - bottom
-    n = len(h)
+    n = len(c)
     if height <= 0 or s < 1 or e + 1 >= n:
         return False
-    v = np.asarray(h if sell else -np.asarray(l, dtype=float), dtype=float)
-    hh = np.asarray(h, dtype=float)
-    ll = np.asarray(l, dtype=float)
+    cc = np.asarray(c, dtype=float)
+    v = cc if sell else -cc
     ext: list[int] = []
     for i in range(s, e + 1):
         a = i - 1
@@ -269,10 +272,7 @@ def is_real_mw(h, l, s: int, e: int, bottom: float, top: float, sell: bool, *,
                 continue
             if v[i + 1:j].max() > max(v[i], v[j]) + 1e-9:
                 continue
-            if sell:
-                pull = min(hh[i], hh[j]) - ll[i + 1:j].min()
-            else:
-                pull = hh[i + 1:j].max() - max(ll[i], ll[j])
+            pull = min(v[i], v[j]) - v[i + 1:j].min()
             if pull >= min_pull * height - 1e-9:
                 return True
     return False

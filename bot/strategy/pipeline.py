@@ -132,7 +132,7 @@ class StrategyPipelineConfig:
     height when finding the BOS / TP level (Nov 2026 backtest: +£1,788 vs
     +£1,148 with the first-dip foot). 0 = old first-dip foot."""
     vertex_require_mw: bool = True
-    """Only real M / W zones on the wicks (see :func:`bot.strategy.vertex.is_real_mw`).
+    """Only real M / W zones: the W / M on the line chart (closes), box wick to wick (see :func:`bot.strategy.vertex.is_real_mw`).
     Tommy's standard zone rule for every bot and timeframe (20 Nov 2026)."""
     vertex_mw_min_pull: float = 0.10
     """M / W middle top / dip must be at least this share of the zone height."""
