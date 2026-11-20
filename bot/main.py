@@ -153,6 +153,7 @@ from bot.strategy.pipeline import (
 from bot.strategy.vertex import VertexPatternCache
 from bot.strategy.tp_target import find_nearest_local_peak
 from bot.strategy.zone_marking import Zone as _ZoneShape
+from bot.strategy.fvg_v import FvgSetup, scan as fvg_scan
 from bot.strategy.zone_refinement import RefinedZone as _RefinedZone
 from bot.strategy.zone_visibility import count_bodies_through_zone
 from bot.visualization.zone_snapshot import ZoneSnapshotWriter
@@ -439,6 +440,9 @@ class Bot:
         self._plan_m5_df: pd.DataFrame | None = None
         self._plan_m5_pending: list[tuple[ValidatedZone, UUID]] = []
         self._plan_m5_cache: VertexPatternCache | None = None
+        # Spike / V FVG (20 Nov 2026): the levels of the FVG zones found on
+        # the last scan, per timeframe, by zone key.
+        self._fvg_levels: dict[str, dict[tuple, TradeLevels]] = {"M1": {}, "M5": {}}
         self._plan_breaker: DrawdownBreaker | None = None
         if self.config.plan is not None:
             self._plan_breaker = DrawdownBreaker(
@@ -1302,6 +1306,8 @@ class Bot:
             new_pipeline_pending.append((zone, zid))
 
         if self.config.plan is not None:
+            # Spike / V FVG setups on M1 (20 Nov 2026), alongside the M / W zones.
+            new_pipeline_pending += self._fvg_candidates(df, "M1")
             # Claude's plan: M5 zones first (the backtest checked M5 then M1).
             m5_cands = self._plan_m5_candidates()
             if self.config.plan.m5_priority:
@@ -1386,9 +1392,58 @@ class Bot:
                         continue
                     self._zone_tf[zid] = "M5"
                     pending.append((z, zid))
+                # Spike / V FVG setups on M5 (20 Nov 2026).
+                pending += self._fvg_candidates(df5, "M5")
                 self._plan_m5_pending = pending
                 self._plan_m5_df = df5
         return [(z, zid) for z, zid in self._plan_m5_pending if zid not in self._traded_zone_ids]
+
+    def _fvg_candidates(self, df: pd.DataFrame, tf: str) -> list[tuple[ValidatedZone, UUID]]:
+        """Claude FTMO, spike / V BOS + FVG setups (20 Nov 2026, see
+        :mod:`bot.strategy.fvg_v`) that are live now on ``tf`` ("M1" or
+        "M5"). ``df``'s last row is the candle still forming. Each FVG is
+        saved as a zone (tagged ``kind: FVG``) and its entry / SL / TP
+        remembered for placement."""
+        plan = self.config.plan
+        if plan is None or not plan.fvg_v or df is None or len(df) < 2:
+            return []
+        if tf == "M5":
+            fcfg, pcfg, tag = plan.fvg_m5, plan.m5_pipeline, "M5"
+        else:
+            fcfg, pcfg, tag = plan.fvg_m1, self.strategy_pipeline_config, None
+        try:
+            setups = fvg_scan(df, fcfg, vertex_config(pcfg))
+        except Exception:
+            logger.exception(f"fvg: {tf} scan raised; no FVG setups this candle")
+            return []
+        levels: dict[tuple, TradeLevels] = {}
+        out: list[tuple[ValidatedZone, UUID]] = []
+        for s in setups:
+            z = _fvg_zone_as_validated(s)
+            levels[_zone_key_from_validated(z)] = TradeLevels(
+                entry=s.entry, sl=s.sl, tp1=s.tp, sl_method="FVG",
+            )
+            zid = self._persist_zone_if_new(z, timeframe=tag, kind="FVG")
+            if zid is None or zid in self._traded_zone_ids:
+                continue
+            if tag == "M5":
+                self._zone_tf[zid] = "M5"
+            out.append((z, zid))
+        self._fvg_levels[tf] = levels
+        if out:
+            logger.debug(
+                f"fvg: {len(out)} {tf} spike / V FVG setup(s) waiting: "
+                + ", ".join(f"{z.direction} {z.bottom:.2f}-{z.top:.2f}" for z, _ in out)
+            )
+        return out
+
+    def _fvg_levels_for(self, zone: Any) -> TradeLevels | None:
+        """Entry / SL / TP of a spike / V FVG zone, or None for a normal zone."""
+        key = _zone_key_from_validated(zone)
+        for lv in self._fvg_levels.values():
+            if key in lv:
+                return lv[key]
+        return None
 
     def _plan_room_ok(self) -> bool:
         """Claude's plan, a second trade beside an open one: the day's
@@ -1926,6 +1981,7 @@ class Bot:
 
     def _persist_zone_if_new(
         self, zone: ValidatedZone, *, timeframe: str | None = None,
+        kind: str | None = None,
     ) -> UUID | None:
         """Insert the zone row (status=CONFIRMED) if not already cached.
 
@@ -1938,7 +1994,7 @@ class Bot:
         if cached is not None:
             return cached
         try:
-            zone_row = self.supabase.log_zone(_zone_to_input(zone, timeframe=timeframe))
+            zone_row = self.supabase.log_zone(_zone_to_input(zone, timeframe=timeframe, kind=kind))
             zone_id = UUID(str(zone_row["id"]))
         except Exception:
             logger.exception(
@@ -2190,8 +2246,10 @@ class Bot:
                 f"{zone.bottom:.2f}-{zone.top:.2f} already traded"
             )
             return False
+        fvg_levels = self._fvg_levels_for(zone)
         if (
             not is_flipped_retrade
+            and fvg_levels is None
             and self.config.enable_old_zone_dedup
             and self._zone_already_used(zone, candidate_zone_id=zone_id)
         ):
@@ -2315,8 +2373,13 @@ class Bot:
         # edge, pushed beyond a swing that sits just past it; TP1 at the
         # zone's first BOS less a spread buffer.
         levels: TradeLevels | None = None
-        if self.config.levels.enabled:
+        if fvg_levels is not None:
+            # Spike / V FVG: entry at the FVG edge, SL past the low / candle
+            # 1, TP at the BOS line (worked out when the FVG was found).
+            levels = fvg_levels
+        elif self.config.levels.enabled:
             levels = compute_levels(zone, ohlc_df, self.config.levels)
+        if levels is not None:
             sl_price = levels.sl
             entry_price = levels.entry
             logger.info(
@@ -2691,7 +2754,7 @@ class Bot:
             sl = tp1 = None
             if zdf is not None and len(zdf):
                 try:
-                    lv = compute_levels(zone, zdf, self.config.levels)
+                    lv = self._fvg_levels_for(zone) or compute_levels(zone, zdf, self.config.levels)
                     entry, sl, tp1 = lv.entry, lv.sl, lv.tp1
                 except Exception:
                     pass
@@ -3123,7 +3186,9 @@ def _zone_key_from_row(
     )
 
 
-def _zone_to_input(zone: ValidatedZone, *, timeframe: str | None = None) -> ZoneInput:
+def _zone_to_input(
+    zone: ValidatedZone, *, timeframe: str | None = None, kind: str | None = None,
+) -> ZoneInput:
     """Project an in-memory zone into the ``zones`` table insert payload.
 
     v1 only handles Strong Point setups → ``zone_type=STRONG_POINT``.
@@ -3144,7 +3209,10 @@ def _zone_to_input(zone: ValidatedZone, *, timeframe: str | None = None) -> Zone
         formed_at=zone.formed_at.to_pydatetime(),
         # Claude's plan: M5 zones on the M1 bot's account are tagged so the
         # lifecycle and the runner know their timeframe.
-        last_evaluation_result={"timeframe": timeframe} if timeframe else None,
+        # Spike / V FVG zones carry kind "FVG" (20 Nov 2026).
+        last_evaluation_result=(
+            {k: v for k, v in (("timeframe", timeframe), ("kind", kind)) if v} or None
+        ),
     )
 
 
@@ -3254,6 +3322,43 @@ def _flipped_zone_as_validated(zone_row: Any) -> ValidatedZone:
         is_strong_point=True,
         validation_failures=[],
         broken_swing=None, broken_at=None, sl_anchor_swing=None,
+    )
+
+
+def _fvg_zone_as_validated(s: FvgSetup) -> ValidatedZone:
+    """A tradeable ``ValidatedZone`` view of a spike / V FVG setup: the
+    FVG is the zone (top / bottom), formed when the BOS (or FVG candle 3)
+    closed. Pattern fields are stubbed (DBR for a buy, RBD for a sell) so
+    the zone row can be saved."""
+    direction = s.direction
+    ts = pd.Timestamp(s.formed_at)
+    top, bottom = float(s.fvg_top), float(s.fvg_bottom)
+    impulse = _Impulse(
+        direction="RALLY" if direction == "BUY" else "DROP",
+        start_index=0, end_index=0, start_time=ts, end_time=ts,
+        range_size=0.0, largest_body=0.0, candle_count=1,
+    )
+    base = _Base(
+        start_index=0, end_index=0, candle_count=1,
+        top=top, bottom=bottom, range_size=top - bottom, largest_body=0.0,
+    )
+    pattern = _Pattern(
+        pattern_type=_PT.DBR if direction == "BUY" else _PT.RBD,
+        impulse_before=impulse, base=base, impulse_after=impulse,
+        direction=direction, formed_at=ts,
+    )
+    shape = _ZoneShape(direction=direction, top=top, bottom=bottom,
+                       formed_at=ts, source_pattern=pattern)
+    refined = _RefinedZone(
+        direction=direction, top=top, bottom=bottom, formed_at=ts,
+        source_pattern=pattern, is_tradeable=True, rejection_reason=None,
+        original_zone=shape,
+    )
+    return ValidatedZone(
+        direction=direction, top=top, bottom=bottom, formed_at=ts,
+        source_pattern=pattern, refined_zone=refined, is_strong_point=True,
+        validation_failures=[], broken_swing=None, broken_at=None,
+        sl_anchor_swing=None,
     )
 
 

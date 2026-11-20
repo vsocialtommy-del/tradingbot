@@ -4626,3 +4626,99 @@ class TestM5Priority:
         zs = [z for z, _ in b._pending_pipeline_zones]
         assert zs[0] is m5_zone and m1_away in zs and m1_other_dir in zs
         assert m1_inside not in zs
+
+
+# --------------------------------------------------------------------------- #
+# Claude FTMO: spike / V BOS + FVG setups (20 Nov 2026)
+# --------------------------------------------------------------------------- #
+
+from bot.main import _fvg_zone_as_validated
+from bot.strategy.fvg_v import FvgSetup
+
+
+def _fvg(direction="BUY", top=1950.0, bottom=1948.0, entry=1950.0, sl=1944.5, tp=1960.7,
+         when="2026-05-08T13:00:00Z") -> FvgSetup:
+    return FvgSetup(direction=direction, fvg_top=top, fvg_bottom=bottom, entry=entry, sl=sl,
+                    tp=tp, bos_level=tp + 0.3, formed_at=pd.Timestamp(when))
+
+
+class TestSpikeVFvg:
+    _plan_bot = TestClaudesPlan._plan_bot
+
+    def test_fvg_setups_saved_tagged_and_queued_on_both_timeframes(self, bot, mocker, tmp_path) -> None:
+        b, mgrs = self._plan_bot(bot, tmp_path)
+        df1, df5 = make_ohlc(n=60), make_ohlc(n=300)
+        b._latest_ohlc = df1
+        mgrs["ohlc_provider"].get.side_effect = lambda sym, tf, count: df5 if tf == "M5" else df1
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[])
+        mocker.patch.object(b, "_run_zone_lifecycle")
+        f1 = _fvg("BUY", 1950.0, 1948.0)
+        f5 = _fvg("SELL", 1990.0, 1988.0, entry=1988.0, sl=1995.5, tp=1975.3)
+        scan = mocker.patch("bot.main.fvg_scan", side_effect=lambda df, fcfg, vcfg:
+                            [f5] if fcfg is b.config.plan.fvg_m5 else [f1])
+        saved = []
+        mocker.patch.object(b, "_persist_zone_if_new", side_effect=lambda z, timeframe=None, kind=None:
+                            saved.append((z.direction, timeframe, kind)) or uuid4())
+        b._detect_new_zones(NOW)
+        pend = b._pending_pipeline_zones
+        assert [(z.direction, z.bottom, z.top) for z, _ in pend] == [
+            ("SELL", 1988.0, 1990.0), ("BUY", 1948.0, 1950.0)]
+        assert b._zone_tf[pend[0][1]] == "M5" and pend[1][1] not in b._zone_tf
+        assert ("SELL", "M5", "FVG") in saved and ("BUY", None, "FVG") in saved
+        # M5 scanned with the M5 candles and M5 settings, M1 with M1.
+        frames = {id(c.args[1]): c.args[0] for c in scan.call_args_list}
+        assert frames[id(b.config.plan.fvg_m5)] is df5 and frames[id(b.config.plan.fvg_m1)] is df1
+        assert b.config.plan.fvg_m5.sl_mode == "low" and b.config.plan.fvg_m1.sl_mode == "candle1"
+
+    def test_fvg_trade_uses_its_own_entry_sl_and_tp(self, bot, mocker, tmp_path) -> None:
+        b, _ = self._plan_bot(bot, tmp_path)
+        _xautism(b)
+        b.config = replace(b.config, enable_old_zone_dedup=True)
+        f = _fvg()
+        mocker.patch("bot.main.fvg_scan", return_value=[f])
+        mocker.patch.object(b, "_persist_zone_if_new", return_value=uuid4())
+        (zone, zid), = b._fvg_candidates(make_ohlc(n=60), "M1")
+        cl = mocker.patch("bot.main.compute_levels")
+        dedup = mocker.spy(b, "_zone_already_used")
+        place = mocker.patch.object(b, "_place_xautism", return_value=True)
+        assert b._try_place_setup(zone, make_ohlc(n=60), zid, bid=1949.9, ask=1950.0) is True
+        kw = place.call_args.kwargs
+        assert (kw["entry_price"], kw["sl_price"], kw["tp1_price"]) == (1950.0, 1944.5, 1960.7)
+        cl.assert_not_called()
+        dedup.assert_not_called()
+
+    def test_fvg_waits_for_price(self, bot, mocker, tmp_path) -> None:
+        b, _ = self._plan_bot(bot, tmp_path)
+        _xautism(b)
+        mocker.patch("bot.main.fvg_scan", return_value=[_fvg()])
+        mocker.patch.object(b, "_persist_zone_if_new", return_value=uuid4())
+        (zone, zid), = b._fvg_candidates(make_ohlc(n=60), "M1")
+        place = mocker.patch.object(b, "_place_xautism", return_value=True)
+        assert b._try_place_setup(zone, make_ohlc(n=60), zid, bid=1951.0, ask=1951.1) is False
+        place.assert_not_called()
+
+    def test_traded_fvg_not_queued_again(self, bot, mocker, tmp_path) -> None:
+        b, _ = self._plan_bot(bot, tmp_path)
+        zid = uuid4()
+        b._traded_zone_ids.add(zid)
+        mocker.patch("bot.main.fvg_scan", return_value=[_fvg()])
+        mocker.patch.object(b, "_persist_zone_if_new", return_value=zid)
+        assert b._fvg_candidates(make_ohlc(n=60), "M1") == []
+
+    def test_off_switch_and_m1_bot_without_the_plan(self, bot, mocker, tmp_path) -> None:
+        b, _ = self._plan_bot(bot, tmp_path)
+        scan = mocker.patch("bot.main.fvg_scan", return_value=[_fvg()])
+        b.config = replace(b.config, plan=replace(b.config.plan, fvg_v=False))
+        assert b._fvg_candidates(make_ohlc(n=60), "M1") == []
+        b.config = replace(b.config, plan=None)
+        assert b._fvg_candidates(make_ohlc(n=60), "M1") == []
+        scan.assert_not_called()
+
+    def test_fvg_zone_row(self) -> None:
+        z = _fvg_zone_as_validated(_fvg("SELL", 1990.0, 1988.0))
+        assert (z.direction, z.top, z.bottom, z.is_strong_point) == ("SELL", 1990.0, 1988.0, True)
+        assert z.refined_zone.is_tradeable
+        row = _zone_to_input(z, timeframe="M5", kind="FVG")
+        assert row.last_evaluation_result == {"timeframe": "M5", "kind": "FVG"}
+        assert row.pattern_type == "RBD"
+        assert _zone_to_input(z, kind="FVG").last_evaluation_result == {"kind": "FVG"}

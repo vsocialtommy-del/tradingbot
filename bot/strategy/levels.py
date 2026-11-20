@@ -32,7 +32,7 @@ import pandas as pd
 from bot.strategy.strong_point import ValidatedZone
 
 
-SlMethod = Literal["PCT_30", "SWING"]
+SlMethod = Literal["PCT_30", "SWING", "FVG"]
 
 
 @dataclass(frozen=True)
