@@ -1,11 +1,14 @@
 """Claude's plan (19 Nov 2026): one bot trading M5 AND M1 zones.
 
+Real M / W zones (20 Nov 2026): both timeframes use Tommy's wick-based
+M / W rule (see :func:`bot.strategy.vertex.is_real_mw`).
+
 Runs on the M1 bot's account (``--bot m1``). Backtested 28 Jul - 13 Nov
 2026 (3 months) as the merged bot.
 
 * **Zones**: M1 zones exactly as the M1 bot (1 pt min, wick-close BOS,
-  M / W only, 5,000 M1 candles) PLUS M5 zones exactly as the M5 bot
-  (2 pt min, normal BOS, M / W only, 100,000 M5 candles ≈ 17 months).
+  real M / W only, 5,000 M1 candles) PLUS M5 zones exactly as the M5 bot
+  (2 pt min, normal BOS, real M / W only, 100,000 M5 candles ≈ 17 months).
   Each zone keeps its own timeframe's BOS / TP and its own runner:
   M5 75/25 with a 4 pt trail, M1 50/50 with a 2 pt trail.
 * **M5 priority** (19 Nov 2026): an M5 trade can open beside an open M1
