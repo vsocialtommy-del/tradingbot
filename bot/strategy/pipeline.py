@@ -40,6 +40,7 @@ Design decisions
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import pandas as pd
 from loguru import logger
@@ -142,10 +143,17 @@ class StrategyPipelineConfig:
     bos_swing_strength: int = 2
     bos_close_beyond_wick: bool = False
     """BOS must close beyond the swing's wick (M1 bot, 12 Nov 2026)."""
+    freshness: Literal["first_touch", "fendi"] = "fendi"
+    """23 Nov 2026, both bots: Fendi freshness. A zone stays tradeable after
+    touches until price reaches its SL level or touches it and then
+    reaches its TP; bodies closing into it don't kill it. ``"first_touch"``
+    is the old rule (``require_fresh_since_bos`` / ``used_once_left`` and
+    the body checks). See :class:`bot.strategy.strong_point.StrongPointConfig`."""
     require_fresh_since_bos: bool = True
     used_once_left: bool = True
     """Zone used once price has left it and come back, even before the
-    BOS (Tommy's freshness rule, 13 Nov 2026, both bots)."""
+    BOS (Tommy's freshness rule, 13 Nov 2026, both bots). First-touch
+    freshness only."""
 
     # TP1 target — read by ``main`` when computing TP1 for each zone.
     # Kept on the pipeline config so the operator only tunes one config
@@ -250,6 +258,7 @@ def run_strategy_pipeline(
         bos_close_beyond_wick=cfg.bos_close_beyond_wick,
         require_fresh_since_bos=cfg.require_fresh_since_bos,
         used_once_left=cfg.used_once_left,
+        freshness=cfg.freshness,
     )
 
     # Swings are needed by every pattern's BOS check; compute them once.

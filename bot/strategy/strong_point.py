@@ -103,6 +103,14 @@ class StrongPointConfig:
     its close. TP1 stays at the same swing."""
     """Swing pivot strength on closes (the line-chart W / M points)."""
 
+    freshness: Literal["first_touch", "fendi"] = "first_touch"
+    """``"fendi"`` (Tommy, 23 Nov 2026, both bots): a zone is NOT used up
+    by touches or by bodies closing into / through it. After the BOS it
+    stays tradeable until price reaches its SL level (30 % of the zone
+    height past the far edge) or touches it and then reaches its TP (the
+    BOS swing, 0.3 early) without a trade. A zone that has been traded is
+    still done for good (the bot's traded-zone list). ``require_fresh_since_bos``,
+    ``used_once_left`` and the body checks are the ``"first_touch"`` rules."""
     require_fresh_since_bos: bool = True
     used_once_left: bool = True
     """Tommy's freshness rule (13 Nov 2026, both bots): once a candle has
@@ -187,7 +195,8 @@ def validate_strong_point(
         failures.append("PATTERN_NOT_ALLOWED")
         return _build_unvalidated(refined, failures)
 
-    if _zone_body_broken_since_formation(refined, df):
+    fendi = cfg.freshness == "fendi"
+    if not fendi and _zone_body_broken_since_formation(refined, df):
         failures.append("ZONE_VIOLATED_BEFORE_RETEST")
         return _build_unvalidated(refined, failures)
 
@@ -203,12 +212,16 @@ def validate_strong_point(
             return _build_unvalidated(refined, failures)
         broken_swing, bos_idx = bos
         broken_at = df.index[bos_idx]
-        if cfg.require_fresh_since_bos and _zone_touched_after(
+        if fendi:
+            if _fendi_used(refined, df, bos_idx, float(broken_swing.price)):
+                failures.append("ZONE_USED_SINCE_BOS")
+                return _build_unvalidated(refined, failures)
+        elif cfg.require_fresh_since_bos and _zone_touched_after(
             refined, df, bos_idx,
         ):
             failures.append("ZONE_USED_SINCE_BOS")
             return _build_unvalidated(refined, failures)
-        if cfg.used_once_left and _reentered_after_leaving(refined, df, bos_idx):
+        if not fendi and cfg.used_once_left and _reentered_after_leaving(refined, df, bos_idx):
             failures.append("ZONE_REENTERED_BEFORE_BOS")
             return _build_unvalidated(refined, failures)
 
@@ -352,6 +365,32 @@ def _zone_touched_after(
         return bool((lows <= refined.top).any())
     highs = df["high"].to_numpy()[bos_idx + 1:]
     return bool((highs >= refined.bottom).any())
+
+
+def _fendi_used(
+    refined: RefinedZone, df: pd.DataFrame, bos_idx: int, bos_price: float,
+    *, sl_frac: float = 0.3, tp_buffer: float = 0.3,
+) -> bool:
+    """Fendi freshness (23 Nov 2026): True iff, after the BOS bar, price
+    reached the zone's SL level (``sl_frac`` of the zone height past the
+    far edge), or touched the zone and later reached its TP (the BOS
+    swing, ``tp_buffer`` early). Touches that don't go on to the TP leave
+    the zone fresh."""
+    if bos_idx + 1 >= len(df):
+        return False
+    top, bottom = float(refined.top), float(refined.bottom)
+    h = top - bottom
+    highs = df["high"].to_numpy()[bos_idx + 1:]
+    lows = df["low"].to_numpy()[bos_idx + 1:]
+    if refined.direction == "BUY":
+        if (lows <= bottom - sl_frac * h).any():
+            return True
+        t = np.nonzero(lows <= top)[0]
+        return bool(len(t) and (highs[t[0]:] >= bos_price - tp_buffer).any())
+    if (highs >= top + sl_frac * h).any():
+        return True
+    t = np.nonzero(highs >= bottom)[0]
+    return bool(len(t) and (lows[t[0]:] <= bos_price + tp_buffer).any())
 
 
 def _reentered_after_leaving(

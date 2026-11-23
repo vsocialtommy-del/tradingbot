@@ -460,3 +460,69 @@ class TestUsedOnceLeft:
         df = _ohlc(_DBR_ROWS)
         refined = _dbr_refined(df, base_start=5, base_end=6, top=102.0, bottom=100.0)
         assert validate_strong_point(refined, df).is_strong_point is True
+
+
+# --------------------------------------------------------------------------- #
+# Fendi freshness (Tommy, 23 Nov 2026)
+# --------------------------------------------------------------------------- #
+
+from types import SimpleNamespace as _NS
+
+from bot.strategy.strong_point import _fendi_used
+
+
+def _bars(rows):
+    idx = pd.date_range("2026-11-23 10:00", periods=len(rows), freq="1min", tz="UTC")
+    return pd.DataFrame(rows, columns=["open", "high", "low", "close"], index=idx)
+
+
+# A BUY zone 100-102 (SL level 99.4), BOS swing 110 (TP 109.7). Bar 0 is the BOS bar.
+_BUY = _NS(direction="BUY", top=102.0, bottom=100.0)
+_BOS_BAR = (108.0, 111.0, 107.5, 110.5)
+
+
+class TestFendiFreshness:
+    def test_untouched_is_fresh(self) -> None:
+        df = _bars([_BOS_BAR, (110.5, 110.8, 106.0, 106.5)])
+        assert not _fendi_used(_BUY, df, 0, 110.0)
+
+    def test_touched_without_reaching_tp_is_still_fresh(self) -> None:
+        df = _bars([_BOS_BAR,
+                    (106.0, 106.2, 101.5, 103.0),    # into the zone
+                    (103.0, 108.0, 102.8, 107.5),    # bounces, short of 109.7
+                    (107.5, 107.6, 103.0, 103.5)])
+        assert not _fendi_used(_BUY, df, 0, 110.0)
+
+    def test_touched_then_tp_is_used(self) -> None:
+        df = _bars([_BOS_BAR,
+                    (106.0, 106.2, 101.5, 103.0),
+                    (103.0, 109.8, 102.8, 109.5)])  # reaches the TP
+        assert _fendi_used(_BUY, df, 0, 110.0)
+
+    def test_tp_before_any_touch_is_not_a_use(self) -> None:
+        df = _bars([_BOS_BAR, (110.5, 112.0, 109.0, 111.0), (111.0, 111.2, 104.0, 104.5)])
+        assert not _fendi_used(_BUY, df, 0, 110.0)
+
+    def test_sl_level_reached_is_used(self) -> None:
+        df = _bars([_BOS_BAR, (106.0, 106.2, 99.3, 100.5)])   # 99.4 = 30% under 100
+        assert _fendi_used(_BUY, df, 0, 110.0)
+
+    def test_body_closing_inside_is_not_a_use(self) -> None:
+        df = _bars([_BOS_BAR, (103.0, 103.2, 100.4, 100.6)])  # closes inside the zone
+        assert not _fendi_used(_BUY, df, 0, 110.0)
+
+    def test_sell_is_the_mirror(self) -> None:
+        sell = _NS(direction="SELL", top=100.0, bottom=98.0)  # SL level 100.6, BOS 90 (TP 90.3)
+        bos = (92.0, 92.5, 89.0, 89.5)
+        assert not _fendi_used(sell, _bars([bos, (94.0, 98.5, 93.5, 97.0)]), 0, 90.0)
+        assert _fendi_used(sell, _bars([bos, (94.0, 98.5, 93.5, 97.0), (97.0, 97.2, 90.2, 90.5)]), 0, 90.0)
+        assert _fendi_used(sell, _bars([bos, (94.0, 100.7, 93.5, 99.0)]), 0, 90.0)
+
+
+def test_both_bots_use_fendi_freshness() -> None:
+    from bot.profiles import build_profile
+    from bot.strategy.pipeline import StrategyPipelineConfig
+    assert StrategyPipelineConfig().freshness == "fendi"
+    assert build_profile("m5")[1].freshness == "fendi"
+    assert build_profile("m1", plan=True)[1].freshness == "fendi"
+    assert StrongPointConfig().freshness == "first_touch"

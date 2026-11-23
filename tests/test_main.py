@@ -3087,11 +3087,48 @@ class TestZoneVisibilityGate:
     """PR #48: pipeline placement is blocked when the zone has been
     obscured (1+ post-formation candle bodied through)."""
 
+    def _bodies_zone(self, bot, mocker):
+        b, _ = bot
+        b.state.last_config_refresh = NOW
+        b.state.last_m5_bar_time = None
+        zone = _make_validated_for_persistence(_PT.RBR)
+        df_with_bodies = _make_ohlc_with_post_formation_bodies_through_zone(
+            zone_top=1900.5, zone_bottom=1900.0,
+            formed_at_iso="2026-05-08T11:30:00Z",
+            n_bodies_through=2,
+        )
+        zone = _ValidatedZone(
+            direction=zone.direction, top=1900.5, bottom=1900.0,
+            formed_at=pd.Timestamp("2026-05-08T11:30:00Z"),
+            source_pattern=zone.source_pattern,
+            refined_zone=zone.refined_zone,
+            is_strong_point=True, validation_failures=[],
+            broken_swing=None, broken_at=None, sl_anchor_swing=None,
+        )
+        bot[1]["ohlc_provider"].get.return_value = df_with_bodies
+        mocker.patch("bot.main.run_strategy_pipeline", return_value=[zone])
+        mocker.patch("bot.main.find_nearest_local_peak", return_value=1907.5)
+        return b
+
+    def test_fendi_freshness_bodies_through_do_not_block(
+        self, bot: tuple[Bot, dict[str, MagicMock]],
+        mocker: MockerFixture,
+    ) -> None:
+        # 23 Nov 2026: Fendi freshness is the default; bodies closing into
+        # the zone don't stop the trade.
+        b = self._bodies_zone(bot, mocker)
+        assert b.strategy_pipeline_config.freshness == "fendi"
+        place = mocker.patch("bot.main.place_layered_orders")
+        b.run_iteration(NOW)
+        place.assert_called_once()
+
     def test_dead_zone_blocks_placement(
         self, bot: tuple[Bot, dict[str, MagicMock]],
         mocker: MockerFixture,
     ) -> None:
         b, _ = bot
+        # The old first-touch freshness keeps the body gate.
+        b.strategy_pipeline_config = replace(b.strategy_pipeline_config, freshness="first_touch")
         b.state.last_config_refresh = NOW
         b.state.last_m5_bar_time = None
 
