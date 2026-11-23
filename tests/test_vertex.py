@@ -117,9 +117,9 @@ def test_zigzag_foot_skips_small_pullback() -> None:
     assert df["close"].iloc[far[0].foot_index] == pytest.approx(4092.6)
 
 
-def test_default_foot_is_the_real_swing() -> None:
-    # 23 Nov 2026: pullbacks under one zone height are skipped (was 0.25).
-    assert StrategyPipelineConfig().vertex_foot_zigzag_frac == 1.0
+def test_default_foot_is_zigzag_quarter() -> None:
+    # 23 Nov 2026: 1.0 (the 'real swing') was tried and put back.
+    assert StrategyPipelineConfig().vertex_foot_zigzag_frac == 0.25
 
 
 # 18 Nov 2026: M / W only. Same rally in and drop out as M_TOP, but the

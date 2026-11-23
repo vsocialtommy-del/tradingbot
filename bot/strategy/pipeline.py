@@ -136,13 +136,12 @@ class StrategyPipelineConfig:
     a 10.43 pt leg in for a 10.47 pt zone and was missed. 3-month backtest
     (14 Aug - 13 Nov 2026, Claude FTMO): +£4,301 vs +£2,663, drawdown -£415
     vs -£504. None = same as ``vertex_leg_min_frac``."""
-    vertex_foot_zigzag_frac: float = 1.0
-    """Zigzag foot: ignore pullbacks whose bounce is under one zone height
-    when finding the BOS / TP level, so it's the real swing low (sell) /
-    high (buy) the move into the zone came from, not a small dip right
-    before the last push (23 Nov 2026, Tommy; was 0.25: the 3672.73 sell
-    that day took 3671.05 instead of the 3670.11 swing low).
-    0 = old first-dip foot."""
+    vertex_foot_zigzag_frac: float = 0.25
+    """Zigzag foot: ignore pullbacks whose bounce is under 25 % of the zone
+    height when finding the BOS / TP level. 0 = old first-dip foot.
+    23 Nov 2026: tried 1.0 (walk back to the 'real' swing, PR #126) and put
+    back the same night: on the M5 bot it pushed the TP / BOS too far away
+    (12-month M5 bot backtest at £50: -£538 with it, +£358 without)."""
     vertex_require_mw: bool = True
     """Only real M / W zones: the W / M on the line chart (closes), box wick to wick (see :func:`bot.strategy.vertex.is_real_mw`).
     Tommy's standard zone rule for every bot and timeframe (20 Nov 2026)."""

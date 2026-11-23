@@ -1,6 +1,7 @@
 """Tommy's 23 Nov 2026 sell zone (MT5 M1 candles, broker time 17:50-18:58):
-the M's first top is the close of the last leg-in candle, and the BOS / TP
-is the real swing low, not the small dip right before the last push."""
+the M's first top is the close of the last leg-in candle. The BOS / TP is
+the swing the leg in came from (3671.05); the 'real swing' version (3670.11,
+PR #126) was put back the same night."""
 
 from __future__ import annotations
 
@@ -98,21 +99,21 @@ def _sells(cfg):
         logger.enable("bot")
 
 
-def test_the_m_is_found_with_the_swing_low_tp() -> None:
+def test_the_m_is_found() -> None:
     cfg = build_profile("m1", plan=True)[1]
     (z,) = _sells(cfg)
     assert (z.bottom, z.top) == (3672.73, 3675.67)        # the vertex, wick to wick
-    assert z.broken_swing.price == 3670.11                 # the real swing low
+    assert z.broken_swing.price == 3671.05                 # the swing the leg in came from
     lv = compute_levels(z, _df(), LevelsConfig())
-    assert (lv.entry, lv.tp1) == (3672.73, 3670.41)        # entry = lowest point of the M
+    assert (lv.entry, lv.tp1) == (3672.73, 3671.35)        # entry = lowest point of the M
 
 
-def test_old_rules_missed_it() -> None:
+def test_old_m_rule_missed_it_and_the_real_swing_option() -> None:
     from dataclasses import replace
     cfg = build_profile("m1", plan=True)[1]
     assert _sells(replace(cfg, vertex_mw_leg_in_end_counts=False)) == []
-    (z,) = _sells(replace(cfg, vertex_foot_zigzag_frac=0.25))
-    assert z.broken_swing.price == 3671.05                 # the small dip
+    (z,) = _sells(replace(cfg, vertex_foot_zigzag_frac=1.0))
+    assert z.broken_swing.price == 3670.11                 # the 'real swing' (off by default)
 
 
 # --------------------------------------------------------------------------- #
