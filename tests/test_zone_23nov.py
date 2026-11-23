@@ -113,3 +113,65 @@ def test_old_rules_missed_it() -> None:
     assert _sells(replace(cfg, vertex_mw_leg_in_end_counts=False)) == []
     (z,) = _sells(replace(cfg, vertex_foot_zigzag_frac=0.25))
     assert z.broken_swing.price == 3671.05                 # the small dip
+
+
+# --------------------------------------------------------------------------- #
+# The 3611.47-3621.94 M5 buy the same day (broker time 14:30-16:20, M5): its
+# leg in moved 10.43 pts for a 10.47 pt zone. The leg in now only has to move
+# half a zone height.
+# --------------------------------------------------------------------------- #
+
+ROWS_M5 = [
+    (3614.83, 3618.14, 3613.14, 3618.10),
+    (3618.09, 3623.12, 3618.09, 3621.31),
+    (3621.32, 3621.37, 3617.14, 3618.15),
+    (3618.16, 3618.55, 3612.96, 3615.81),
+    (3615.83, 3617.37, 3613.14, 3615.51),
+    (3615.51, 3619.33, 3614.30, 3617.10),
+    (3617.13, 3622.67, 3614.25, 3616.57),
+    (3616.57, 3622.50, 3614.49, 3622.00),
+    (3622.10, 3625.56, 3618.12, 3621.32),
+    (3621.32, 3623.80, 3618.68, 3623.33),
+    (3623.67, 3627.71, 3622.23, 3626.88),
+    (3626.98, 3631.88, 3626.33, 3626.94),
+    (3626.95, 3627.48, 3619.18, 3619.56),
+    (3619.54, 3622.46, 3616.02, 3616.45),
+    (3616.45, 3621.94, 3614.66, 3618.45),
+    (3618.61, 3620.62, 3614.24, 3615.43),
+    (3615.60, 3616.56, 3611.47, 3615.19),
+    (3615.17, 3659.91, 3615.17, 3654.42),
+    (3654.31, 3665.99, 3645.95, 3659.96),
+    (3659.96, 3665.81, 3652.85, 3656.56),
+    (3656.52, 3667.85, 3653.14, 3667.05),
+    (3667.09, 3670.65, 3662.91, 3667.98),
+    (3667.89, 3684.74, 3665.80, 3684.13),
+]
+
+
+def _df5() -> pd.DataFrame:
+    idx = pd.date_range("2026-11-23 14:30", periods=len(ROWS_M5), freq="5min", tz="UTC")
+    return pd.DataFrame(ROWS_M5, columns=["open", "high", "low", "close"], index=idx)
+
+
+def _buys(cfg):
+    logger.disable("bot")
+    try:
+        return [z for z in run_strategy_pipeline(_df5(), cfg)
+                if z.direction == "BUY" and z.is_strong_point]
+    finally:
+        logger.enable("bot")
+
+
+def test_m5_buy_with_a_small_leg_in_is_found_on_both_bots() -> None:
+    from bot.plan import PlanConfig
+    for cfg in (build_profile("m5")[1], PlanConfig().m5_pipeline):
+        assert cfg.vertex_leg_in_min_frac == 0.5
+        (z,) = _buys(cfg)
+        assert (z.bottom, z.top) == (3611.47, 3621.94)
+        assert z.broken_swing.price == 3626.88
+        assert compute_levels(z, _df5(), LevelsConfig()).entry == 3621.94
+
+
+def test_m5_buy_missed_with_the_full_zone_leg_in_rule() -> None:
+    from dataclasses import replace
+    assert _buys(replace(build_profile("m5")[1], vertex_leg_in_min_frac=None)) == []

@@ -128,6 +128,14 @@ class StrategyPipelineConfig:
     vertex_max_leg: int = 5
     vertex_exit_frac: float = 0.5
     vertex_leg_min_frac: float = 1.0
+    """Leg out (and leg in, unless ``vertex_leg_in_min_frac``) must move at
+    least this many zone heights on the line chart."""
+    vertex_leg_in_min_frac: float | None = 0.5
+    """23 Nov 2026 (Tommy): the leg in only has to move half a zone height
+    (the leg out still a full one). His 3611.47-3621.94 M5 buy that day had
+    a 10.43 pt leg in for a 10.47 pt zone and was missed. 3-month backtest
+    (14 Aug - 13 Nov 2026, Claude FTMO): +£4,301 vs +£2,663, drawdown -£415
+    vs -£504. None = same as ``vertex_leg_min_frac``."""
     vertex_foot_zigzag_frac: float = 1.0
     """Zigzag foot: ignore pullbacks whose bounce is under one zone height
     when finding the BOS / TP level, so it's the real swing low (sell) /
@@ -215,6 +223,7 @@ def vertex_config(cfg: StrategyPipelineConfig) -> VertexConfig:
         min_base=cfg.vertex_min_base, max_base=cfg.vertex_max_base,
         max_leg=cfg.vertex_max_leg, exit_frac=cfg.vertex_exit_frac,
         leg_min_frac=cfg.vertex_leg_min_frac,
+        leg_in_min_frac=cfg.vertex_leg_in_min_frac,
         foot_zigzag_frac=cfg.vertex_foot_zigzag_frac,
         require_mw=cfg.vertex_require_mw,
         mw_min_pull=cfg.vertex_mw_min_pull,
