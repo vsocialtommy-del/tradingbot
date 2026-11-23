@@ -153,6 +153,7 @@ from bot.strategy.pipeline import (
 from bot.strategy.vertex import VertexPatternCache
 from bot.strategy.tp_target import find_nearest_local_peak
 from bot.strategy.zone_marking import Zone as _ZoneShape
+from bot.strategy.fvg_human import scan as human_fvg_scan
 from bot.strategy.fvg_v import FvgSetup, scan as fvg_scan
 from bot.strategy.zone_refinement import RefinedZone as _RefinedZone
 from bot.strategy.zone_visibility import count_bodies_through_zone
@@ -440,7 +441,7 @@ class Bot:
         self._plan_m5_df: pd.DataFrame | None = None
         self._plan_m5_pending: list[tuple[ValidatedZone, UUID]] = []
         self._plan_m5_cache: VertexPatternCache | None = None
-        # Spike / V FVG (20 Nov 2026): the levels of the FVG zones found on
+        # FVG setups (human FVG, or the FVG spam bot): the levels of the FVG zones found on
         # the last scan, per timeframe, by zone key.
         self._fvg_levels: dict[str, dict[tuple, TradeLevels]] = {"M1": {}, "M5": {}}
         self._plan_breaker: DrawdownBreaker | None = None
@@ -1306,7 +1307,7 @@ class Bot:
             new_pipeline_pending.append((zone, zid))
 
         if self.config.plan is not None:
-            # Spike / V FVG setups on M1 (20 Nov 2026), alongside the M / W zones.
+            # FVG setups on M1 (human FVG, 23 Nov 2026), alongside the M / W zones.
             new_pipeline_pending += self._fvg_candidates(df, "M1")
             # Claude's plan: M5 zones first (the backtest checked M5 then M1).
             m5_cands = self._plan_m5_candidates()
@@ -1392,27 +1393,31 @@ class Bot:
                         continue
                     self._zone_tf[zid] = "M5"
                     pending.append((z, zid))
-                # Spike / V FVG setups on M5 (20 Nov 2026).
+                # FVG setups on M5 (human FVG, 23 Nov 2026).
                 pending += self._fvg_candidates(df5, "M5")
                 self._plan_m5_pending = pending
                 self._plan_m5_df = df5
         return [(z, zid) for z, zid in self._plan_m5_pending if zid not in self._traded_zone_ids]
 
     def _fvg_candidates(self, df: pd.DataFrame, tf: str) -> list[tuple[ValidatedZone, UUID]]:
-        """Claude FTMO, spike / V BOS + FVG setups (20 Nov 2026, see
-        :mod:`bot.strategy.fvg_v`) that are live now on ``tf`` ("M1" or
-        "M5"). ``df``'s last row is the candle still forming. Each FVG is
-        saved as a zone (tagged ``kind: FVG``) and its entry / SL / TP
-        remembered for placement."""
+        """Claude FTMO FVG setups that are live now on ``tf`` ("M1" or
+        "M5"): the human FVG (23 Nov 2026, :mod:`bot.strategy.fvg_human`)
+        or, with ``fvg_mode="spam"``, the FVG spam bot's spike / V BOS +
+        FVG (:mod:`bot.strategy.fvg_v`). ``df``'s last row is the candle
+        still forming. Each FVG is saved as a zone (tagged ``kind: FVG``)
+        and its entry / SL / TP remembered for placement."""
         plan = self.config.plan
         if plan is None or not plan.fvg_v or df is None or len(df) < 2:
             return []
-        if tf == "M5":
-            fcfg, pcfg, tag = plan.fvg_m5, plan.m5_pipeline, "M5"
-        else:
-            fcfg, pcfg, tag = plan.fvg_m1, self.strategy_pipeline_config, None
+        pcfg = plan.m5_pipeline if tf == "M5" else self.strategy_pipeline_config
+        tag = "M5" if tf == "M5" else None
         try:
-            setups = fvg_scan(df, fcfg, vertex_config(pcfg))
+            if plan.fvg_mode == "spam":
+                fcfg = plan.fvg_m5 if tf == "M5" else plan.fvg_m1
+                setups = fvg_scan(df, fcfg, vertex_config(pcfg))
+            else:
+                hcfg = plan.fvg_human_m5 if tf == "M5" else plan.fvg_human_m1
+                setups = human_fvg_scan(df, hcfg, vertex_config(pcfg))
         except Exception:
             logger.exception(f"fvg: {tf} scan raised; no FVG setups this candle")
             return []
@@ -1432,13 +1437,13 @@ class Bot:
         self._fvg_levels[tf] = levels
         if out:
             logger.debug(
-                f"fvg: {len(out)} {tf} spike / V FVG setup(s) waiting: "
+                f"fvg: {len(out)} {tf} {plan.fvg_mode} FVG setup(s) waiting: "
                 + ", ".join(f"{z.direction} {z.bottom:.2f}-{z.top:.2f}" for z, _ in out)
             )
         return out
 
     def _fvg_levels_for(self, zone: Any) -> TradeLevels | None:
-        """Entry / SL / TP of a spike / V FVG zone, or None for a normal zone."""
+        """Entry / SL / TP of an FVG zone, or None for a normal zone."""
         key = _zone_key_from_validated(zone)
         for lv in self._fvg_levels.values():
             if key in lv:
@@ -2392,8 +2397,8 @@ class Bot:
         # zone's first BOS less a spread buffer.
         levels: TradeLevels | None = None
         if fvg_levels is not None:
-            # Spike / V FVG: entry at the FVG edge, SL past the low / candle
-            # 1, TP at the BOS line (worked out when the FVG was found).
+            # FVG: the entry / SL / TP worked out when the FVG was found
+            # (human: middle of the gap, past the sweep, next liquidity).
             levels = fvg_levels
         elif self.config.levels.enabled:
             levels = compute_levels(zone, ohlc_df, self.config.levels)
@@ -3235,7 +3240,7 @@ def _zone_to_input(
         formed_at=zone.formed_at.to_pydatetime(),
         # Claude's plan: M5 zones on the M1 bot's account are tagged so the
         # lifecycle and the runner know their timeframe.
-        # Spike / V FVG zones carry kind "FVG" (20 Nov 2026).
+        # FVG zones carry kind "FVG" (20 Nov 2026).
         last_evaluation_result=(
             {k: v for k, v in (("timeframe", timeframe), ("kind", kind)) if v} or None
         ),
@@ -3352,7 +3357,7 @@ def _flipped_zone_as_validated(zone_row: Any) -> ValidatedZone:
 
 
 def _fvg_zone_as_validated(s: FvgSetup) -> ValidatedZone:
-    """A tradeable ``ValidatedZone`` view of a spike / V FVG setup: the
+    """A tradeable ``ValidatedZone`` view of an FVG setup: the
     FVG is the zone (top / bottom), formed when the BOS (or FVG candle 3)
     closed. Pattern fields are stubbed (DBR for a buy, RBD for a sell) so
     the zone row can be saved."""

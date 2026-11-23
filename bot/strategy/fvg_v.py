@@ -1,4 +1,10 @@
-"""Spike / V BOS + FVG setups (Tommy, 20 Nov 2026), for Claude FTMO.
+"""Spike / V BOS + FVG setups (Tommy, 20 Nov 2026): the "FVG spam bot".
+
+Claude FTMO traded these 20-23 Nov 2026. Since 23 Nov 2026 it trades the
+human FVG instead (:mod:`bot.strategy.fvg_human`); this is kept and comes
+back with ``PlanConfig.fvg_mode = "spam"``. 12 months to 13 Nov 2026 at
+£50 a trade: 9,956 trades (38 a day) +£36,541, max drawdown -£825, but
+only £3.67 a trade on average.
 
 Traded alongside the real M / W zones. Only when the move came from a
 spike / V, never from a base: if a W / M (or any base) shows, the normal
