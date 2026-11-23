@@ -21,10 +21,14 @@ Runs on the M1 bot's account (``--bot m1``). Backtested 28 Jul - 13 Nov
   room check: no trade opens if the day's P&L minus that trade's risk
   would go below -£200. No losses-a-day count, no losses-in-a-row stop,
   no profit target.
-* **Spike / V FVG** (20 Nov 2026): also trades BOS + FVG setups where
-  the move came from a spike / V (no base): entry at the first touch of
-  the FVG, TP at the BOS line, SL 0.5 past the low (M5) / candle 1 of the
-  FVG (M1). Same £50, runners, slots and risk rules as the zones. See
+* **Human FVG** (23 Nov 2026): also trades one FVG per shift in
+  structure: a sweep of obvious liquidity, the first BOS against the
+  trend (a lower high broken for a BUY), then the first gap in that
+  move. Entry the middle of the gap, SL 0.5 past the sweep, TP the
+  next liquidity (the swing before the broken one). Same £50, runners,
+  slots and risk rules as the zones. See :mod:`bot.strategy.fvg_human`.
+  The spike / V FVG it replaced (20 Nov 2026, every BOS + FVG) is kept
+  as the "FVG spam bot": ``fvg_mode="spam"``, see
   :mod:`bot.strategy.fvg_v`.
 * **Drawdown breaker**: half risk once the balance is £400 below its
   peak, a quarter at £600 below. The peak counts from when the plan
@@ -38,11 +42,12 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from loguru import logger
 
 from bot.execution.layer2_stop import XautismEntryConfig
+from bot.strategy.fvg_human import HumanFvgConfig
 from bot.strategy.fvg_v import FvgVConfig
 from bot.strategy.pipeline import StrategyPipelineConfig
 
@@ -70,13 +75,22 @@ class PlanConfig:
     open position and waiting order going to its stop, minus the new
     trade's risk, stays inside the dead stop."""
     fvg_v: bool = True
-    """20 Nov 2026: also trade spike / V BOS + FVG setups on both timeframes
-    (see :mod:`bot.strategy.fvg_v`). Only when the move came from a spike /
-    V, never a base: a W / M is left to the normal zone rules."""
+    """Trade FVG setups on both timeframes as well as the zones (the kind
+    is ``fvg_mode``). Only when the move came from a spike / V, never a
+    base: a W / M is left to the normal zone rules."""
+    fvg_mode: Literal["human", "spam"] = "human"
+    """23 Nov 2026: "human" (see :mod:`bot.strategy.fvg_human`), one FVG
+    per shift in structure after a sweep, entry the middle of the gap.
+    "spam" is the FVG spam bot (20-23 Nov 2026, :mod:`bot.strategy.fvg_v`):
+    every spike / V BOS + FVG, entry the near edge, TP the BOS line."""
+    fvg_human_m5: HumanFvgConfig = field(default_factory=HumanFvgConfig)
+    fvg_human_m1: HumanFvgConfig = field(default_factory=HumanFvgConfig)
+    """Human FVG on both timeframes: SL 0.5 past the sweep, TP the next
+    liquidity, entry the middle of the gap."""
     fvg_m5: FvgVConfig = field(default_factory=lambda: FvgVConfig(sl_mode="low"))
-    """M5 FVG: SL 0.5 past the low / high of the move, TP the BOS line."""
+    """FVG spam bot, M5: SL 0.5 past the low / high of the move, TP the BOS line."""
     fvg_m1: FvgVConfig = field(default_factory=lambda: FvgVConfig(sl_mode="candle1"))
-    """M1 FVG: SL 0.5 past candle 1 of the FVG, TP the BOS line."""
+    """FVG spam bot, M1: SL 0.5 past candle 1 of the FVG, TP the BOS line."""
     drawdown_steps: tuple[tuple[float, float], ...] = ((600.0, 0.25), (400.0, 0.5))
     """(£ below peak, risk multiplier), biggest drawdown first."""
     state_file: str = "logs/plan_state.json"

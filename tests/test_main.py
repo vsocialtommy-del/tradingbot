@@ -4643,7 +4643,13 @@ def _fvg(direction="BUY", top=1950.0, bottom=1948.0, entry=1950.0, sl=1944.5, tp
 
 
 class TestSpikeVFvg:
-    _plan_bot = TestClaudesPlan._plan_bot
+    """The FVG spam bot (spike / V FVG, 20-23 Nov 2026), kept behind
+    ``PlanConfig.fvg_mode = "spam"``."""
+
+    def _plan_bot(self, bot, tmp_path):
+        b, mgrs = TestClaudesPlan._plan_bot(self, bot, tmp_path)
+        b.config = replace(b.config, plan=replace(b.config.plan, fvg_mode="spam"))
+        return b, mgrs
 
     def test_fvg_setups_saved_tagged_and_queued_on_both_timeframes(self, bot, mocker, tmp_path) -> None:
         b, mgrs = self._plan_bot(bot, tmp_path)
@@ -4724,6 +4730,58 @@ class TestSpikeVFvg:
         assert _zone_to_input(z, kind="FVG").last_evaluation_result == {"kind": "FVG"}
 
 
+class TestHumanFvg:
+    """Claude FTMO's live FVG since 23 Nov 2026: the human FVG."""
+    _plan_bot = TestClaudesPlan._plan_bot
+
+    def test_human_is_the_default_and_spam_is_kept(self) -> None:
+        p = PlanConfig()
+        assert p.fvg_v and p.fvg_mode == "human"
+        assert p.fvg_human_m1.entry == "mid" and p.fvg_human_m5.entry == "mid"
+
+    def test_human_scan_on_both_timeframes_spam_not_used(self, bot, mocker, tmp_path) -> None:
+        b, _ = self._plan_bot(bot, tmp_path)
+        f1 = _fvg("BUY", 1949.0, 1948.0, entry=1949.0, sl=1944.5, tp=1960.7)
+        f5 = _fvg("SELL", 1990.0, 1989.0, entry=1989.0, sl=1995.5, tp=1975.3)
+        human = mocker.patch("bot.main.human_fvg_scan", side_effect=lambda df, hcfg, vcfg:
+                             [f5] if hcfg is b.config.plan.fvg_human_m5 else [f1])
+        spam = mocker.patch("bot.main.fvg_scan", return_value=[_fvg()])
+        mocker.patch.object(b, "_persist_zone_if_new", side_effect=lambda *a, **k: uuid4())
+        df = make_ohlc(n=60)
+        (z1, _), = b._fvg_candidates(df, "M1")
+        (z5, zid5), = b._fvg_candidates(df, "M5")
+        assert (z1.direction, z1.bottom, z1.top) == ("BUY", 1948.0, 1949.0)
+        assert (z5.direction, z5.bottom, z5.top) == ("SELL", 1989.0, 1990.0)
+        assert b._zone_tf[zid5] == "M5"
+        assert human.call_count == 2
+        spam.assert_not_called()
+
+    def test_human_trade_uses_the_middle_entry_sl_and_tp(self, bot, mocker, tmp_path) -> None:
+        b, _ = self._plan_bot(bot, tmp_path)
+        _xautism(b)
+        f = _fvg("BUY", 1949.0, 1948.0, entry=1949.0, sl=1944.5, tp=1960.7)
+        mocker.patch("bot.main.human_fvg_scan", return_value=[f])
+        mocker.patch.object(b, "_persist_zone_if_new", return_value=uuid4())
+        (zone, zid), = b._fvg_candidates(make_ohlc(n=60), "M1")
+        place = mocker.patch.object(b, "_place_xautism", return_value=True)
+        # Price at the top of the gap (1950) hasn't reached the middle yet.
+        assert b._try_place_setup(zone, make_ohlc(n=60), zid, bid=1949.9, ask=1950.0) is False
+        place.assert_not_called()
+        assert b._try_place_setup(zone, make_ohlc(n=60), zid, bid=1948.9, ask=1949.0) is True
+        kw = place.call_args.kwargs
+        assert (kw["entry_price"], kw["sl_price"], kw["tp1_price"]) == (1949.0, 1944.5, 1960.7)
+
+    def test_spam_mode_scans_with_the_spike_v_rules(self, bot, mocker, tmp_path) -> None:
+        b, _ = self._plan_bot(bot, tmp_path)
+        b.config = replace(b.config, plan=replace(b.config.plan, fvg_mode="spam"))
+        human = mocker.patch("bot.main.human_fvg_scan", return_value=[])
+        spam = mocker.patch("bot.main.fvg_scan", return_value=[_fvg()])
+        mocker.patch.object(b, "_persist_zone_if_new", return_value=uuid4())
+        assert len(b._fvg_candidates(make_ohlc(n=60), "M1")) == 1
+        assert spam.call_args.args[1] is b.config.plan.fvg_m1
+        human.assert_not_called()
+
+
 # --------------------------------------------------------------------------- #
 # 23 Nov 2026: no firing into a zone price has already gone through, and a
 # gap-through fill uses the zone up (Claude FTMO opened and closed a 0.01
@@ -4739,7 +4797,7 @@ class TestNoGapThroughLoop:
     def _sell_fvg(self, b, mocker):
         _xautism(b)
         f = _fvg("SELL", 3633.68, 3633.47, entry=3633.47, sl=3635.68, tp=3633.29)
-        mocker.patch("bot.main.fvg_scan", return_value=[f])
+        mocker.patch("bot.main.human_fvg_scan", return_value=[f])
         mocker.patch.object(b, "_persist_zone_if_new", return_value=uuid4())
         (zone, zid), = b._fvg_candidates(make_ohlc(n=60), "M1")
         return zone, zid
@@ -4761,7 +4819,7 @@ class TestNoGapThroughLoop:
     def test_buy_not_fired_when_ask_already_below_the_zone(self, bot, mocker, tmp_path) -> None:
         b, _ = self._plan_bot(bot, tmp_path)
         _xautism(b)
-        mocker.patch("bot.main.fvg_scan", return_value=[_fvg()])   # BUY 1948-1950
+        mocker.patch("bot.main.human_fvg_scan", return_value=[_fvg()])   # BUY 1948-1950
         mocker.patch.object(b, "_persist_zone_if_new", return_value=uuid4())
         (zone, zid), = b._fvg_candidates(make_ohlc(n=60), "M1")
         place = mocker.patch.object(b, "_place_xautism", return_value=True)
