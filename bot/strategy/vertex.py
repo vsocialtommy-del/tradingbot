@@ -88,6 +88,12 @@ class VertexConfig:
     mw_max_apart: float = 0.5
     """The two bottoms / tops may be at most this fraction of the zone
     height apart (Tommy's A / B / C, 20 Nov 2026)."""
+    mw_leg_in_end_counts: bool = True
+    """23 Nov 2026: the close of the last leg-in candle can be the FIRST
+    top (M) / bottom (W) of the line-chart M / W (it's only used to see the
+    shape; the zone box and the entry are still the vertex candles).
+    Tommy's 3672.73-3675.67 sell that day: tops 3674.79 (leg-in end) and
+    3674.42."""
 
 
 def detect_vertex_patterns(df: pd.DataFrame, config: VertexConfig | None = None) -> list[Pattern]:
@@ -141,9 +147,16 @@ def _finish(found: list[Pattern], df: pd.DataFrame, cfg: VertexConfig) -> list[P
     if cfg.require_mw:
         c = df["close"].to_numpy(float)
         out = [p for p in out if is_real_mw(
-            c, p.base.start_index, p.base.end_index, p.base.bottom, p.base.top,
+            c, _mw_start(p, cfg), p.base.end_index, p.base.bottom, p.base.top,
             p.direction == "SELL", min_pull=cfg.mw_min_pull, max_apart=cfg.mw_max_apart)]
     return out
+
+
+def _mw_start(p: Pattern, cfg: VertexConfig) -> int:
+    """First candle whose close can be an M top / W bottom: the vertex, or
+    the last leg-in candle too (``mw_leg_in_end_counts``)."""
+    s = p.base.start_index
+    return s - 1 if cfg.mw_leg_in_end_counts and s >= 2 else s
 
 
 def _shift_pattern(p: Pattern, off: int) -> Pattern:
