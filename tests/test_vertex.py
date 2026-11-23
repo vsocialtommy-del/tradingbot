@@ -117,8 +117,9 @@ def test_zigzag_foot_skips_small_pullback() -> None:
     assert df["close"].iloc[far[0].foot_index] == pytest.approx(4092.6)
 
 
-def test_default_foot_is_zigzag_quarter() -> None:
-    assert StrategyPipelineConfig().vertex_foot_zigzag_frac == 0.25
+def test_default_foot_is_the_real_swing() -> None:
+    # 23 Nov 2026: pullbacks under one zone height are skipped (was 0.25).
+    assert StrategyPipelineConfig().vertex_foot_zigzag_frac == 1.0
 
 
 # 18 Nov 2026: M / W only. Same rally in and drop out as M_TOP, but the
@@ -263,9 +264,14 @@ def test_two_candle_vertex_is_not_a_real_m() -> None:
     # rule the detector still finds it.
     df = frame([(3681.0, 3681.2, 3676.9, 3679.1), (3679.1, 3679.3, 3675.9, 3676.1)] + TWO_CANDLE_M)
     loose = detect_vertex_patterns(df, VertexConfig(require_mw=False, min_base=2))
-    real = detect_vertex_patterns(df, VertexConfig(require_mw=True, min_base=2))
+    real = detect_vertex_patterns(df, VertexConfig(require_mw=True, min_base=2,
+                                                   mw_leg_in_end_counts=False))
     assert [p for p in loose if p.direction == "SELL" and p.base.candle_count == 2]
     assert not [p for p in real if p.direction == "SELL" and p.base.candle_count == 2]
+    # 23 Nov 2026: the leg-in close (3684.5) can be top 1, the vertex dips
+    # (3683.8) and closes higher again (3685.0): that IS an M.
+    leg_top = detect_vertex_patterns(df, VertexConfig(require_mw=True, min_base=2))
+    assert [p for p in leg_top if p.direction == "SELL" and p.base.candle_count == 2]
 
 
 def test_two_candle_spike_still_rejected() -> None:

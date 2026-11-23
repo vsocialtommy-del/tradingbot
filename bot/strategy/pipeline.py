@@ -128,10 +128,13 @@ class StrategyPipelineConfig:
     vertex_max_leg: int = 5
     vertex_exit_frac: float = 0.5
     vertex_leg_min_frac: float = 1.0
-    vertex_foot_zigzag_frac: float = 0.25
-    """Zigzag foot: ignore pullbacks whose bounce is under 25 % of the zone
-    height when finding the BOS / TP level (Nov 2026 backtest: +£1,788 vs
-    +£1,148 with the first-dip foot). 0 = old first-dip foot."""
+    vertex_foot_zigzag_frac: float = 1.0
+    """Zigzag foot: ignore pullbacks whose bounce is under one zone height
+    when finding the BOS / TP level, so it's the real swing low (sell) /
+    high (buy) the move into the zone came from, not a small dip right
+    before the last push (23 Nov 2026, Tommy; was 0.25: the 3672.73 sell
+    that day took 3671.05 instead of the 3670.11 swing low).
+    0 = old first-dip foot."""
     vertex_require_mw: bool = True
     """Only real M / W zones: the W / M on the line chart (closes), box wick to wick (see :func:`bot.strategy.vertex.is_real_mw`).
     Tommy's standard zone rule for every bot and timeframe (20 Nov 2026)."""
@@ -139,6 +142,9 @@ class StrategyPipelineConfig:
     """M / W middle top / dip must be at least this share of the zone height."""
     vertex_mw_max_apart: float = 0.5
     """The two bottoms / tops may be at most this share of the zone height apart."""
+    vertex_mw_leg_in_end_counts: bool = True
+    """23 Nov 2026: the last leg-in candle's close can be the first top /
+    bottom of the M / W (see :class:`bot.strategy.vertex.VertexConfig`)."""
     require_bos: bool = True
     bos_swing_strength: int = 2
     bos_close_beyond_wick: bool = False
@@ -213,6 +219,7 @@ def vertex_config(cfg: StrategyPipelineConfig) -> VertexConfig:
         require_mw=cfg.vertex_require_mw,
         mw_min_pull=cfg.vertex_mw_min_pull,
         mw_max_apart=cfg.vertex_mw_max_apart,
+        mw_leg_in_end_counts=cfg.vertex_mw_leg_in_end_counts,
     )
 
 
