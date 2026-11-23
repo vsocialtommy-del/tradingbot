@@ -2285,7 +2285,10 @@ class Bot:
         # own existing safety guard
         # (``flipped_zone_body_broken_since_flip``) so we skip this
         # check for flipped retrades.
-        if not is_flipped_retrade:
+        # 23 Nov 2026: with Fendi freshness bodies closing into the zone
+        # don't kill it (the pipeline's freshness rule decides).
+        fendi = getattr(self.strategy_pipeline_config, "freshness", "first_touch") == "fendi"
+        if not is_flipped_retrade and not fendi:
             bodies = count_bodies_through_zone(
                 ohlc_df,
                 zone_top=zone.top,
