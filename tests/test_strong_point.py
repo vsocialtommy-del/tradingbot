@@ -511,6 +511,17 @@ class TestFendiFreshness:
         df = _bars([_BOS_BAR, (103.0, 103.2, 100.4, 100.6)])  # closes inside the zone
         assert not _fendi_used(_BUY, df, 0, 110.0)
 
+    def test_touch_before_the_bos_then_tp_is_used(self) -> None:
+        # 23 Nov 2026 (3676.45-3681.13 sell): retested before the BOS, then
+        # ran through the TP. Counted from the end of the leg out, not the BOS.
+        sell = _NS(direction="SELL", top=100.0, bottom=98.0)
+        df = _bars([(97.0, 97.2, 95.0, 95.5),     # 0: end of the leg out
+                    (95.5, 98.4, 95.4, 97.5),     # 1: back into the zone (no BOS yet)
+                    (97.5, 97.6, 91.0, 91.5),     # 2: the BOS bar
+                    (91.5, 91.6, 89.0, 89.5)])    # 3: through the TP (90.3)
+        assert _fendi_used(sell, df, 0, 90.0)
+        assert not _fendi_used(sell, df, 2, 90.0)   # the old (from the BOS) count missed it
+
     def test_sell_is_the_mirror(self) -> None:
         sell = _NS(direction="SELL", top=100.0, bottom=98.0)  # SL level 100.6, BOS 90 (TP 90.3)
         bos = (92.0, 92.5, 89.0, 89.5)

@@ -213,7 +213,10 @@ def validate_strong_point(
         broken_swing, bos_idx = bos
         broken_at = df.index[bos_idx]
         if fendi:
-            if _fendi_used(refined, df, bos_idx, float(broken_swing.price)):
+            # From the end of the leg out, not the BOS: a touch before the
+            # BOS that then went on to the TP has used the zone too.
+            since = min(refined.source_pattern.impulse_after.end_index, bos_idx)
+            if _fendi_used(refined, df, since, float(broken_swing.price)):
                 failures.append("ZONE_USED_SINCE_BOS")
                 return _build_unvalidated(refined, failures)
         elif cfg.require_fresh_since_bos and _zone_touched_after(
@@ -368,20 +371,21 @@ def _zone_touched_after(
 
 
 def _fendi_used(
-    refined: RefinedZone, df: pd.DataFrame, bos_idx: int, bos_price: float,
+    refined: RefinedZone, df: pd.DataFrame, since_idx: int, bos_price: float,
     *, sl_frac: float = 0.3, tp_buffer: float = 0.3,
 ) -> bool:
-    """Fendi freshness (23 Nov 2026): True iff, after the BOS bar, price
-    reached the zone's SL level (``sl_frac`` of the zone height past the
-    far edge), or touched the zone and later reached its TP (the BOS
-    swing, ``tp_buffer`` early). Touches that don't go on to the TP leave
-    the zone fresh."""
-    if bos_idx + 1 >= len(df):
+    """Fendi freshness (23 Nov 2026): True iff, after bar ``since_idx``
+    (the end of the zone's leg out), price reached the zone's SL level
+    (``sl_frac`` of the zone height past the far edge), or touched the
+    zone and later reached its TP (the BOS swing, ``tp_buffer`` early),
+    whether that touch came before or after the BOS. Touches that don't go
+    on to the TP leave the zone fresh."""
+    if since_idx + 1 >= len(df):
         return False
     top, bottom = float(refined.top), float(refined.bottom)
     h = top - bottom
-    highs = df["high"].to_numpy()[bos_idx + 1:]
-    lows = df["low"].to_numpy()[bos_idx + 1:]
+    highs = df["high"].to_numpy()[since_idx + 1:]
+    lows = df["low"].to_numpy()[since_idx + 1:]
     if refined.direction == "BUY":
         if (lows <= bottom - sl_frac * h).any():
             return True
