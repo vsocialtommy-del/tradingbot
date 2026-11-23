@@ -1923,6 +1923,9 @@ class Bot:
             # Iterate over a copy so we can mutate the underlying list.
             remaining: list[tuple[ValidatedZone, UUID]] = []
             for zone, zid in queue:
+                if zid in self._traded_zone_ids:
+                    # Used while queued (e.g. a fill that gapped through it).
+                    continue
                 if plan is not None and plan.m5_priority and not is_flipped_retrade:
                     # An M5 trade can open beside an M1 trade (never two M5);
                     # an M1 trade only when nothing else is open.
@@ -2304,9 +2307,24 @@ class Bot:
         # * SELL Layer 1 = zone.bottom. Fires when price rises in from
         #        below → ask must be ≥ zone.bottom.
         #
-        # Overshoot (price past the FAR edge) is caught by the existing
-        # ``_detect_gap_through`` check in order_manager; this gate
-        # only covers the "not yet at zone" case.
+        # Overshoot (23 Nov 2026): price already past the FAR edge (BUY ask
+        # under zone.bottom, SELL bid over zone.top, beyond the gap
+        # tolerance). A market order would fill outside the zone and be
+        # closed straight away by ``_detect_gap_through`` (paying the
+        # spread), so don't fire: wait for price to come back in.
+        tol = self.order_manager_config.gap_tolerance_dollars
+        if (zone.direction == "BUY" and ask < zone.bottom - tol) or (
+            zone.direction == "SELL" and bid > zone.top + tol
+        ):
+            self._note_waiting_zone(zone)
+            far = (f"ask {ask:.2f} below zone.bottom" if zone.direction == "BUY"
+                   else f"bid {bid:.2f} above zone.top")
+            logger.info(
+                f"new setup deferred: {zone.direction} zone {zone.bottom:.2f}-"
+                f"{zone.top:.2f}, current {far} (past the far side); "
+                f"not firing into a gap"
+            )
+            return False
         if zone.direction == "BUY" and bid > zone.top:
             self._note_waiting_zone(zone)
             logger.info(
@@ -2651,6 +2669,14 @@ class Bot:
             f"new setup not placed: status={result.status} "
             f"errors={result.error_messages}"
         )
+        if any("GAP_THROUGH" in str(e) for e in (result.error_messages or [])):
+            # 23 Nov 2026: a fill that gapped through the zone uses the zone
+            # up. Retrying would open and close again every tick (19 times
+            # in 27 s on Claude FTMO), paying the spread each time.
+            self._traded_zone_ids.add(zone_id)
+            logger.warning(
+                f"zone {zone_id} used: Layer 1 gapped through it; not retrying"
+            )
         return False
 
     # ------------------------------------------------------------------ #

@@ -4722,3 +4722,69 @@ class TestSpikeVFvg:
         assert row.last_evaluation_result == {"timeframe": "M5", "kind": "FVG"}
         assert row.pattern_type == "RBD"
         assert _zone_to_input(z, kind="FVG").last_evaluation_result == {"kind": "FVG"}
+
+
+# --------------------------------------------------------------------------- #
+# 23 Nov 2026: no firing into a zone price has already gone through, and a
+# gap-through fill uses the zone up (Claude FTMO opened and closed a 0.01
+# 19 times in 27 s on a 0.21 pt SELL FVG while price sat above it).
+# --------------------------------------------------------------------------- #
+
+from bot.execution.order_manager import OrderPlacementResult as _PR
+
+
+class TestNoGapThroughLoop:
+    _plan_bot = TestClaudesPlan._plan_bot
+
+    def _sell_fvg(self, b, mocker):
+        _xautism(b)
+        f = _fvg("SELL", 3633.68, 3633.47, entry=3633.47, sl=3635.68, tp=3633.29)
+        mocker.patch("bot.main.fvg_scan", return_value=[f])
+        mocker.patch.object(b, "_persist_zone_if_new", return_value=uuid4())
+        (zone, zid), = b._fvg_candidates(make_ohlc(n=60), "M1")
+        return zone, zid
+
+    def test_sell_not_fired_when_bid_already_above_the_zone(self, bot, mocker, tmp_path) -> None:
+        b, _ = self._plan_bot(bot, tmp_path)
+        zone, zid = self._sell_fvg(b, mocker)
+        place = mocker.patch.object(b, "_place_xautism", return_value=True)
+        assert b._try_place_setup(zone, make_ohlc(n=60), zid, bid=3633.88, ask=3634.03) is False
+        place.assert_not_called()
+
+    def test_sell_still_fires_inside_the_tolerance(self, bot, mocker, tmp_path) -> None:
+        b, _ = self._plan_bot(bot, tmp_path)
+        zone, zid = self._sell_fvg(b, mocker)
+        place = mocker.patch.object(b, "_place_xautism", return_value=True)
+        assert b._try_place_setup(zone, make_ohlc(n=60), zid, bid=3633.59, ask=3633.74) is True
+        place.assert_called_once()
+
+    def test_buy_not_fired_when_ask_already_below_the_zone(self, bot, mocker, tmp_path) -> None:
+        b, _ = self._plan_bot(bot, tmp_path)
+        _xautism(b)
+        mocker.patch("bot.main.fvg_scan", return_value=[_fvg()])   # BUY 1948-1950
+        mocker.patch.object(b, "_persist_zone_if_new", return_value=uuid4())
+        (zone, zid), = b._fvg_candidates(make_ohlc(n=60), "M1")
+        place = mocker.patch.object(b, "_place_xautism", return_value=True)
+        assert b._try_place_setup(zone, make_ohlc(n=60), zid, bid=1947.7, ask=1947.8) is False
+        place.assert_not_called()
+
+    def test_gap_through_fill_uses_the_zone_up(self, bot, mocker, tmp_path) -> None:
+        b, _ = self._plan_bot(bot, tmp_path)
+        zone, zid = self._sell_fvg(b, mocker)
+        gap = _PR(status="SKIPPED", setup_id=uuid4(), layer_1_ticket=None, layer_2_trade_id=None,
+                  layer_3_trade_id=None, layer_1_filled_price=3633.88, sl_price=3635.68, tp1_price=3633.29,
+                  error_messages=["GAP_THROUGH_ZONE: filled at 3633.88 above zone.top=3633.68 + tolerance=0.05"])
+        om = mocker.patch("bot.main.place_xautism_orders", return_value=gap)
+        assert b._try_place_setup(zone, make_ohlc(n=60), zid, bid=3633.60, ask=3633.75) is False
+        assert zid in b._traded_zone_ids
+        # The queue skips it from now on: no second attempt.
+        b._pending_pipeline_zones = [(zone, zid)]
+        b._latest_ohlc = make_ohlc(n=60)
+        b._try_place_pending(bid=3633.60, ask=3633.75)
+        assert om.call_count == 1
+        assert b._pending_pipeline_zones == []          # dropped from the queue
+        # (Control: an unused zone in the same queue does get tried.)
+        b._traded_zone_ids.discard(zid)
+        b._pending_pipeline_zones = [(zone, zid)]
+        b._try_place_pending(bid=3633.60, ask=3633.75)
+        assert om.call_count == 2
