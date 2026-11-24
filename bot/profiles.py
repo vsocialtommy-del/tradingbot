@@ -247,6 +247,10 @@ def build_profile(name: str, risk: str | None = None, max_losses=None, *, plan: 
             )
             fixed = replace(cfg.risk, risk_pct=None, risk_per_trade=50.0,
                             count_first_layer_only_losses=False)
-            cfg = replace(cfg, plan=pc, risk=plan_risk(fixed, pc))
+            # 24 Nov 2026 (Tommy): its M5 W / M zones only trade with the H1
+            # trend (50 EMA); M1 zones and the FVG are unchanged. 12-month
+            # backtest (£50): +£21,601 vs +£19,822, max drawdown -£535 vs
+            # -£744, 5 red weeks of 53 vs 8, no losing month vs 1.
+            cfg = replace(cfg, plan=pc, risk=plan_risk(fixed, pc), h1_trend_ema_period=50)
         return cfg, m1_pipeline
     raise ValueError(f"unknown bot {name!r} (expected one of {sorted(ENV_FILES)})")

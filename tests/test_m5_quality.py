@@ -91,12 +91,17 @@ def test_summarise_day_counts_open_trades() -> None:
 # Profiles: M5 bot only
 # --------------------------------------------------------------------------- #
 
-def test_m5_bot_has_the_three_rules_claude_ftmo_does_not() -> None:
+def test_m5_bot_has_the_three_rules() -> None:
     m5 = build_profile("m5")[0]
     assert (m5.h1_trend_ema_period, m5.min_reward_frac, m5.risk.max_trades_per_day) == (50, 0.3, 3)
-    for cfg in (build_profile("m1")[0], build_profile("m1", plan=True)[0]):
-        assert cfg.h1_trend_ema_period is None and cfg.min_reward_frac is None
-        assert cfg.risk.max_trades_per_day is None
+
+
+def test_claude_ftmo_has_the_h1_trend_only() -> None:
+    ftmo = build_profile("m1", plan=True)[0]
+    assert ftmo.h1_trend_ema_period == 50
+    assert ftmo.min_reward_frac is None and ftmo.risk.max_trades_per_day is None
+    m1 = build_profile("m1")[0]
+    assert m1.h1_trend_ema_period is None and m1.min_reward_frac is None
 
 
 # --------------------------------------------------------------------------- #
@@ -157,3 +162,24 @@ def test_rules_off_trade_as_before(bot, mocker) -> None:  # noqa: F811
     assert b._try_place_setup(zone, make_ohlc(n=30), uuid4(), bid=1899.9, ask=1900.0) is True
     trend.assert_not_called()
     place.assert_called_once()
+
+
+def test_claude_ftmo_trend_only_checks_m5_wm_zones(bot, mocker) -> None:  # noqa: F811
+    b, _ = bot
+    place = _ready(b, mocker, tp=1905.0, frac=None)
+    b.config = replace(b.config, ohlc_timeframe="M1")
+    trend = mocker.patch("bot.main.h1_ema_trend", return_value="DOWN")
+    zone = make_zone_for_test(direction="BUY", top=1900.0, bottom=1895.0)
+    df = make_ohlc(n=30)
+    # An M1 zone: no H1 trend check.
+    assert b._try_place_setup(zone, df, uuid4(), bid=1899.9, ask=1900.0) is True
+    trend.assert_not_called()
+    # An M5 zone against the trend: skipped.
+    assert b._try_place_setup(zone, df, uuid4(), bid=1899.9, ask=1900.0, timeframe="M5") is False
+    # An M5 FVG: its own rules, no trend check.
+    trend.reset_mock()
+    mocker.patch.object(b, "_fvg_levels_for",
+                        return_value=TradeLevels(entry=1900.0, sl=1893.5, tp1=1905.0, sl_method="FVG"))
+    assert b._try_place_setup(zone, df, uuid4(), bid=1899.9, ask=1900.0, timeframe="M5") is True
+    trend.assert_not_called()
+    assert place.call_count == 2
