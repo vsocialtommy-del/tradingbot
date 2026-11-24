@@ -24,7 +24,9 @@ class TestProfiles:
         assert cfg.bot_name == "M5"
         assert cfg.ohlc_timeframe == "M5"
         # £100, 2 losses, -£300; 0.01-only losses don't count (16 Nov 2026)
-        assert cfg.risk == replace(base.risk, count_first_layer_only_losses=False)
+        # 24 Nov 2026: max 3 trades a day, H1 trend, TP at least 0.3 x the SL
+        assert cfg.risk == replace(base.risk, count_first_layer_only_losses=False, max_trades_per_day=3)
+        assert (cfg.h1_trend_ema_period, cfg.min_reward_frac) == (50, 0.3)
         # 12 Nov 2026: trend read on M5 (its own chart), fresh H1 exception
         assert cfg.direction_gate.trend_timeframe == "5min"
         assert cfg.direction_gate.enabled is False           # filter off by default

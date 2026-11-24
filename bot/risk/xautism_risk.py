@@ -65,6 +65,10 @@ class RiskConfig:
     max_daily_loss_pct: float | None = None
     """If set (e.g. 0.30), the daily loss limit is this share of the
     current balance instead of the fixed ``max_daily_loss``."""
+    max_trades_per_day: int | None = None
+    """Stop opening new trades once this many have been taken today (closed
+    today + still open), wins or losses. None = no cap. M5 bot: 3 (24 Nov
+    2026)."""
     room_check: bool = False
     """True = a hard daily limit: no new trade if the day's P&L minus that
     trade's risk would go past ``-max_daily_loss`` (at -£160 with £50 at
@@ -140,6 +144,8 @@ class DailyRisk:
     loss_streak_full: int = 0
     """Losing trades in a row, skipping 0.01-only losses (they neither add
     to the streak nor reset it). Used when those losses don't count."""
+    open_trades: int = 0
+    """Trades still open right now (for the trades-a-day cap)."""
 
     @property
     def total(self) -> float:
@@ -257,6 +263,7 @@ def summarise_day(
         loss_streak=streak,
         first_layer_only_losses=sum(1 for k, v in closed.items() if v < 0 and _first_layer_only(k)),
         loss_streak_full=streak_full,
+        open_trades=len(open_trades),
     )
 
 
@@ -269,6 +276,11 @@ def check_risk(daily: DailyRisk, config: RiskConfig) -> RiskVerdict:
         return RiskVerdict(True, (
             f"daily P&L {daily.total:.2f}: no room for a {config.risk_per_trade:.0f} trade "
             f"inside -{config.max_daily_loss:.0f}"
+        ), daily)
+    taken = daily.closed_trades + daily.open_trades
+    if config.max_trades_per_day and taken >= config.max_trades_per_day:
+        return RiskVerdict(True, (
+            f"{taken} trades taken today (max {config.max_trades_per_day})"
         ), daily)
     counted = daily.losing_trades
     if not config.count_first_layer_only_losses:
