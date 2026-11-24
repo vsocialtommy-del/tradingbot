@@ -337,9 +337,12 @@ class BotLoopConfig:
     this EMA of H1 closes (:mod:`bot.strategy.h1_trend`). None = off. M5
     bot: 50 (24 Nov 2026)."""
     min_reward_frac: float | None = None
-    """W / M zones: skip the zone if the TP is closer to the entry than
+    """M5 W / M zones: skip the zone if the TP is closer to the entry than
     this share of the SL distance (0.3 = TP at least 30% of the risk
-    away). None = off. M5 bot: 0.3 (24 Nov 2026)."""
+    away). None = off. M5 bot and Claude FTMO's M5 zones: 0.3 (24 Nov 2026)."""
+    min_reward_frac_m1: float | None = None
+    """The same for M1 W / M zones. None = off (24 Nov 2026: Claude FTMO
+    keeps every M1 zone until live slippage is measured)."""
     ohlc_timeframe: Literal["M1", "M5"] = "M5"
     """Entry timeframe: zones, the close exit and the layer logic all run
     on these bars. ``M5`` for the M5 bot, ``M1`` for the M1 bot
@@ -554,8 +557,10 @@ class Bot:
             + (f", max {rc.max_trades_per_day} trades a day" if rc.max_trades_per_day else "")
             + (f", M5 zones with the H1 trend ({self.config.h1_trend_ema_period} EMA)"
                if self.config.h1_trend_ema_period else "")
-            + (f", TP at least {self.config.min_reward_frac:g} x the SL distance"
+            + (f", M5 zones' TP at least {self.config.min_reward_frac:g} x the SL distance"
                if self.config.min_reward_frac else "")
+            + (f", M1 zones' TP at least {self.config.min_reward_frac_m1:g} x the SL distance"
+               if self.config.min_reward_frac_m1 else "")
         )
         if self.config.plan is not None:
             pc = self.config.plan
@@ -2507,8 +2512,11 @@ class Bot:
             )
             return False
         # 2b. Minimum reward (24 Nov 2026): skip a W / M zone whose TP is
-        # closer to the entry than ``min_reward_frac`` of the SL distance.
-        frac = self.config.min_reward_frac
+        # closer to the entry than ``min_reward_frac`` (M5 zones) /
+        # ``min_reward_frac_m1`` (M1 zones) of the SL distance.
+        frac = (self.config.min_reward_frac_m1
+                if (timeframe or self.config.ohlc_timeframe) == "M1"
+                else self.config.min_reward_frac)
         if frac and fvg_levels is None:
             reward, risk_pts = abs(tp1_price - entry_price), abs(entry_price - sl_price)
             if reward < frac * risk_pts:

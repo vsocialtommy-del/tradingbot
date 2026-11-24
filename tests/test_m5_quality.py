@@ -96,10 +96,11 @@ def test_m5_bot_has_the_three_rules() -> None:
     assert (m5.h1_trend_ema_period, m5.min_reward_frac, m5.risk.max_trades_per_day) == (50, 0.3, 3)
 
 
-def test_claude_ftmo_has_the_h1_trend_only() -> None:
+def test_claude_ftmo_has_the_h1_trend_and_m5_minimum_reward() -> None:
     ftmo = build_profile("m1", plan=True)[0]
     assert ftmo.h1_trend_ema_period == 50
-    assert ftmo.min_reward_frac is None and ftmo.risk.max_trades_per_day is None
+    assert ftmo.min_reward_frac == 0.3 and ftmo.min_reward_frac_m1 is None
+    assert ftmo.risk.max_trades_per_day is None
     m1 = build_profile("m1")[0]
     assert m1.h1_trend_ema_period is None and m1.min_reward_frac is None
 
@@ -182,4 +183,22 @@ def test_claude_ftmo_trend_only_checks_m5_wm_zones(bot, mocker) -> None:  # noqa
                         return_value=TradeLevels(entry=1900.0, sl=1893.5, tp1=1905.0, sl_method="FVG"))
     assert b._try_place_setup(zone, df, uuid4(), bid=1899.9, ask=1900.0, timeframe="M5") is True
     trend.assert_not_called()
+    assert place.call_count == 2
+
+
+def test_minimum_reward_is_per_timeframe(bot, mocker) -> None:  # noqa: F811
+    b, _ = bot
+    place = _ready(b, mocker, tp=1901.0, period=None)     # 1.0 for 6.5 = 0.15
+    b.config = replace(b.config, ohlc_timeframe="M1")
+    zone = make_zone_for_test(direction="BUY", top=1900.0, bottom=1895.0)
+    df = make_ohlc(n=30)
+    # M1 zone, no M1 rule: trades.
+    assert b._try_place_setup(zone, df, uuid4(), bid=1899.9, ask=1900.0) is True
+    # M5 zone: 0.15 < 0.3, skipped.
+    assert b._try_place_setup(zone, df, uuid4(), bid=1899.9, ask=1900.0, timeframe="M5") is False
+    # With an M1 rule of 0.1 the M1 zone still trades (0.15), at 0.2 it doesn't.
+    b.config = replace(b.config, min_reward_frac_m1=0.1)
+    assert b._try_place_setup(zone, df, uuid4(), bid=1899.9, ask=1900.0) is True
+    b.config = replace(b.config, min_reward_frac_m1=0.2)
+    assert b._try_place_setup(zone, df, uuid4(), bid=1899.9, ask=1900.0) is False
     assert place.call_count == 2

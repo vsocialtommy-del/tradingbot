@@ -251,6 +251,10 @@ def build_profile(name: str, risk: str | None = None, max_losses=None, *, plan: 
             # trend (50 EMA); M1 zones and the FVG are unchanged. 12-month
             # backtest (£50): +£21,601 vs +£19,822, max drawdown -£535 vs
             # -£744, 5 red weeks of 53 vs 8, no losing month vs 1.
-            cfg = replace(cfg, plan=pc, risk=plan_risk(fixed, pc), h1_trend_ema_period=50)
+            # Same evening: its M5 zones also skip a TP under 0.3 x the SL
+            # distance (as the M5 bot). 12-month backtest with the H1 trend:
+            # M5 zones 231 trades +£788 vs 466 trades +£764; M1 zones unchanged.
+            cfg = replace(cfg, plan=pc, risk=plan_risk(fixed, pc), h1_trend_ema_period=50,
+                          min_reward_frac=0.3)
         return cfg, m1_pipeline
     raise ValueError(f"unknown bot {name!r} (expected one of {sorted(ENV_FILES)})")
