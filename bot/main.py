@@ -138,7 +138,7 @@ from bot.strategy.strong_point import (
 )
 from bot.strategy.direction_gate import DirectionGateConfig, check_direction, tf_label, trend_summary
 from bot.strategy.h1_trend import allowed as h1_trend_allows
-from bot.strategy.h1_trend import h1_ema_trend
+from bot.strategy.h1_trend import h1_ema_summary, h1_ema_trend
 from bot.strategy.levels import LevelsConfig, TradeLevels, compute_levels
 from bot.strategy.stacked import StackedConfig, StackedPlan, stacked_plan
 from bot.risk.xautism_risk import (
@@ -2855,8 +2855,32 @@ class Bot:
         return views
 
     def _dashboard_trend(self) -> dict[str, Any] | None:
-        """The direction gate's current reading, recomputed once per new
-        candle (it only changes when a bar closes)."""
+        """The trend badge. With the H1 trend on (24 Nov 2026, both bots)
+        it shows the H1 50 EMA trend that filters M5 zones; otherwise the
+        direction gate's reading. Recomputed once per new candle."""
+        period = self.config.h1_trend_ema_period
+        if period:
+            df = (self._plan_m5_df if self.config.plan is not None
+                  and getattr(self, "_plan_m5_df", None) is not None
+                  else getattr(self, "_latest_ohlc", None))
+            if df is None or len(df) == 0:
+                return None
+            key = ("h1", df.index[-1], period)
+            cached = getattr(self, "_trend_cache", None)
+            if cached is not None and cached[0] == key:
+                return cached[1]
+            try:
+                summary = h1_ema_summary(df.iloc[:-1] if len(df) > 1 else df, period)
+            except Exception:  # noqa: BLE001
+                logger.debug("dashboard: H1 trend summary failed")
+                return None
+            offset = getattr(getattr(self, "daily_risk", None), "offset", None)
+            if summary.get("since") and isinstance(offset, timedelta):
+                summary["since"] = (pd.Timestamp(summary["since"]) - offset).isoformat()
+            summary["filter"] = "h1"
+            summary["applies_to"] = "M5 zones"
+            self._trend_cache = (key, summary)
+            return summary
         df = getattr(self, "_latest_ohlc", None)
         if df is None or len(df) == 0:
             return None

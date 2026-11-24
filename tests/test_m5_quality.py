@@ -202,3 +202,27 @@ def test_minimum_reward_is_per_timeframe(bot, mocker) -> None:  # noqa: F811
     b.config = replace(b.config, min_reward_frac_m1=0.2)
     assert b._try_place_setup(zone, df, uuid4(), bid=1899.9, ask=1900.0) is False
     assert place.call_count == 2
+
+
+def test_h1_summary_for_the_dashboard() -> None:
+    from bot.strategy.h1_trend import h1_ema_summary
+    n = 12 * 80
+    up = h1_ema_summary(_m5(np.linspace(3500, 3700, n)))
+    assert up["state"] == "UPTREND" and up["timeframe"] == "H1"
+    assert up["down_below"] == up["ema"] and up["up_above"] is None and up["ema"] < 3700
+    rows = list(np.linspace(3500, 3700, 12 * 79)) + list(np.linspace(3690, 3300, 12))
+    down = h1_ema_summary(_m5(rows))
+    assert down["state"] == "DOWNTREND" and down["up_above"] == down["ema"]
+    assert pd.Timestamp(down["since"]) == _m5(rows).index[-1] + pd.Timedelta(minutes=5)
+    assert h1_ema_summary(_m5(np.linspace(3500, 3700, 12 * 20)))["state"] == "RANGE"
+
+
+def test_dashboard_badge_is_the_h1_trend_when_on(bot, mocker) -> None:  # noqa: F811
+    b, _ = bot
+    b._latest_ohlc = _m5(np.linspace(3500, 3700, 12 * 80))
+    b.config = replace(b.config, h1_trend_ema_period=50)
+    t = b._dashboard_trend()
+    assert (t["state"], t["timeframe"], t["filter"]) == ("UPTREND", "H1", "h1")
+    b.config = replace(b.config, h1_trend_ema_period=None)
+    b._trend_cache = None
+    assert b._dashboard_trend()["filter"] != "h1"

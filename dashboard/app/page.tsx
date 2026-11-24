@@ -25,7 +25,8 @@ type StatusData = {
   next_buy?: Zone | null; next_sell?: Zone | null;
   plan?: { name: string; zones: string; daily_stop: number; drawdown_peak: number | null; m5_runner: string } | null;
   trend?: { state: "UPTREND" | "DOWNTREND" | "RANGE"; timeframe: string; rule: string;
-    since: string | null; up_above: number | null; down_below: number | null; filter?: string } | null;
+    since: string | null; up_above: number | null; down_below: number | null; filter?: string;
+    ema?: number | null; applies_to?: string } | null;
 };
 type Command = { id: number; command: string; status: string; created_at: string; finished_at: string | null; output: string | null };
 type BotRow = {
@@ -103,6 +104,9 @@ const lossesText = (v: string | number | null | undefined) =>
 // own chart or one step up.
 const TREND_TF: Record<string, [string, string]> = { M5: ["M5", "M15"], M1: ["M1", "M5"] };
 const filterOff = (t: StatusData["trend"]) => !t || t.filter === "off";
+// 24 Nov 2026: both bots' M5 zones only trade with the H1 trend (H1 close vs
+// its 50 EMA); the badge shows that one (filter "h1").
+const isH1 = (t: StatusData["trend"]) => !!t && t.filter === "h1";
 const trendFilterText = (bot: string, v?: string | null) => {
   const [own, higher] = TREND_TF[bot] ?? ["own chart", "higher"];
   return v === "own" ? `On · ${own}` : v === "higher" ? `On · ${higher}` : "Off";
@@ -112,6 +116,7 @@ function TrendBadge({ t }: { t: StatusData["trend"] }) {
   if (!t) return null;
   const cls = t.state === "UPTREND" ? "up" : t.state === "DOWNTREND" ? "down" : "range";
   const txt = t.state === "UPTREND" ? "▲ UP" : t.state === "DOWNTREND" ? "▼ DOWN" : "◆ RANGE";
+  if (isH1(t)) return <span className={`trend ${cls}`}>{txt} · H1</span>;
   return <span className={`trend ${cls}${filterOff(t) ? " info" : ""}`}>{txt} · {t.timeframe}{filterOff(t) ? " · info" : ""}</span>;
 }
 
@@ -436,7 +441,14 @@ function BotPopup({ b, now, trading, onClose, onToggle, onCommand, api, say, rel
           {d.trend ? (
             <>
               <TrendBadge t={d.trend} />{" "}
-              {filterOff(d.trend) ? "Trend filter is off, so this is info only: buys and sells are both allowed." :
+              {isH1(d.trend) ? <>
+                H1 closed {d.trend.state === "UPTREND" ? "above" : d.trend.state === "DOWNTREND" ? "below" : "near"} its 50 EMA
+                {d.trend.ema != null ? <> (<b>{d.trend.ema.toFixed(2)}</b>)</> : null}.{" "}
+                {d.trend.state === "UPTREND" ? "M5 zones: buys only, sells wait." :
+                  d.trend.state === "DOWNTREND" ? "M5 zones: sells only, buys wait." :
+                  "Not enough H1 candles yet, so M5 zones trade both ways."}
+                {b.bot === "M1" ? " M1 zones and the FVG trade both ways." : ""}
+              </> : filterOff(d.trend) ? "Trend filter is off, so this is info only: buys and sells are both allowed." :
                 d.trend.state === "RANGE" ? "No break yet, so buys and sells are both allowed." :
                 d.trend.state === "DOWNTREND" ? "Buys blocked (unless inside a fresh higher-timeframe zone)." :
                 "Sells blocked (unless inside a fresh higher-timeframe zone)."}
@@ -478,8 +490,8 @@ function BotPopup({ b, now, trading, onClose, onToggle, onCommand, api, say, rel
             <div className="edit">{b.maxLosses ? "SET HERE · TAP TO CHANGE" : "BOT DEFAULT · TAP TO CHANGE"}</div>
           </button>
           <button className="field wide" onClick={() => setEditing(true)} disabled={!b.configured || !!b.error}>
-            <label>Trend filter</label>
-            <div>{trendFilterText(b.bot, d.trend?.filter ?? b.trendFilter)}</div>
+            <label>Extra BOS trend filter</label>
+            <div>{trendFilterText(b.bot, isH1(d.trend) ? b.trendFilter : (d.trend?.filter ?? b.trendFilter))}</div>
             <div className="edit">{b.trendFilter ? "SET HERE · TAP TO CHANGE" : "BOT DEFAULT · TAP TO CHANGE"}</div>
           </button>
         </div>
@@ -574,14 +586,15 @@ function SettingsEditor({ b, onClose, api, say, reload }: {
             <button key={l} className={`chip ${losses === l ? "on" : ""}`} onClick={() => setLosses(l)}>{lossesText(l)}</button>
           ))}
         </div>
-        <h3>TREND FILTER</h3>
+        <h3>EXTRA BOS TREND FILTER</h3>
         <div className="chips">
           <button className={`chip ${trend === "off" ? "on" : ""}`} onClick={() => setTrend("off")}>Off</button>
           <button className={`chip ${trend === "own" ? "on" : ""}`} onClick={() => setTrend("own")}>On · {own}</button>
           <button className={`chip ${trend === "higher" ? "on" : ""}`} onClick={() => setTrend("higher")}>On · {higher}</button>
         </div>
         <p className="note">
-          Off = takes every zone, the trend badge is info only. On = no buys in a downtrend or sells in an uptrend on
+          The H1 trend (50 EMA) on M5 zones is always on. This is an extra, older filter on top: off = no extra
+          check. On = no buys in a BOS downtrend or sells in a BOS uptrend on
           that chart, unless the zone is inside a fresh {b.bot === "M1" ? "M15" : "H1"} zone.
         </p>
         <p className="note">
