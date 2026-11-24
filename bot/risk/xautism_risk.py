@@ -20,6 +20,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Callable
 
 from loguru import logger
@@ -69,6 +70,10 @@ class RiskConfig:
     """Stop opening new trades once this many have been taken today (closed
     today + still open), wins or losses. None = no cap. M5 bot: 3 (24 Nov
     2026)."""
+    day_reset: str = "new_york"
+    """When the day's P&L starts again: "new_york" = 17:00 New York (22:00
+    UK, the broker's day), "ftmo" = 00:00 Prague time (23:00 UK), the day
+    FTMO's 3% daily loss uses. Claude FTMO: "ftmo" (24 Nov 2026)."""
     room_check: bool = False
     """True = a hard daily limit: no new trade if the day's P&L minus that
     trade's risk would go past ``-max_daily_loss`` (at -£160 with £50 at
@@ -159,10 +164,24 @@ class RiskVerdict:
     daily: DailyRisk | None = None
 
 
-def trading_day_start(now: datetime) -> datetime:
+FTMO_TIMEZONE = ZoneInfo("Europe/Prague")
+"""FTMO resets its daily loss at 00:00 CE(S)T."""
+
+
+def trading_day_start(now: datetime, day_reset: str = "new_york") -> datetime:
+    if day_reset == "ftmo":
+        local = now.astimezone(FTMO_TIMEZONE)
+        start = datetime(local.year, local.month, local.day, tzinfo=FTMO_TIMEZONE)
+        return start.astimezone(timezone.utc)
     day = current_trading_date(now)
     start_et = datetime(day.year, day.month, day.day, DAILY_RESET_HOUR, tzinfo=ET_TIMEZONE)
     return start_et.astimezone(timezone.utc)
+
+
+def trading_day_label(now: datetime, day_reset: str = "new_york") -> str:
+    if day_reset == "ftmo":
+        return str(now.astimezone(FTMO_TIMEZONE).date())
+    return str(current_trading_date(now))
 
 
 def summarise_day(
@@ -331,7 +350,7 @@ class DailyRiskTracker:
         mono = time.monotonic()
         if self._cached is not None and mono - self._cached[0] < self._cache_seconds:
             return self._cached[1]
-        start = trading_day_start(now)
+        start = trading_day_start(now, config.day_reset)
         self._update_offset(now)
         try:
             # Deal times are server time, so "up to now" in UTC would miss
@@ -347,7 +366,7 @@ class DailyRiskTracker:
             return RiskVerdict(True, "MT5 history unavailable")
         daily = summarise_day(
             deals, positions, magic=magic, day_start=start + self._offset,
-            trading_day=str(current_trading_date(now)),
+            trading_day=trading_day_label(now, config.day_reset),
             known=self._known,
         )
         verdict = check_risk(daily, config)
