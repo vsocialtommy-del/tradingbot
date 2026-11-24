@@ -3355,11 +3355,14 @@ def _zone_tag(zone_row: Any) -> str | None:
 
 def plan_risk(risk: RiskConfig, plan: PlanConfig) -> RiskConfig:
     """Claude's plan risk rules over whatever £ risk is set: -£200 hard
-    daily stop with the room check, no loss count, no streak stop."""
+    daily stop with the room check, no loss count, no streak stop. The day
+    starts at 00:00 Prague time (23:00 UK) like FTMO's daily loss, so a
+    -£200 evening can't run on into a fresh bot day at 22:00 UK and add up
+    to more than FTMO's 3% (24 Nov 2026)."""
     return replace(
         risk, max_daily_loss=plan.daily_stop, room_check=True,
         max_losses_per_day=50, max_loss_streak=None,
-        max_daily_loss_pct=None,
+        max_daily_loss_pct=None, day_reset="ftmo",
     )
 
 
