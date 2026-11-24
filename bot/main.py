@@ -137,6 +137,8 @@ from bot.strategy.strong_point import (
     compute_sl_price,
 )
 from bot.strategy.direction_gate import DirectionGateConfig, check_direction, tf_label, trend_summary
+from bot.strategy.h1_trend import allowed as h1_trend_allows
+from bot.strategy.h1_trend import h1_ema_trend
 from bot.strategy.levels import LevelsConfig, TradeLevels, compute_levels
 from bot.strategy.stacked import StackedConfig, StackedPlan, stacked_plan
 from bot.risk.xautism_risk import (
@@ -330,6 +332,14 @@ class BotLoopConfig:
     """Claude's plan (19 Nov 2026, M1 bot): also trade M5 zones, runner
     doesn't block, -£200 room-checked dead stop, drawdown breaker. See
     :mod:`bot.plan`. None = the bot as before."""
+    h1_trend_ema_period: int | None = None
+    """M5 W / M zones only trade with the H1 trend: last closed H1 close vs
+    this EMA of H1 closes (:mod:`bot.strategy.h1_trend`). None = off. M5
+    bot: 50 (24 Nov 2026)."""
+    min_reward_frac: float | None = None
+    """W / M zones: skip the zone if the TP is closer to the entry than
+    this share of the SL distance (0.3 = TP at least 30% of the risk
+    away). None = off. M5 bot: 0.3 (24 Nov 2026)."""
     ohlc_timeframe: Literal["M1", "M5"] = "M5"
     """Entry timeframe: zones, the close exit and the layer logic all run
     on these bars. ``M5`` for the M5 bot, ``M1`` for the M1 bot
@@ -507,6 +517,10 @@ class Bot:
         # backtest's ``traded_keys``: a zone is traded once, ever.
         # Hydrated from Supabase on startup.
         self._traded_zone_ids: set[UUID] = set()
+        self._low_reward_zone_ids: set[UUID] = set()
+        """Zones skipped for a TP too close to the entry: their TP, entry
+        and SL don't change, so they are never tried again (as backtested)."""
+        self._h1_skip_logged: dict[UUID, str] = {}
         self._last_bad_tick_log: datetime | None = None
         self._jump_since: datetime | None = None
 
@@ -537,6 +551,11 @@ class Bot:
                f"{xc.runner_keep_frac * 100:.0f}% trails {xc.runner_trail_points:g} pts"
                if xc.runner_enabled else "off")
             + f", candle close exit {'on' if xc.m5_close_exit else 'off (30% SL only)'}"
+            + (f", max {rc.max_trades_per_day} trades a day" if rc.max_trades_per_day else "")
+            + (f", M5 zones with the H1 trend ({self.config.h1_trend_ema_period} EMA)"
+               if self.config.h1_trend_ema_period else "")
+            + (f", TP at least {self.config.min_reward_frac:g} x the SL distance"
+               if self.config.min_reward_frac else "")
         )
         if self.config.plan is not None:
             pc = self.config.plan
@@ -2254,6 +2273,8 @@ class Bot:
                 f"{zone.bottom:.2f}-{zone.top:.2f} already traded"
             )
             return False
+        if zone_id in self._low_reward_zone_ids:
+            return False
         fvg_levels = self._fvg_levels_for(zone)
         if (
             not is_flipped_retrade
@@ -2387,6 +2408,20 @@ class Bot:
                 f"{zone.bottom:.2f}-{zone.top:.2f} {decision.reason}"
             )
 
+        # 0d. H1 trend (24 Nov 2026, M5 bot): M5 W / M zones only trade with
+        # the H1 trend (last closed H1 close vs its 50 EMA).
+        period = self.config.h1_trend_ema_period
+        if period and fvg_levels is None and (timeframe or self.config.ohlc_timeframe) == "M5":
+            trend = h1_ema_trend(ohlc_df.iloc[:-1] if len(ohlc_df) > 1 else ohlc_df, period)
+            if not h1_trend_allows(zone.direction, trend):
+                msg = (f"new setup skipped: {zone.direction} zone "
+                       f"{zone.bottom:.2f}-{zone.top:.2f} against the H1 trend "
+                       f"({trend}, {period} EMA)")
+                if self._h1_skip_logged.get(zone_id) != msg:
+                    self._h1_skip_logged[zone_id] = msg
+                    logger.info(msg)
+                return False
+
         # 1. SL — zone-bound formula (loosened-rules PR).
         sp_cfg = StrongPointConfig(
             sl_buffer_points=self.sl_manager_config.sl_buffer_points,
@@ -2471,6 +2506,20 @@ class Bot:
                 f"entry {entry_price:.2f}"
             )
             return False
+        # 2b. Minimum reward (24 Nov 2026): skip a W / M zone whose TP is
+        # closer to the entry than ``min_reward_frac`` of the SL distance.
+        frac = self.config.min_reward_frac
+        if frac and fvg_levels is None:
+            reward, risk_pts = abs(tp1_price - entry_price), abs(entry_price - sl_price)
+            if reward < frac * risk_pts:
+                self._low_reward_zone_ids.add(zone_id)
+                logger.info(
+                    f"new setup skipped: {zone.direction} zone "
+                    f"{zone.bottom:.2f}-{zone.top:.2f} TP {tp1_price:.2f} only "
+                    f"{reward:.2f} pts from entry {entry_price:.2f} for "
+                    f"{risk_pts:.2f} pts of risk (needs {frac:g} x)"
+                )
+                return False
         if self.config.xautism_entries.enabled:
             return self._place_xautism(
                 zone, zone_id, entry_price=entry_price,

@@ -167,7 +167,15 @@ def build_profile(name: str, risk: str | None = None, max_losses=None, *, plan: 
             direction_gate=trend_gate(base.direction_gate, "M5", "off"),
             # 16 Nov 2026: a 0.01-only loss (layer 2 never filled) doesn't
             # use up one of the 2 losses a day. The daily £ limit still counts it.
-            risk=replace(base.risk, count_first_layer_only_losses=False),
+            # 24 Nov 2026: max 3 trades a day (see h1_trend_ema_period below).
+            risk=replace(base.risk, count_first_layer_only_losses=False, max_trades_per_day=3),
+            # 24 Nov 2026 (Tommy): only trade with the H1 trend (50 EMA), max 3
+            # trades a day, and skip zones whose TP is under 0.3 x the SL
+            # distance. 12-month backtest (£50 a trade): +£737 from 205 trades,
+            # £3.60 a trade, max drawdown -£448; live rules then +£358 from 862
+            # trades, £0.42 a trade, -£871.
+            h1_trend_ema_period=50,
+            min_reward_frac=0.3,
             # 19 Nov 2026: look back 100,000 M5 bars (about 17 months, was
             # 5000 = 3.5 weeks) so still-fresh zones from when price was last
             # at these levels (e.g. Sep 2025 demand) can be traded. Needs MT5
