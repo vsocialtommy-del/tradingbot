@@ -74,6 +74,12 @@ class RiskConfig:
     """When the day's P&L starts again: "new_york" = 17:00 New York (22:00
     UK, the broker's day), "ftmo" = 00:00 Prague time (23:00 UK), the day
     FTMO's 3% daily loss uses. Claude FTMO: "ftmo" (24 Nov 2026)."""
+    giveback_after: float | None = None
+    """Profit lock (25 Nov 2026, Claude FTMO): once the day's closed P&L has
+    reached this (e.g. +£100), no new trades if it falls back to
+    ``giveback_keep`` of the day's best (half: best +£100 stops at +£50,
+    best +£200 at +£100). Open trades keep running. None = off."""
+    giveback_keep: float = 0.5
     room_check: bool = False
     """True = a hard daily limit: no new trade if the day's P&L minus that
     trade's risk would go past ``-max_daily_loss`` (at -£160 with £50 at
@@ -151,6 +157,8 @@ class DailyRisk:
     to the streak nor reset it). Used when those losses don't count."""
     open_trades: int = 0
     """Trades still open right now (for the trades-a-day cap)."""
+    realised_peak: float = 0.0
+    """The day's best closed P&L so far (for the profit lock)."""
 
     @property
     def total(self) -> float:
@@ -235,21 +243,30 @@ def summarise_day(
         in_lots[key] = None if vol is None or prev is None else prev + float(vol)
 
     realised = 0.0
+    peak = 0.0
     net: dict[str, float] = {}
     last_close: dict[str, float] = {}
-    for d in deals:
-        if d.get("entry") not in (DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT, DEAL_ENTRY_OUT_BY):
-            continue
+    for d in sorted(deals, key=lambda x: float(x.get("time", 0))):
         pos = d.get("position_id")
-        if pos not in trade_of_pos:
+        if pos not in trade_of_pos or float(d.get("time", 0)) < start_ts:
             continue
-        if float(d.get("time", 0)) < start_ts:
+        if d.get("entry") == DEAL_ENTRY_IN:
+            # Commission charged on the way in (FTMO) counts too, so the
+            # day's P&L matches MT5's profit + commission.
+            cost = float(d.get("commission", 0.0)) + float(d.get("fee", 0.0))
+            if cost:
+                realised += cost
+                key = trade_of_pos[pos]
+                net[key] = net.get(key, 0.0) + cost
+            continue
+        if d.get("entry") not in (DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT, DEAL_ENTRY_OUT_BY):
             continue
         pnl = (
             float(d.get("profit", 0.0)) + float(d.get("commission", 0.0))
             + float(d.get("swap", 0.0)) + float(d.get("fee", 0.0))
         )
         realised += pnl
+        peak = max(peak, realised)
         key = trade_of_pos[pos]
         net[key] = net.get(key, 0.0) + pnl
         last_close[key] = max(last_close.get(key, 0.0), float(d.get("time", 0)))
@@ -283,6 +300,7 @@ def summarise_day(
         first_layer_only_losses=sum(1 for k, v in closed.items() if v < 0 and _first_layer_only(k)),
         loss_streak_full=streak_full,
         open_trades=len(open_trades),
+        realised_peak=round(peak, 2),
     )
 
 
@@ -295,6 +313,12 @@ def check_risk(daily: DailyRisk, config: RiskConfig) -> RiskVerdict:
         return RiskVerdict(True, (
             f"daily P&L {daily.total:.2f}: no room for a {config.risk_per_trade:.0f} trade "
             f"inside -{config.max_daily_loss:.0f}"
+        ), daily)
+    if (config.giveback_after is not None and daily.realised_peak >= config.giveback_after
+            and daily.realised <= config.giveback_keep * daily.realised_peak):
+        return RiskVerdict(True, (
+            f"profit lock: today's best +{daily.realised_peak:.2f}, now "
+            f"{daily.realised:+.2f} (stops at {config.giveback_keep * daily.realised_peak:+.2f})"
         ), daily)
     taken = daily.closed_trades + daily.open_trades
     if config.max_trades_per_day and taken >= config.max_trades_per_day:

@@ -570,7 +570,11 @@ class Bot:
                 f"{(1 - pc.m5_entries.runner_keep_frac) * 100:.0f}/{pc.m5_entries.runner_keep_frac * 100:.0f} "
                 f"{pc.m5_entries.runner_trail_points:g} pt trail; one trade at a time"
                 f"{', a risk-free runner does not block' if pc.runner_frees_slot else ''}; "
-                f"-£{pc.daily_stop:.0f} dead stop with room check; drawdown breaker "
+                f"-£{pc.daily_stop:.0f} dead stop with room check; "
+                + (f"profit lock: after +£{pc.profit_lock_after:.0f}, stop at "
+                   f"{pc.profit_lock_keep * 100:.0f}% of the day's best; "
+                   if pc.profit_lock_after is not None else "")
+                + "drawdown breaker "
                 + ", ".join(f"x{m:g} at -£{b:.0f}" for b, m in sorted(pc.drawdown_steps))
             )
         self.mt5.connect()
@@ -3363,6 +3367,7 @@ def plan_risk(risk: RiskConfig, plan: PlanConfig) -> RiskConfig:
         risk, max_daily_loss=plan.daily_stop, room_check=True,
         max_losses_per_day=50, max_loss_streak=None,
         max_daily_loss_pct=None, day_reset="ftmo",
+        giveback_after=plan.profit_lock_after, giveback_keep=plan.profit_lock_keep,
     )
 
 
