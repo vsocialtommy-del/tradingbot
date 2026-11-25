@@ -33,6 +33,13 @@ What happens here, every tick, for each ACTIVE runner-mode setup:
    when price comes back to the stop; :meth:`PositionTracker.detect_closed_positions`
    then closes the row and the setup as usual.
 
+Spread (fix 25 Nov 2026): a stop has to sit on the far side of the
+spread (above the ask for a sell, below the bid for a buy) plus the
+broker's stops level, or MT5 rejects it ("Invalid stops"). When the
+breakeven / trail level isn't allowed yet, the stop goes to the closest
+level MT5 accepts, and moves on to breakeven as soon as price allows. A
+runner is never left on its full SL because the move was rejected.
+
 Restart-safe: the trail lives in the broker SL. A runner is recognised
 after a restart by its SL sitting at or beyond its entry, and step 2 is
 idempotent if it ever runs twice.
@@ -68,6 +75,18 @@ def _beyond_tp(direction: str, bid: float, ask: float, tp: float) -> bool:
     return bid >= tp if direction == "BUY" else ask <= tp
 
 
+STOP_BUFFER = 0.05
+"""Extra distance past the spread / stops level for a stop to be accepted."""
+
+
+def allowed_sl(direction: str, want: float, bid: float, ask: float, min_gap: float) -> float:
+    """``want`` if MT5 accepts it now, else the closest stop it does."""
+    gap = max(min_gap, 0.0) + STOP_BUFFER
+    if direction == "BUY":
+        return round(min(want, bid - gap), 2)
+    return round(max(want, ask + gap), 2)
+
+
 def _sl_locked(direction: str, sl: float, entry: float) -> bool:
     """SL at breakeven or better (only true once the runner has started)."""
     if not sl:
@@ -91,6 +110,7 @@ class RunnerTrailManager:
         self._config = config or XautismEntryConfig()
         self._symbol = symbol
         self._runners: dict[UUID, _Runner] = {}
+        self._failed: set[tuple[int, float]] = set()
         self.trail_for: Any = None
         """Optional ``setup -> trail points`` (Claude's plan: M5 setups
         trail 4 pts, M1 setups 2 pts). None = ``runner_trail_points``."""
@@ -100,6 +120,23 @@ class RunnerTrailManager:
         """Setups whose runner has started (TP1 hit, stop at breakeven or
         better): risk-free, so Claude's plan lets a new trade open."""
         return set(self._runners)
+
+    def _min_gap(self) -> float:
+        try:
+            return float(self._mt5.get_min_stop_distance(self._symbol) or 0.0)
+        except Exception:
+            return 0.0
+
+    def _move_sl(self, ticket: int, sl: float) -> bool:
+        """Move a stop; a rejected move is logged once per level, not every tick."""
+        try:
+            self._mt5.modify_order(ticket, sl=sl)
+            return True
+        except Exception as exc:
+            if (ticket, sl) not in self._failed:
+                self._failed.add((ticket, sl))
+                logger.warning(f"runner: SL move to {sl:.2f} rejected for {ticket}: {exc}")
+            return False
 
     def _trail(self, setup: Setup) -> float:
         if self.trail_for is not None:
@@ -193,7 +230,7 @@ class RunnerTrailManager:
             if started:
                 state = self._runners[setup.id] = _Runner(best=price)
             elif _beyond_tp(direction, bid, ask, tp):
-                return self._start(setup, trades, open_trades, positions, price)
+                return self._start(setup, trades, open_trades, positions, price, bid, ask)
             else:
                 return None
 
@@ -201,6 +238,7 @@ class RunnerTrailManager:
         state.best = max(state.best, price) if direction == "BUY" else min(state.best, price)
         trail = self._trail(setup)
         step = self._config.runner_trail_step
+        gap = self._min_gap()
         moved: list[str] = []
         for t in open_trades:
             if t.layer_number == 2 and positions[t.mt5_ticket].get("tp"):
@@ -209,17 +247,14 @@ class RunnerTrailManager:
             entry = float(pos["price_open"])
             cur = float(pos.get("sl") or 0.0)
             if direction == "BUY":
-                new = round(max(entry, state.best - trail), 2)
+                new = allowed_sl(direction, max(entry, state.best - trail), bid, ask, gap)
                 better = (not cur) or new >= cur + step
             else:
-                new = round(min(entry, state.best + trail), 2)
+                new = allowed_sl(direction, min(entry, state.best + trail), bid, ask, gap)
                 better = (not cur) or new <= cur - step
             if not better:
                 continue
-            try:
-                self._mt5.modify_order(t.mt5_ticket, sl=new)  # type: ignore[arg-type]
-            except Exception:
-                logger.exception(f"runner: SL move to {new} failed for {t.mt5_ticket}")
+            if not self._move_sl(t.mt5_ticket, new):  # type: ignore[arg-type]
                 continue
             moved.append(f"L{t.layer_number} {cur:.2f}→{new:.2f}")
         if moved:
@@ -234,8 +269,12 @@ class RunnerTrailManager:
         open_trades: list[Trade],
         positions: dict[int, dict[str, Any]],
         price: float,
+        bid: float | None = None,
+        ask: float | None = None,
     ) -> RunnerEvent:
         direction = setup.direction
+        bid = price if bid is None else bid
+        ask = price if ask is None else ask
         # 1. Waiting layer 2 / runner stops are no longer wanted.
         for t in trades:
             if t.status == "WAITING":
@@ -266,13 +305,16 @@ class RunnerTrailManager:
             # 2b. Only the 0.01 is in: it becomes the runner.
             runners = [t for t in open_trades if t.layer_number == 1]
 
-        # 3. Runner SL to breakeven.
+        # 3. Runner SL to breakeven, or as close as the spread allows
+        #    (the trail moves it on to breakeven as soon as it can).
+        gap = self._min_gap()
         for t in runners:
             entry = float(positions[t.mt5_ticket]["price_open"])
-            try:
-                self._mt5.modify_order(t.mt5_ticket, sl=round(entry, 2))  # type: ignore[arg-type]
-            except Exception:
-                logger.exception(f"runner: breakeven move failed for {t.mt5_ticket}")
+            sl = allowed_sl(direction, entry, bid, ask, gap)
+            if sl != round(entry, 2):
+                logger.info(f"runner: breakeven {entry:.2f} inside the spread, SL to {sl:.2f} for now "
+                            f"({t.mt5_ticket})")
+            self._move_sl(t.mt5_ticket, sl)  # type: ignore[arg-type]
 
         self._runners[setup.id] = _Runner(best=price)
         who = ", ".join(f"L{t.layer_number} {t.lot_size} lots" for t in runners) or "none"
