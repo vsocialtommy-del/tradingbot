@@ -21,6 +21,9 @@ Runs on the M1 bot's account (``--bot m1``). Backtested 28 Jul - 13 Nov
   room check: no trade opens if the day's P&L minus that trade's risk
   would go below -£200. No losses-a-day count, no losses-in-a-row stop,
   no profit target.
+* **Profit lock** (25 Nov 2026): once the day's closed P&L reaches
+  +£100, no new trades if it falls back to half the day's best. Open
+  trades keep running.
 * **Human FVG** (23 Nov 2026): also trades one FVG per shift in
   structure: a sweep of obvious liquidity, the first BOS against the
   trend (a lower high broken for a BUY), then the first gap in that
@@ -66,6 +69,14 @@ class PlanConfig:
     ))
     """M5 trades: 75% at TP1, 25% trails 4 pts (as the M5 bot)."""
     daily_stop: float = 200.0
+    profit_lock_after: float | None = 100.0
+    """25 Nov 2026 (Tommy): once the day's closed P&L (after commission)
+    reaches +£100, no new trades if it falls back to half the day's best
+    (best +£100 stops at +£50, +£200 at +£100, +£400 at +£200). Open
+    trades keep running; starts again at 23:00 UK. None = off.
+    12-month backtest (£50, demo costs): +£20,533 vs +£21,872 without,
+    27 days stopped, no day that reached +£200 was cut short."""
+    profit_lock_keep: float = 0.5
     runner_frees_slot: bool = True
     m5_priority: bool = True
     """19 Nov 2026: an M5 trade can open beside an open M1 trade (never two
