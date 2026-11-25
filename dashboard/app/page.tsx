@@ -7,6 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 type Zone = {
   direction: "BUY" | "SELL"; top: number; bottom: number; entry: number;
   sl: number | null; tp1: number | null; distance: number;
+  tf?: string | null;   // M5 / M1 / FVG
 };
 type Position = {
   ticket: number; direction: string; volume: number; entry: number;
@@ -356,9 +357,13 @@ function BotCard({ b, now, trading, onOpen, onToggle }: {
       <div className="kv"><label>Balance</label><b>{d.account ? money(d.account.balance, cur) : "–"}</b></div>
       <div className="kv"><label>Today</label><b className={today ? tone(today.realised) : ""}>{today ? signed(today.realised, cur) : "–"}</b></div>
       <div className="kv"><label>W / L today</label><b>{today ? `${today.wins ?? 0}/${today.losses}` : "–"}</b></div>
+      {/* Only the zones the bot would take right now (25 Nov 2026): M5
+          zones against the H1 trend and low-reward zones are left out. */}
       <div className="zn">
-        <span className="b">BUY</span> {d.next_buy ? <>{d.next_buy.entry.toFixed(2)} · <em>{pts(d.next_buy.distance)} pts</em></> : "none"}<br />
-        <span className="s">SELL</span> {d.next_sell ? <>{d.next_sell.entry.toFixed(2)} · <em>{pts(d.next_sell.distance)} pts</em></> : "none"}
+        {d.next_buy ? <><span className="b">BUY</span> {d.next_buy.entry.toFixed(2)}{d.next_buy.tf ? ` · ${d.next_buy.tf}` : ""} · <em>{pts(d.next_buy.distance)} pts</em></> : null}
+        {d.next_buy && d.next_sell ? <br /> : null}
+        {d.next_sell ? <><span className="s">SELL</span> {d.next_sell.entry.toFixed(2)}{d.next_sell.tf ? ` · ${d.next_sell.tf}` : ""} · <em>{pts(d.next_sell.distance)} pts</em></> : null}
+        {!d.next_buy && !d.next_sell ? "No zone it would take right now" : null}
       </div>
       <div className="tap-hint">TAP FOR MORE</div>
     </div>
@@ -370,7 +375,7 @@ function BotCard({ b, now, trading, onOpen, onToggle }: {
 function ZoneBox({ z, dir }: { z: Zone | null | undefined; dir: "BUY" | "SELL" }) {
   return (
     <div className={`zone ${dir === "BUY" ? "buy" : "sell"}`}>
-      <div className="t">{dir}</div>
+      <div className="t">{dir}{z?.tf ? ` · ${z.tf}` : ""}</div>
       {z ? (
         <>
           <div className="p">{z.bottom.toFixed(2)} – {z.top.toFixed(2)}</div>
@@ -382,7 +387,7 @@ function ZoneBox({ z, dir }: { z: Zone | null | undefined; dir: "BUY" | "SELL" }
       ) : (
         <>
           <div className="p">None waiting</div>
-          <div className="m">No {dir.toLowerCase()} zone {dir === "BUY" ? "below" : "above"} price</div>
+          <div className="m">No {dir.toLowerCase()} zone it would take right now</div>
         </>
       )}
     </div>

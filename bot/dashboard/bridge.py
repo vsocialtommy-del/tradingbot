@@ -155,9 +155,12 @@ class ZoneView:
     sl: float | None
     tp1: float | None
     distance: float
+    tf: str | None = None
+    """M5 / M1 / FVG: which kind of zone it is (shown on the card)."""
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "tf": self.tf,
             "direction": self.direction,
             "top": round(self.top, 2),
             "bottom": round(self.bottom, 2),

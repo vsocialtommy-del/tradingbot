@@ -2837,25 +2837,53 @@ class Bot:
         seen = getattr(self, "_deferred_seen", {})
         cutoff = time.monotonic() - 15.0
         views: list[ZoneView] = []
+        period = self.config.h1_trend_ema_period
+        trends: dict[int, Any] = {}
         for zone, _zid in list(self._pending_pipeline_zones):
             zdf = df
-            if self.config.plan is not None and self._zone_timeframe(_zid) == "M5":
-                zdf = self._plan_m5_df
+            tf = self.config.ohlc_timeframe
+            if self.config.plan is not None:
+                tf = self._zone_timeframe(_zid) or tf
+                if tf == "M5":
+                    zdf = self._plan_m5_df
             key = (zone.direction, round(float(zone.top), 2), round(float(zone.bottom), 2))
             if seen.get(key, 0.0) < cutoff:
                 continue
+            # 25 Nov 2026 (Tommy): only show zones the bot would actually
+            # take right now. M5 W / M zones against the H1 trend and zones
+            # under the minimum reward are left out (M1 zones and FVGs
+            # still trade both ways on Claude FTMO, so they stay).
+            if _zid in self._low_reward_zone_ids:
+                continue
+            try:
+                fvg = self._fvg_levels_for(zone)
+            except Exception:
+                fvg = None
+            if period and fvg is None and tf == "M5" and zdf is not None and len(zdf):
+                if id(zdf) not in trends:
+                    try:
+                        trends[id(zdf)] = h1_ema_trend(zdf.iloc[:-1] if len(zdf) > 1 else zdf, period)
+                    except Exception:
+                        trends[id(zdf)] = None
+                if not h1_trend_allows(zone.direction, trends[id(zdf)]):
+                    continue
             buy = zone.direction == "BUY"
             entry = float(zone.top) if buy else float(zone.bottom)
             sl = tp1 = None
             if zdf is not None and len(zdf):
                 try:
-                    lv = self._fvg_levels_for(zone) or compute_levels(zone, zdf, self.config.levels)
+                    lv = fvg or compute_levels(zone, zdf, self.config.levels)
                     entry, sl, tp1 = lv.entry, lv.sl, lv.tp1
                 except Exception:
                     pass
+            frac = (self.config.min_reward_frac_m1 if tf == "M1" else self.config.min_reward_frac)
+            if (frac and fvg is None and sl is not None and tp1 is not None
+                    and abs(tp1 - entry) < frac * abs(entry - sl)):
+                continue
             dist = (bid - entry) if buy else (entry - ask)
             views.append(ZoneView(zone.direction, float(zone.top), float(zone.bottom),
-                                  entry, sl, tp1, max(dist, 0.0)))
+                                  entry, sl, tp1, max(dist, 0.0),
+                                  tf="FVG" if fvg is not None else tf))
         return views
 
     def _dashboard_trend(self) -> dict[str, Any] | None:

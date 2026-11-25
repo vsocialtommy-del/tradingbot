@@ -226,3 +226,32 @@ def test_dashboard_badge_is_the_h1_trend_when_on(bot, mocker) -> None:  # noqa: 
     b.config = replace(b.config, h1_trend_ema_period=None)
     b._trend_cache = None
     assert b._dashboard_trend()["filter"] != "h1"
+
+
+def test_dashboard_next_zones_are_only_ones_it_would_take(bot, mocker) -> None:  # noqa: F811
+    """25 Nov 2026: the card only shows zones the bot would take now."""
+    import time
+    b, _ = bot
+    b._latest_ohlc = _m5(np.linspace(3500, 3700, 12 * 80))          # H1 uptrend
+    b.config = replace(b.config, h1_trend_ema_period=50, min_reward_frac=0.3)
+    buy = make_zone_for_test(direction="BUY", top=3690.0, bottom=3685.0)
+    sell = make_zone_for_test(direction="SELL", top=3715.0, bottom=3710.0)
+    low = make_zone_for_test(direction="BUY", top=3680.0, bottom=3675.0)
+    ids = {id(buy): uuid4(), id(sell): uuid4(), id(low): uuid4()}
+    b._pending_pipeline_zones = [(z, ids[id(z)]) for z in (buy, sell, low)]
+    now = time.monotonic()
+    b._deferred_seen = {(z.direction, round(float(z.top), 2), round(float(z.bottom), 2)): now
+                        for z in (buy, sell, low)}
+
+    def lv(zone, df, cfg):
+        e = float(zone.top) if zone.direction == "BUY" else float(zone.bottom)
+        s = -1 if zone.direction == "BUY" else 1
+        tp = e - s * (0.5 if zone is low else 5.0)                   # low: 0.5 for 6.5
+        return TradeLevels(entry=e, sl=e + s * 6.5, tp1=tp, sl_method="PCT_30")
+    mocker.patch("bot.main.compute_levels", side_effect=lv)
+    views = b._waiting_zone_views(bid=3695.0, ask=3695.3)
+    assert [(v.direction, v.top) for v in views] == [("BUY", 3690.0)]   # sell: against H1; low: tiny TP
+    assert views[0].tf == "M5" and views[0].as_dict()["tf"] == "M5"
+    # Rules off: everything shows, as before.
+    b.config = replace(b.config, h1_trend_ema_period=None, min_reward_frac=None)
+    assert len(b._waiting_zone_views(bid=3695.0, ask=3695.3)) == 3
