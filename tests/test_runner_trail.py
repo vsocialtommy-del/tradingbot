@@ -142,6 +142,7 @@ def make_manager(mocker: MockerFixture, setup, trades, broker: Broker):
     mt5.get_open_positions.side_effect = broker.get_open_positions
     mt5.modify_order.side_effect = broker.modify_order
     mt5.close_position.side_effect = broker.close_position
+    mt5.get_min_stop_distance.return_value = 0.0
     trk = mocker.MagicMock(spec=PositionTracker)
     trk.get_active_setups.return_value = [setup]
     trk.get_trades_for_setup.return_value = trades
@@ -252,3 +253,47 @@ class TestRunner:
         off = XautismEntryConfig(runner_enabled=False)
         assert mgr.check_live(bid=TP, ask=TP + 0.1, config=off) == []
         mt5.close_position.assert_not_called()
+
+
+class TestSpread:
+    """25 Nov 2026, Claude FTMO on FTMO: M1 SELL, 0.01 filled at 3533.05,
+    TP1 3533.48 "hit" 3 seconds later with the ask at 3533.28. Breakeven
+    (3533.05) was under the ask, MT5 said "Invalid stops" every second for
+    9 minutes and the 0.01 sat on its full SL (3537.84) while price went to
+    3537.81."""
+
+    def _sell(self, mocker):
+        setup = make_setup(direction="SELL", edge=3533.62, far=3536.0)
+        setup = setup.model_copy(update={"planned_tp1_price": Decimal("3533.48")})
+        l1 = make_trade(setup, layer=1, status="FILLED", ticket=111)
+        broker = Broker([{"ticket": 111, "price_open": 3533.05, "sl": 3537.84, "tp": 0.0}])
+        return (setup, broker, *make_manager(mocker, setup, [l1], broker))
+
+    def test_breakeven_inside_the_spread_goes_as_close_as_allowed(self, mocker) -> None:
+        setup, broker, mgr, mt5, trk = self._sell(mocker)
+        mgr.check_live(bid=3532.88, ask=3533.28)
+        assert broker.pos[111]["sl"] == pytest.approx(3533.33)   # ask + 0.05, not 3537.84
+        # Price drops: on to breakeven as soon as it's allowed.
+        mgr.check_live(bid=3532.40, ask=3532.80)
+        assert broker.pos[111]["sl"] == pytest.approx(3533.05)
+
+    def test_broker_stops_level_is_respected(self, mocker) -> None:
+        setup, broker, mgr, mt5, trk = self._sell(mocker)
+        mt5.get_min_stop_distance.return_value = 0.20
+        mgr.check_live(bid=3532.88, ask=3533.28)
+        assert broker.pos[111]["sl"] == pytest.approx(3533.53)   # ask + 0.20 + 0.05
+
+    def test_buy_side(self) -> None:
+        from bot.exits.runner_trail import allowed_sl
+        assert allowed_sl("BUY", 1900.0, bid=1899.90, ask=1900.30, min_gap=0.0) == pytest.approx(1899.85)
+        assert allowed_sl("BUY", 1900.0, bid=1901.00, ask=1901.40, min_gap=0.0) == 1900.0
+        assert allowed_sl("SELL", 1900.0, bid=1899.00, ask=1899.40, min_gap=0.0) == 1900.0
+
+    def test_a_rejected_move_is_logged_once(self, mocker) -> None:
+        setup, broker, mgr, mt5, trk = self._sell(mocker)
+        mt5.modify_order.side_effect = RuntimeError("Invalid stops")
+        warn = mocker.patch("bot.exits.runner_trail.logger.warning")
+        for _ in range(5):
+            mgr.check_live(bid=3532.88, ask=3533.28)
+        assert warn.call_count == 1
+        assert broker.pos[111]["sl"] == 3537.84
