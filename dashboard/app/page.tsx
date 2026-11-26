@@ -46,6 +46,7 @@ type Headline = { id: string; title: string; summary: string | null; time: strin
 type News = { calendar: CalEvent[]; calendarError: string | null; headlines: Headline[]; headlinesError: string | null };
 
 type DayTrade = {
+  key?: string; chart?: string | null;
   direction: string; open: string; close: string; profit: number;
   layers: { volume: number; open: number | null; close: number | null; profit: number }[];
 };
@@ -799,6 +800,14 @@ function BigCal({ bot, label, start, months, load, api, currency, today, onClose
                       <span className={tone(l.profit)}>{signed(l.profit, currency)}</span>
                     </div>
                   ))}
+                  {/* Trade photo journal (26 Nov 2026): tap to open full size. */}
+                  {t.chart ? (
+                    <a href={t.chart} target="_blank" rel="noreferrer" className="trade-pic">
+                      <img src={t.chart} alt={`${t.direction} trade chart`} loading="lazy" />
+                    </a>
+                  ) : Date.now() - Date.parse(t.close) < 2 * 3600_000 ? (
+                    <div className="meta" style={{ marginTop: 6 }}>Picture comes about 30 min after the trade closes</div>
+                  ) : null}
                 </div>
               ))
             )}
