@@ -226,3 +226,19 @@ def test_dashboard_badge_is_the_h1_trend_when_on(bot, mocker) -> None:  # noqa: 
     b.config = replace(b.config, h1_trend_ema_period=None)
     b._trend_cache = None
     assert b._dashboard_trend()["filter"] != "h1"
+
+
+@pytest.mark.parametrize("tp, bid, ask, trades", [
+    (1899.99, 1899.6, 1900.0, False),   # TP behind the entry (26 Nov: sell 3572.19, TP 3572.20)
+    (1900.30, 1899.6, 1900.0, False),   # 0.30 of reward, 0.40 spread
+    (1900.50, 1899.6, 1900.0, True),    # 0.50 covers the 0.40 spread
+    (1900.30, 1899.9, 1900.0, True),    # tight spread: 0.30 covers 0.10
+])
+def test_tp_must_cover_the_spread(bot, mocker, tp, bid, ask, trades) -> None:  # noqa: F811
+    b, _ = bot
+    place = _ready(b, mocker, tp=tp, period=None, frac=None)
+    zone, zid = make_zone_for_test(direction="BUY", top=1900.0, bottom=1895.0), uuid4()
+    assert b._try_place_setup(zone, make_ohlc(n=30), zid, bid=bid, ask=ask) is trades
+    assert place.called is trades
+    if not trades:   # not remembered: a tighter spread later can still trade
+        assert zid not in b._low_reward_zone_ids

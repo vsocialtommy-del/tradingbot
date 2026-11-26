@@ -524,6 +524,7 @@ class Bot:
         """Zones skipped for a TP too close to the entry: their TP, entry
         and SL don't change, so they are never tried again (as backtested)."""
         self._h1_skip_logged: dict[UUID, str] = {}
+        self._spread_skip_logged: dict[UUID, str] = {}
         self._last_bad_tick_log: datetime | None = None
         self._jump_since: datetime | None = None
 
@@ -2532,6 +2533,23 @@ class Bot:
                     f"{risk_pts:.2f} pts of risk (needs {frac:g} x)"
                 )
                 return False
+        # 2c. Bug fix (26 Nov 2026): never place a trade whose TP1 can't
+        # cover the spread. On FTMO (~0.4 spread) an M1 sell was placed at
+        # 3572.19 with TP1 3572.20, on the wrong side of the entry, so even
+        # a "win" lost money. Not remembered: if the spread narrows, the
+        # zone can still trade.
+        spread = max(float(ask) - float(bid), 0.0)
+        reward = (float(tp1_price) - float(entry_price) if zone.direction == "BUY"
+                  else float(entry_price) - float(tp1_price))
+        if reward < spread:
+            msg = (f"new setup skipped: {zone.direction} zone "
+                   f"{zone.bottom:.2f}-{zone.top:.2f} TP {float(tp1_price):.2f} is "
+                   f"{reward:+.2f} pts from entry {float(entry_price):.2f}, doesn't cover "
+                   f"the {spread:.2f} spread")
+            if self._spread_skip_logged.get(zone_id) != msg:
+                self._spread_skip_logged[zone_id] = msg
+                logger.info(msg)
+            return False
         if self.config.xautism_entries.enabled:
             return self._place_xautism(
                 zone, zone_id, entry_price=entry_price,
