@@ -554,6 +554,38 @@ class SupabaseLogger:
         if rows:
             self._client.table(table).upsert(rows, on_conflict=on_conflict).execute()
 
+    # ---- trade photo journal (migrations/018_trade_charts.sql) ----
+    def trade_chart_keys(self, bot: str, account: int) -> list[str]:
+        """setup_keys that already have a picture for this bot + account."""
+        res = (self._client.table("trade_charts").select("setup_key")
+               .eq("bot", bot).eq("account", account).execute())
+        return [r["setup_key"] for r in (res.data or [])]
+
+    def find_setup_by_key(self, key: str, near: datetime | None = None) -> dict[str, Any] | None:
+        """The setup whose id starts with ``key`` (the s=xxxxxxxx tag in the
+        order comment). If several, the one created closest before ``near``."""
+        lo, hi = f"{key}-0000-0000-0000-000000000000", f"{key}-ffff-ffff-ffff-ffffffffffff"
+        res = (self._client.table("setups").select("*")
+               .gte("id", lo).lte("id", hi).order("created_at", desc=True).limit(10).execute())
+        rows = res.data or []
+        if near is not None and len(rows) > 1:
+            def gap(r: dict[str, Any]) -> float:
+                try:
+                    t = datetime.fromisoformat(str(r["created_at"]).replace("Z", "+00:00"))
+                    return abs((t - near).total_seconds())
+                except Exception:  # noqa: BLE001
+                    return float("inf")
+            rows = sorted(rows, key=gap)
+        return rows[0] if rows else None
+
+    def get_zone_row(self, zone_id: str) -> dict[str, Any] | None:
+        res = self._client.table("zones").select("*").eq("id", str(zone_id)).limit(1).execute()
+        return (res.data or [None])[0]
+
+    def upload_file(self, bucket: str, path: str, data: bytes, content_type: str) -> None:
+        self._client.storage.from_(bucket).upload(
+            path, data, {"content-type": content_type, "upsert": "true"})
+
     # ---- bot_logs ----
     def log_event(
         self,

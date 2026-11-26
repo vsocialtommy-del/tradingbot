@@ -34,6 +34,7 @@ everything at TP1.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 
 from bot.strategy.pipeline import StrategyPipelineConfig
 
@@ -176,6 +177,9 @@ def build_profile(name: str, risk: str | None = None, max_losses=None, *, plan: 
             # trades, £0.42 a trade, -£871.
             h1_trend_ema_period=50,
             min_reward_frac=0.3,
+            # 26 Nov 2026: trade photo journal from now on.
+            journal_since=datetime(2026, 11, 26, 18, 0, tzinfo=timezone.utc),
+            journal_label="M5 BOT",
             # 19 Nov 2026: look back 100,000 M5 bars (about 17 months, was
             # 5000 = 3.5 weeks) so still-fresh zones from when price was last
             # at these levels (e.g. Sep 2025 demand) can be traded. Needs MT5
@@ -254,7 +258,11 @@ def build_profile(name: str, risk: str | None = None, max_losses=None, *, plan: 
             # Same evening: its M5 zones also skip a TP under 0.3 x the SL
             # distance (as the M5 bot). 12-month backtest with the H1 trend:
             # M5 zones 231 trades +£788 vs 466 trades +£764; M1 zones unchanged.
+            # 26 Nov 2026: trade photo journal, every trade since it went on
+            # FTMO (24 Nov 2026 ~21:50 UK).
             cfg = replace(cfg, plan=pc, risk=plan_risk(fixed, pc), h1_trend_ema_period=50,
-                          min_reward_frac=0.3)
+                          min_reward_frac=0.3,
+                          journal_since=datetime(2026, 11, 24, 21, 45, tzinfo=timezone.utc),
+                          journal_label="CLAUDE FTMO")
         return cfg, m1_pipeline
     raise ValueError(f"unknown bot {name!r} (expected one of {sorted(ENV_FILES)})")

@@ -36,11 +36,13 @@ export async function GET(req: NextRequest) {
   const data = (raw ?? []).filter((r) => lastDay.get(r.setup_key) === date);
 
   const trades = new Map<string, {
+    key: string; chart: string | null;
     direction: string; open: string; close: string; profit: number;
     layers: { volume: number; open: number | null; close: number | null; profit: number }[];
   }>();
   for (const r of (data ?? []) as Row[]) {
     const t = trades.get(r.setup_key) ?? {
+      key: r.setup_key, chart: null,
       direction: r.direction, open: r.open_time, close: r.close_time, profit: 0, layers: [],
     };
     if (r.open_time < t.open) t.open = r.open_time;
@@ -53,6 +55,18 @@ export async function GET(req: NextRequest) {
       profit: Number(r.profit),
     });
     trades.set(r.setup_key, t);
+  }
+  // Trade photo journal (SQL 018): a link to each trade's picture, valid
+  // for an hour. Nothing breaks if the table or bucket isn't there yet.
+  if (trades.size) {
+    const { data: charts } = await sb.from("trade_charts").select("setup_key, path")
+      .eq("bot", bot).in("setup_key", [...trades.keys()]);
+    for (const c of (charts ?? []) as { setup_key: string; path: string }[]) {
+      const t = trades.get(c.setup_key);
+      if (!t || t.chart) continue;
+      const { data: signed } = await sb.storage.from("trade-charts").createSignedUrl(c.path, 3600);
+      if (signed?.signedUrl) t.chart = signed.signedUrl;
+    }
   }
   const list = [...trades.values()]
     .map((t) => ({ ...t, profit: Math.round(t.profit * 100) / 100 }))

@@ -110,6 +110,7 @@ from bot.dashboard.bridge import (
     pick_closest_zones,
     positions_missing_open,
 )
+from bot.journal.journal import TradeJournal
 from bot.filters.forex_factory import ForexFactoryCalendar
 from bot.filters.news_filter import NewsFilter, NewsFilterConfig
 from bot.logging.supabase_logger import (
@@ -253,6 +254,12 @@ class BotLoopConfig:
     """How often closed positions are copied for the dashboard calendar."""
     dashboard_backfill_days: int = 60
     """How far back the calendar is filled on startup."""
+    journal_since: datetime | None = None
+    """Trade photo journal (26 Nov 2026): a picture of every trade that
+    opened from this time on, 30 min after it closes. None = off."""
+    journal_label: str = ""
+    """Bot name printed on the pictures (e.g. "CLAUDE FTMO")."""
+    journal_seconds: float = 20.0
 
     max_simultaneous_setups: int = 1
     """Nov 2026 (XAUTISM): one trade at a time (was 3)."""
@@ -465,6 +472,15 @@ class Bot:
             self.runner_trail.trail_for = self._trail_for_setup
         # Phone dashboard (Nov 2026): status / calendar / live settings.
         self.dashboard = DashboardBridge(supabase, self.config.bot_name)
+        self.journal: TradeJournal | None = None
+        if self.config.journal_since is not None and supabase is not None:
+            self.journal = TradeJournal(
+                supabase, bot=self.config.bot_name,
+                bot_label=self.config.journal_label or f"{self.config.bot_name} BOT",
+                symbol=self.config.symbol, since=self.config.journal_since,
+                default_tf=self.config.ohlc_timeframe,
+                ema_period=self.config.h1_trend_ema_period or 50,
+            )
         self._base_risk = self.config.risk
         self._live_risk_raw: tuple[Any, Any] = (None, None)
         self._trend_filter = "on" if self.config.direction_gate.enabled else "off"
@@ -3045,6 +3061,8 @@ class Bot:
             return
         login = getattr(self.mt5, "_login", None)
         self.dashboard.sync_trades(rows, account=login if isinstance(login, int) else None)
+        if self.journal is not None:
+            self.journal.note_rows(rows, login if isinstance(login, int) else None)
         if self.dashboard.available:
             self._calendar_backfilled = True
 
@@ -3058,6 +3076,13 @@ class Bot:
             if _elapsed(self.state.last_dashboard_trades, now) >= self.config.dashboard_trades_seconds:
                 self.state.last_dashboard_trades = now
                 self._sync_closed_trades(now)
+            if (self.journal is not None
+                    and _elapsed(getattr(self, "_last_journal", None), now) >= self.config.journal_seconds):
+                self._last_journal = now
+                self.journal.step(
+                    now, lambda tf, n: self.mt5.get_ohlc(self.config.symbol, tf, n),
+                    getattr(self.daily_risk, "offset", None),
+                )
         except Exception:
             logger.exception("dashboard pass failed (trading not affected)")
 
