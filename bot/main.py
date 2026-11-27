@@ -73,6 +73,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import httpx
 import pandas as pd
@@ -329,6 +330,12 @@ class BotLoopConfig:
     enable_news_close: bool = True
     """Close every open trade (and cancel a pending layer 2) when a
     news blackout starts, i.e. 15 min before the release."""
+    friday_no_new_after: str | None = None
+    """FTMO Standard (27 Nov 2026): no new trades on Friday from this UK
+    time ("20:00"). None = off."""
+    friday_close_at: str | None = None
+    """...and close every open trade / cancel pending orders at this UK
+    time ("21:45"), so nothing is held over the weekend. None = off."""
     news_source: Literal["forexfactory", "supabase"] = "forexfactory"
     """Where news comes from: the bot downloads Forex Factory's weekly
     calendar itself, or the old Supabase ``news_events`` table."""
@@ -500,6 +507,8 @@ class Bot:
                 supabase, config=self.news_filter_config,
             )
         self._news_closed: set[UUID] = set()
+        self._weekend_closed: set[UUID] = set()
+        self._weekend_logged: int = 0
 
         self.state = BotState()
         self._stopped = False
@@ -924,14 +933,30 @@ class Bot:
             else:
                 self._news_closed.clear()
 
-        placement_blocked = False
+        # Friday flat (FTMO Standard): no new trades late Friday, then
+        # close everything before the weekend break.
+        weekend = self._friday_phase(now)
+        if weekend >= 2:
+            self._run_news_close("weekend: flat before Friday close",
+                                 close_reason="MANUAL_CLOSE", tag="WEEKEND_CLOSE",
+                                 done=self._weekend_closed)
+        elif weekend == 0:
+            self._weekend_closed.clear()
+        if weekend != self._weekend_logged:
+            if weekend == 1:
+                logger.info(f"weekend: no new trades from Friday {self.config.friday_no_new_after} UK")
+            elif weekend == 2:
+                logger.info(f"weekend: closing everything at Friday {self.config.friday_close_at} UK")
+            self._weekend_logged = weekend
+
+        placement_blocked = weekend >= 1
         paused = self._is_paused(now)
         if True:  # zones keep updating while switched off; only placement stops
             daily_halt_result = (
                 self._check_daily_halt(now)
                 if self.config.enable_balance_pct_halt else _NotHalted()
             )
-            placement_blocked = daily_halt_result.is_halted or bool(
+            placement_blocked = placement_blocked or daily_halt_result.is_halted or bool(
                 news_check is not None and news_check.is_blocked
             )
             if paused:
@@ -1752,13 +1777,32 @@ class Bot:
             f"SELL={outcome.get('SELL')}"
         )
 
-    def _run_news_close(self, reason: str) -> None:
+    def _friday_phase(self, now: datetime) -> int:
+        """0 = normal, 1 = Friday no-new-trades window, 2 = Friday close
+        time reached (UK clock)."""
+        a, b = self.config.friday_no_new_after, self.config.friday_close_at
+        if a is None and b is None:
+            return 0
+        uk = now.astimezone(ZoneInfo("Europe/London"))
+        if uk.weekday() != 4:
+            return 0
+        hm = uk.strftime("%H:%M")
+        if b is not None and hm >= b:
+            return 2
+        if a is not None and hm >= a:
+            return 1
+        return 0
+
+    def _run_news_close(self, reason: str, *, close_reason: str = "NEWS_CLOSE",
+                        tag: str = "NEWS_CLOSE", done: set[UUID] | None = None) -> None:
         """News blackout started: close every open bot trade at market
         and cancel pending layer 2 stops (``close_reason='NEWS_CLOSE'``).
         Each setup once per blackout; retried next tick if a close
-        failed (the broker SL still protects it meanwhile)."""
+        failed (the broker SL still protects it meanwhile). Also used for
+        the Friday close (``tag='WEEKEND_CLOSE'``)."""
+        done = self._news_closed if done is None else done
         for setup in self._safe_get_active_setups():
-            if setup.id in self._news_closed:
+            if setup.id in done:
                 continue
             ok = True
             closed = cancelled = 0
@@ -1774,19 +1818,19 @@ class Bot:
                         )
                         continue
                     self.position_tracker.update_trade_status(
-                        trade.id, "CLOSED", close_reason="NEWS_CLOSE",
+                        trade.id, "CLOSED", close_reason=close_reason,  # type: ignore[arg-type]
                     )
                     closed += 1
                 elif trade.status == "WAITING":
                     cancel_layer2_at_broker(self.mt5, trade)
                     self.position_tracker.update_trade_status(
-                        trade.id, "CANCELLED", close_reason="NEWS_CLOSE",
+                        trade.id, "CANCELLED", close_reason=close_reason,  # type: ignore[arg-type]
                     )
                     cancelled += 1
             if ok:
-                self._news_closed.add(setup.id)
+                done.add(setup.id)
             logger.warning(
-                f"NEWS_CLOSE: setup={setup.id} {setup.direction}: closed "
+                f"{tag}: setup={setup.id} {setup.direction}: closed "
                 f"{closed}, cancelled {cancelled} ({reason})"
             )
 

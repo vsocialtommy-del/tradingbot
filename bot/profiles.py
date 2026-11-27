@@ -180,6 +180,8 @@ def build_profile(name: str, risk: str | None = None, max_losses=None, *, plan: 
             # 26 Nov 2026: trade photo journal from now on.
             journal_since=datetime(2026, 11, 26, 18, 0, tzinfo=timezone.utc),
             journal_label="M5 BOT",
+            # 27 Nov 2026: flat before the weekend (FTMO Standard).
+            friday_no_new_after="20:00", friday_close_at="21:45",
             # 19 Nov 2026: look back 100,000 M5 bars (about 17 months, was
             # 5000 = 3.5 weeks) so still-fresh zones from when price was last
             # at these levels (e.g. Sep 2025 demand) can be traded. Needs MT5
@@ -263,6 +265,8 @@ def build_profile(name: str, risk: str | None = None, max_losses=None, *, plan: 
             cfg = replace(cfg, plan=pc, risk=plan_risk(fixed, pc), h1_trend_ema_period=50,
                           min_reward_frac=0.3,
                           journal_since=datetime(2026, 11, 24, 21, 45, tzinfo=timezone.utc),
-                          journal_label="CLAUDE FTMO")
+                          journal_label="CLAUDE FTMO",
+                          # 27 Nov 2026: flat before the weekend (FTMO Standard).
+                          friday_no_new_after="20:00", friday_close_at="21:45")
         return cfg, m1_pipeline
     raise ValueError(f"unknown bot {name!r} (expected one of {sorted(ENV_FILES)})")
