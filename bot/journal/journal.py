@@ -29,6 +29,9 @@ from loguru import logger
 from bot.journal.trade_chart import ChartTrade, Layer, classify_exit, render, summary
 
 BUCKET = "trade-charts"
+VERSION = 2
+"""Picture version. Pictures saved with an older version are redrawn
+(v2, 27 Nov 2026: zone formed time fixed to real UTC)."""
 AFTER_CLOSE = timedelta(minutes=30)
 MAX_TRIES = 3
 # How much chart before the entry, at most (the zone may be older).
@@ -142,7 +145,7 @@ class TradeJournal:
             self._finish(key, fut)
         if self._done is None:
             try:
-                self._done = set(self._sb.trade_chart_keys(self.bot, self._account or 0))
+                self._done = set(self._sb.trade_chart_keys(self.bot, self._account or 0, VERSION))
             except Exception as exc:  # noqa: BLE001
                 self._failed("reading trade_charts", exc)
                 return
@@ -159,19 +162,21 @@ class TradeJournal:
             logger.warning(f"journal: reading candles for {key} failed ({exc}); will retry")
             self._tries[key] = self._tries.get(key, 0) + 1
             return
-        self._job = (key, self._pool.submit(self._make, key, list(rows), m1, m5, self._account))
+        self._job = (key, self._pool.submit(self._make, key, list(rows), m1, m5, self._account,
+                                            offset))
 
     # ---- background thread ------------------------------------------------
 
     def _make(self, key: str, rows: list[dict[str, Any]], m1: pd.DataFrame,
-              m5: pd.DataFrame, account: int | None) -> str:
-        trade = self.build_trade(key, rows, account, m5)
+              m5: pd.DataFrame, account: int | None, offset: timedelta = timedelta(0)) -> str:
+        trade = self.build_trade(key, rows, account, m5, offset)
         candles = m1 if trade.tf == "M1" else m5
         first, last = trade.opened, trade.closed
+        bar = timedelta(minutes=1 if trade.tf == "M1" else 5)
         start = first - LOOKBACK.get(trade.tf, LOOKBACK["M5"])
         if trade.zone_formed is not None:
-            bar = timedelta(minutes=1 if trade.tf == "M1" else 5)
             start = max(start, trade.zone_formed - LEAD_BARS * bar)
+        start = min(start, first - 10 * bar)          # always some chart before the entry
         window = candles[(candles.index >= pd.Timestamp(start)) &
                          (candles.index <= pd.Timestamp(last + AFTER_CLOSE))]
         if len(window) < 5:
@@ -179,6 +184,7 @@ class TradeJournal:
         _, _, _, ema = h1_trend_at(m5, first, self.ema_period)
         png = render(trade, window, ema)
         info = summary(trade, window)
+        info["v"] = VERSION
         day = pd.Timestamp(first).tz_convert("Europe/London").strftime("%Y-%m-%d")
         path = f"{self.bot}/{account or 'acct'}/{day}/{key}.png"
         self._sb.upload_file(BUCKET, path, png, "image/png")
@@ -189,7 +195,7 @@ class TradeJournal:
         return path
 
     def build_trade(self, key: str, rows: list[dict[str, Any]], account: int | None,
-                    m5: pd.DataFrame) -> ChartTrade:
+                    m5: pd.DataFrame, offset: timedelta = timedelta(0)) -> ChartTrade:
         layers = layers_from_rows(rows)
         setup = zone = None
         notes: list[str] = []
@@ -211,7 +217,9 @@ class TradeJournal:
             direction=str(rows[0]["direction"]), tf=tf, kind=kind, layers=layers,
             zone_top=float(zone["top"]) if zone else None,
             zone_bottom=float(zone["bottom"]) if zone else None,
-            zone_formed=_ts(zone["formed_at"]) if zone and zone.get("formed_at") else None,
+            # zones.formed_at is a candle time, stamped in the broker's clock
+            # (UTC+2); the trades are real UTC.
+            zone_formed=(_ts(zone["formed_at"]) - offset) if zone and zone.get("formed_at") else None,
             entry=f("planned_layer1_price"), sl=f("planned_sl_price"), tp1=f("planned_tp1_price"),
             h1_state=state, h1_close=h1c, h1_ema=h1e, notes=notes,
         )
