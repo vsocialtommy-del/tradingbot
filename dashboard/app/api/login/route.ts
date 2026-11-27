@@ -2,7 +2,7 @@ import { timingSafeEqual } from "crypto";
 import { NextResponse, type NextRequest } from "next/server";
 
 import { db } from "@/lib/db";
-import { COOKIE, authConfigured, makeToken } from "@/lib/session";
+import { COOKIE, authConfigured, makeToken, viewPin, type Role } from "@/lib/session";
 
 export const dynamic = "force-dynamic";
 
@@ -52,9 +52,15 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "locked", lockedUntil: row!.locked_until }, { status: 429 });
   }
 
-  if (/^\d{4}$/.test(pin) && samePin(pin, process.env.DASHBOARD_PIN!)) {
-    await sb.from("dashboard_auth").upsert({ id: 1, failed_attempts: 0, locked_until: null });
-    const { token } = await makeToken(now);
+  // Main PIN = full control. VIEW_PIN (27 Nov 2026) = watch only.
+  let role: Role | null = null;
+  if (/^\d{4}$/.test(pin) && samePin(pin, process.env.DASHBOARD_PIN!)) role = "full";
+  else if (/^\d{4}$/.test(pin) && viewPin() && samePin(pin, viewPin())) role = "view";
+  if (role) {
+    if (role === "full") {
+      await sb.from("dashboard_auth").upsert({ id: 1, failed_attempts: 0, locked_until: null });
+    }
+    const { token } = await makeToken(now, role);
     const res = NextResponse.json({ ok: true });
     res.cookies.set(COOKIE, token, {
       httpOnly: true,

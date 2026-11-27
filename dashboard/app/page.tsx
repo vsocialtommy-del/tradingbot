@@ -137,6 +137,9 @@ export default function Dashboard() {
   const [news, setNews] = useState<News | null>(null);
   const [confirm, setConfirm] = useState<{ text: string; ok: string; danger?: boolean; run: () => Promise<void> } | null>(null);
   const [pendingToggle, setPendingToggle] = useState<Record<string, boolean>>({});
+  // "view" = logged in with the watch-only PIN: no buttons, no settings (27 Nov 2026).
+  const [role, setRole] = useState<"full" | "view">("full");
+  const watch = role === "view";
 
   const say = useCallback((t: string) => {
     setToast(t);
@@ -158,6 +161,7 @@ export default function Dashboard() {
     try {
       const j = await api("/api/status");
       setBots(j.bots);
+      setRole(j.role === "view" ? "view" : "full");
       setSkew(Date.parse(j.serverTime) - Date.now());
       setNetErr(false);
     } catch (e) {
@@ -255,12 +259,16 @@ export default function Dashboard() {
         <h1 className="brand">XAU/TISM BOT</h1>
         <p>2 BOTS · {netErr ? "NO CONNECTION" : "LIVE"} · {now ? new Date(now).toLocaleTimeString("en-GB", { timeZone: TZ, hour: "2-digit", minute: "2-digit" }) : "--:--"} UK</p>
       </div>
-      <button className="top-btn" disabled={!bots?.some((b) => b.configured)}
-        onClick={() => setConfirm({
-          text: "Pull the latest code from GitHub and restart BOTH bots on it? Open trades stay in MT5.",
-          ok: "Update",
-          run: sendCommand(bots?.find((b) => b.configured)?.bot ?? "M5", "update"),
-        })}>UPDATE</button>
+      {watch ? (
+        <span className="watch-tag">WATCH ONLY</span>
+      ) : (
+        <button className="top-btn" disabled={!bots?.some((b) => b.configured)}
+          onClick={() => setConfirm({
+            text: "Pull the latest code from GitHub and restart BOTH bots on it? Open trades stay in MT5.",
+            ok: "Update",
+            run: sendCommand(bots?.find((b) => b.configured)?.bot ?? "M5", "update"),
+          })}>UPDATE</button>
+      )}
     </header>
   );
 
@@ -277,9 +285,9 @@ export default function Dashboard() {
 
       <div className="row">
         {bots.map((b) => (
-          <BotCard key={b.bot} b={b} now={serverNow}
+          <BotCard key={b.bot} b={b} now={serverNow} watch={watch}
             trading={pendingToggle[b.bot] ?? !b.killSwitch}
-            onOpen={() => setOpen(b.bot)} onToggle={() => askToggle(b)} />
+            onOpen={() => { if (!watch) setOpen(b.bot); }} onToggle={() => { if (!watch) askToggle(b); }} />
         ))}
       </div>
 
@@ -295,7 +303,7 @@ export default function Dashboard() {
 
       <UsdNews news={news} now={serverNow} />
 
-      {openBot && (
+      {openBot && !watch && (
         <BotPopup b={openBot} now={serverNow} trading={pendingToggle[openBot.bot] ?? !openBot.killSwitch}
           onClose={() => setOpen(null)} onToggle={() => askToggle(openBot)}
           onCommand={(cmd, text, danger) => setConfirm({ text, ok: "Yes", danger, run: sendCommand(openBot.bot, cmd) })}
@@ -330,23 +338,27 @@ export default function Dashboard() {
 
 // ------------------------------------------------------------------ bot card
 
-function BotCard({ b, now, trading, onOpen, onToggle }: {
-  b: BotRow; now: number; trading: boolean; onOpen: () => void; onToggle: () => void;
+function BotCard({ b, now, trading, watch = false, onOpen, onToggle }: {
+  b: BotRow; now: number; trading: boolean; watch?: boolean; onOpen: () => void; onToggle: () => void;
 }) {
   const st = botState(b, now);
   const d = b.status?.data ?? {};
   const cur = d.account?.currency;
   const today = d.today;
   return (
-    <div className="card tap" onClick={onOpen} role="button">
+    <div className={watch ? "card" : "card tap"} onClick={watch ? undefined : onOpen} role={watch ? undefined : "button"}>
       <div className="hd">
         <div style={{ minWidth: 0 }}>
           <div className="name">{botName(b)}</div>
           <div className="sub">{[riskText(d.settings?.risk), d.account?.login ? `#${d.account.login}` : null].filter(Boolean).join(" · ") || " "}</div>
         </div>
-        <button className={`sw ${trading ? "on" : ""}`} aria-label={trading ? "Turn off" : "Turn on"}
-          disabled={!b.configured || !!b.error}
-          onClick={(e) => { e.stopPropagation(); onToggle(); }} />
+        {watch ? (
+          <span className={`watch-onoff ${trading ? "on" : ""}`}>{trading ? "ON" : "OFF"}</span>
+        ) : (
+          <button className={`sw ${trading ? "on" : ""}`} aria-label={trading ? "Turn off" : "Turn on"}
+            disabled={!b.configured || !!b.error}
+            onClick={(e) => { e.stopPropagation(); onToggle(); }} />
+        )}
       </div>
       <div className="st"><span className={`dot ${st.cls}`} />{st.label}</div>
       <TrendBadge t={d.trend} />
@@ -361,7 +373,7 @@ function BotCard({ b, now, trading, onOpen, onToggle }: {
         <span className="b">BUY</span> {d.next_buy ? <>{d.next_buy.entry.toFixed(2)} · <em>{pts(d.next_buy.distance)} pts</em></> : "none"}<br />
         <span className="s">SELL</span> {d.next_sell ? <>{d.next_sell.entry.toFixed(2)} · <em>{pts(d.next_sell.distance)} pts</em></> : "none"}
       </div>
-      <div className="tap-hint">TAP FOR MORE</div>
+      {!watch && <div className="tap-hint">TAP FOR MORE</div>}
     </div>
   );
 }
