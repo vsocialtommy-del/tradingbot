@@ -41,17 +41,19 @@ class FakeSB:
         self.files: dict[str, bytes] = {}
         self.rows: list[dict] = []
 
-    def trade_chart_keys(self, bot, account):
+    def trade_chart_keys(self, bot, account, version=0):
         if self.missing:
             raise RuntimeError('relation "trade_charts" does not exist')
-        return [r["setup_key"] for r in self.rows]
+        return [r["setup_key"] for r in self.rows if int(r["data"].get("v") or 1) >= version]
 
     def find_setup_by_key(self, key, near=None):
         return {"zone_id": "z1", "planned_layer1_price": 3572.19, "planned_sl_price": 3575.68,
                 "planned_tp1_price": 3572.20, "created_at": T0.isoformat()}
 
     def get_zone_row(self, zid):
-        return {"top": 3573.80, "bottom": 3572.19, "formed_at": (T0 - timedelta(minutes=20)).isoformat(),
+        # Like the real zones table: a candle time in the broker's clock (UTC+2).
+        return {"top": 3573.80, "bottom": 3572.19,
+                "formed_at": (T0 - timedelta(minutes=20) + OFFSET).isoformat(),
                 "last_evaluation_result": {"timeframe": "M1"}}
 
     def upload_file(self, bucket, path, data, ctype):
@@ -124,6 +126,8 @@ def test_picture_and_numbers_saved_once() -> None:
     assert d["h1_trend"] in ("UPTREND", "DOWNTREND")
     assert d["reward_pts"] == -0.01 and d["profit"] == 0.39 and d["result"] == "WIN"
     assert [x["name"] for x in d["layers"]] == ["L1", "L2", "L3 runner"]
+    # 27 Nov 2026 bug: the zone time is broker clock, the chart needs real UTC.
+    assert d["zone_formed"] == (T0 - timedelta(minutes=20)).isoformat() and d["v"] == 2
     # Already done: not drawn again.
     _run(j, now + timedelta(minutes=5))
     assert len(sb.files) == 1
@@ -159,3 +163,12 @@ def test_profiles(profile, label, since) -> None:
     assert ftmo.journal_label == "CLAUDE FTMO"
     assert ftmo.journal_since == datetime(2026, 11, 24, 21, 45, tzinfo=timezone.utc)
     assert build_profile("m1")[0].journal_since is None
+
+
+def test_old_pictures_are_redrawn() -> None:
+    sb = FakeSB()
+    sb.rows.append({"setup_key": "124c34a8", "data": {}})          # v1 picture
+    j = _journal(sb)
+    j.note_rows(_rows(), 540334604)
+    _run(j, T0 + timedelta(minutes=45))
+    assert len(sb.files) == 1 and sb.rows[-1]["data"]["v"] == 2

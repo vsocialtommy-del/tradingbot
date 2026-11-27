@@ -555,11 +555,13 @@ class SupabaseLogger:
             self._client.table(table).upsert(rows, on_conflict=on_conflict).execute()
 
     # ---- trade photo journal (migrations/018_trade_charts.sql) ----
-    def trade_chart_keys(self, bot: str, account: int) -> list[str]:
-        """setup_keys that already have a picture for this bot + account."""
-        res = (self._client.table("trade_charts").select("setup_key")
+    def trade_chart_keys(self, bot: str, account: int, version: int = 0) -> list[str]:
+        """setup_keys that already have a picture for this bot + account
+        (at least ``version``; older ones get redrawn)."""
+        res = (self._client.table("trade_charts").select("setup_key,data")
                .eq("bot", bot).eq("account", account).execute())
-        return [r["setup_key"] for r in (res.data or [])]
+        return [r["setup_key"] for r in (res.data or [])
+                if int((r.get("data") or {}).get("v") or 1) >= version]
 
     def find_setup_by_key(self, key: str, near: datetime | None = None) -> dict[str, Any] | None:
         """The setup whose id starts with ``key`` (the s=xxxxxxxx tag in the
