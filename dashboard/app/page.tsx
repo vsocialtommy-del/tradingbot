@@ -725,6 +725,7 @@ function BigCal({ bot, label, start, months, load, api, currency, today, onClose
   const [ym, setYm] = useState(start);
   const [day, setDay] = useState<string | null>(null);
   const [trades, setTrades] = useState<DayTrade[] | null>(null);
+  const [pic, setPic] = useState<string | null>(null);   // trade picture open full screen
   const month = months[`${bot}|${ym}`];
   const asked = useRef<Set<string>>(new Set());
 
@@ -800,16 +801,20 @@ function BigCal({ bot, label, start, months, load, api, currency, today, onClose
                       <span className={tone(l.profit)}>{signed(l.profit, currency)}</span>
                     </div>
                   ))}
-                  {/* Trade photo journal (26 Nov 2026): tap to open full size. */}
+                  {/* Trade photo journal: only loads when you tap SEE TRADE (27 Nov 2026). */}
                   {t.chart ? (
-                    <a href={t.chart} target="_blank" rel="noreferrer" className="trade-pic">
-                      <img src={t.chart} alt={`${t.direction} trade chart`} loading="lazy" />
-                    </a>
+                    <button className="btn see-trade" onClick={() => setPic(t.chart ?? null)}>SEE TRADE</button>
                   ) : Date.now() - Date.parse(t.close) < 2 * 3600_000 ? (
                     <div className="meta" style={{ marginTop: 6 }}>Picture comes about 30 min after the trade closes</div>
                   ) : null}
                 </div>
               ))
+            )}
+            {pic && (
+              <div className="pic-view" onClick={() => setPic(null)}>
+                <button className="pic-x" onClick={() => setPic(null)} aria-label="Close">✕</button>
+                <img src={pic} alt="Trade chart" onClick={(e) => e.stopPropagation()} />
+              </div>
             )}
           </>
         )}
