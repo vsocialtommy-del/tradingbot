@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 
-import { db, fail, isBot, needLogin } from "@/lib/db";
+import { db, fail, isBot, needFull } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
@@ -8,7 +8,7 @@ const COMMANDS = ["update", "restart", "start", "stop", "login"];
 
 // Queues a button press for the laptop supervisor (picked up within ~5 s).
 export async function POST(req: NextRequest) {
-  const denied = await needLogin();
+  const denied = await needFull();   // watch-only PIN can't press buttons
   if (denied) return denied;
   const body = await req.json().catch(() => ({}));
   if (!isBot(body.bot)) return fail("Unknown bot");

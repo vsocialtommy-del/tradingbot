@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { BOTS, db, needLogin, type Bot } from "@/lib/db";
+import { BOTS, currentRole, db, needLogin, type Bot } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
@@ -37,7 +37,7 @@ export async function GET() {
   if (denied) return denied;
   const bots = await Promise.all(BOTS.map(one));
   return NextResponse.json(
-    { bots, serverTime: new Date().toISOString() },
+    { bots, serverTime: new Date().toISOString(), role: await currentRole() },
     { headers: { "Cache-Control": "no-store" } },
   );
 }

@@ -6,7 +6,7 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 
-import { COOKIE, validToken } from "./session";
+import { COOKIE, tokenRole, validToken } from "./session";
 
 export const BOTS = ["M5", "M1"] as const;
 export type Bot = (typeof BOTS)[number];
@@ -33,6 +33,18 @@ export function db(bot: Bot): SupabaseClient | null {
 export async function needLogin(): Promise<NextResponse | null> {
   const ok = await validToken(cookies().get(COOKIE)?.value);
   return ok ? null : NextResponse.json({ error: "Log in again" }, { status: 401 });
+}
+
+/** Buttons and settings: the main PIN only. The watch-only PIN gets 403. */
+export async function needFull(): Promise<NextResponse | null> {
+  const role = await tokenRole(cookies().get(COOKIE)?.value);
+  if (role === "full") return null;
+  if (role === "view") return NextResponse.json({ error: "Watch only: you can't change anything" }, { status: 403 });
+  return NextResponse.json({ error: "Log in again" }, { status: 401 });
+}
+
+export async function currentRole(): Promise<"full" | "view" | null> {
+  return tokenRole(cookies().get(COOKIE)?.value);
 }
 
 export function fail(message: string, status = 400): NextResponse {
